@@ -853,7 +853,9 @@ class AudioBus{
     // HPF on drum bus -- stops sub-octave mud from kick sub colliding with sub bus
     const drumHPF=ctx.createBiquadFilter();drumHPF.type='highpass';drumHPF.frequency.value=28;drumHPF.Q.value=0.5;
     drumHPF.connect(this.drumComp);
-    this.drumBus=ctx.createGain();this.drumBus.gain.value=0.95;
+    // Drums sit UNDER the mix, not on top. They support the groove, they
+    // shouldn't drown out bass/mid/lead. 0.55 vs previous 0.95.
+    this.drumBus=ctx.createGain();this.drumBus.gain.value=0.55;
     this.drumBus.connect(drumHPF);
 
     // -- BASS BUS: Moog-style glue compressor -----------------------------
@@ -2838,10 +2840,10 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   const freq=440*Math.pow(2,(note-69)/12)*warp;
   const s=drumSeed();
   const pc=((note%12)+12)%12; const pcMod=pc/12;
-  // LFO modulation for bass: slow filter sweep, med cutoff wobble, fast vibrato
+  // LFO: slow drift on cutoff offset, med drift on the presence harmonic
+  // gain (below). No fast LFO on bass -- 2Hz vibrato on low notes = cartoon.
   const lSlow = lfoBank.get('slow',t);
   const lMed  = lfoBank.get('med',t);
-  const lFast = lfoBank.get('fast',t);
   // Bias a few per-hit parameters toward learned-good bass values.
   s.punch = paramMemory.bias('bass','punch', s.punch);
   s.tone  = paramMemory.bias('bass','tone',  s.tone);
@@ -2866,18 +2868,20 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   // -- BODY OSCILLATOR ---------------------------------------------------
   const body=ctx.createOscillator(); body.type=bodyType;
   body.frequency.value=freq*(1+s.color*0.004);
-  body.detune.value=(pcMod*8-4)+(s.color*5-2.5) + lFast*3.5; // vibrato from LFO
+  // Per-hit detune only. No LFO vibrato here -- a 2Hz wobble on bass sounds cartoony.
+  body.detune.value=(pcMod*8-4)+(s.color*5-2.5);
 
   // -- RESONANT FILTER: neural cutoff + mode-specific envelope ----------
   const flt=ctx.createBiquadFilter(); flt.type='lowpass';
   const baseQ={pluck:4.5,slap:6.0,sustain:2.5,growl:8.0}[mode];
-  flt.Q.value=baseQ+chaos*8+nn.filterCutoff*5+s.punch*3 + lMed*0.8;
+  flt.Q.value=baseQ+chaos*8+nn.filterCutoff*5+s.punch*3;
 
-  // Filter envelope: each mode has distinct shape. LFO widens the opening
-  // point over time so the same note picks a different cutoff on each hit.
+  // Filter envelope: each mode has distinct shape. Keep LFO contribution
+  // tiny and SLOW only -- enough to make consecutive hits differ, not enough
+  // to modulate the cutoff audibly within a note.
   const fOpen={pluck:800,slap:2200,sustain:600,growl:1400}[mode];
   const fClose={pluck:80,slap:120,sustain:180,growl:60}[mode];
-  const lfoCutoff = lSlow*220 + lMed*140;
+  const lfoCutoff = lSlow*45;
   flt.frequency.setValueAtTime(Math.max(80,(fOpen+windBoost*400+inputChar*600+chaos*1200+pcMod*300+lfoCutoff)*warp), t);
   flt.frequency.exponentialRampToValueAtTime(Math.max(40,(fClose+pcMod*30)*warp), t+decayTime);
 
@@ -2914,24 +2918,26 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   }
 
   // -- PRESENCE HARMONIC: overtone for articulation ----------------------
+  // lMed samples once at trigger time -- brightness drifts across notes
+  // without wobbling within a note (no cartoon effect).
   const pres=ctx.createOscillator(); pres.type='sine';
   pres.frequency.value=freq*(2+nn.harmonicMix*0.5);
   const pg=ctx.createGain();
-  pg.gain.setValueAtTime((s.color*0.12+nn.filterCutoff*0.06),t);
+  const presAmt = Math.max(0.02, (s.color*0.12+nn.filterCutoff*0.06) * (1 + lMed*0.45));
+  pg.gain.setValueAtTime(presAmt,t);
   pg.gain.linearRampToValueAtTime(0.0001,t+0.14/warp);
   pres.connect(pg); pg.connect(dest);
   pres.start(t); pres.stop(t+0.18/warp);
   autoClean(pres,pg);
 
-  // -- BASS LFO: filter wobble for organic movement ---------------------
-  // Only on sustain/growl modes where there's time to hear it
-  if(mode==='sustain'||mode==='growl'){
+  // -- BASS LFO: gentle filter movement, growl mode only. Tuned WAY down
+  // (max 2.2Hz, max 150Hz depth) so it breathes instead of Squidward-wahing.
+  // Sustain mode is left clean -- long notes don't need a moving filter.
+  if(mode==='growl'){
     const bassLfo=ctx.createOscillator(); bassLfo.type='sine';
-    // Rate varies per note for uniqueness: 1.5-4Hz
-    bassLfo.frequency.value=1.5+s.color*2.5+chaos*1.5;
+    bassLfo.frequency.value=0.8+s.color*1.4;      // 0.8-2.2Hz, was 1.5-5Hz
     const bassLfoGain=ctx.createGain();
-    // Depth in Hz -- enough to feel, not enough to pitch shift
-    bassLfoGain.gain.value=(60+chaos*120+windBoost*80)*(mode==='growl'?2.2:1.0);
+    bassLfoGain.gain.value=40+chaos*110;           // max 150Hz, was up to 572Hz
     bassLfo.connect(bassLfoGain); bassLfoGain.connect(flt.frequency);
     bassLfo.start(t); bassLfo.stop(t+decayTime+0.05);
     autoClean(bassLfo,bassLfoGain);
@@ -3027,10 +3033,9 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0){
   const _lStyle=styleP();
   const mode = _lStyle.leadMode || 'saw';
   const freq=440*Math.pow(2,(note-69)/12)*warp;
-  // LFO drives lead timbre drift + vibrato + note length
+  // LFO only for long-form timbre drift. No note-length / volume wobble --
+  // those made phrases sound like they were breathing wrong.
   const lSlow = lfoBank.get('slow',t);
-  const lMed  = lfoBank.get('med',t);
-  const lFast = lfoBank.get('fast',t);
   // Bias random params toward learned-good lead values
   s.punch = paramMemory.bias('lead','punch', s.punch);
   s.tone  = paramMemory.bias('lead','tone',  s.tone);
@@ -3039,9 +3044,9 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0){
   if(!s._wild && paramMemory.shouldGate('lead', s)){
     s.punch *= 0.7; s.decay *= 0.8; windBoost *= 0.7;
   }
-  const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult*(1+lSlow*0.15)/warp;
+  const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult/warp;
   const atk = _lStyle.attackMult * 0.006;
-  const vol = (0.09+windBoost*0.04+s.punch*0.03) * (1 + lMed*0.10);
+  const vol = 0.09+windBoost*0.04+s.punch*0.03;
 
   // Hard ceiling: 10kHz lowpass on ALL lead modes -- prevents deafening highs
   // Gentle slope (Q=0.5) so it doesn't ring, just rolls off
@@ -4890,6 +4895,8 @@ function App(){
     const mutes=mutesRef.current;
     const ie=ar.inputEnergy||0.5;
     const tick=ar.tick++;
+    // Follow-vs-lead signal visible to every drum sub-block in this scheduleNote.
+    const userIsDrummer = (userRole === 'drum') || ((ar._onsetRate||0) > 2.3);
     Object.values(voices).forEach(v=>v.tick());
     // Keep brain in sync with current chord context
     brain.setChord(chordType);
@@ -5064,10 +5071,8 @@ function App(){
         const sMod0 = isCall?0.7 : isResponse?0.50 : isTurnaround?1.0 : 0.7; // snare much less
         const hMod0 = isCall?0.9 : isResponse?1.30 : isTurnaround?0.7 : 1;
         // Rationality: 1.0 = strict archetype adherence, 0.0 = chaotic variation.
-        // Follow-vs-lead: if the user is drumming (role=drum OR lots of mic onsets),
-        // the AI drums loosen up and leave room. If the user is NOT drumming,
-        // the AI takes charge -- push rationality up so the kit leads the groove.
-        const userIsDrummer = (userRole === 'drum') || ((ar._onsetRate||0) > 2.3);
+        // `userIsDrummer` is set at the top of scheduleNote so every drum
+        // sub-block sees the same signal.
         const baseRat = ar.drumRationality ?? 0.75;
         const rat = userIsDrummer
           ? Math.max(0, Math.min(1, baseRat * 0.55))       // follow: loosen, let user lead
@@ -5075,7 +5080,12 @@ function App(){
         const dp = {k:new Array(16).fill(false), s:new Array(16).fill(false),
                     h:new Array(16).fill(false), hOpen:new Array(16).fill(false)};
         let kickCount = 0;
+        // When AI is leading, cap total kicks to 4 per 16-step bar so the
+        // groove breathes. When the user is drumming, no cap -- they get
+        // the fills and we stay out of their way.
+        const kickCap = userIsDrummer ? 16 : 4;
         for(let st=0;st<16;st++){
+          if(kickCount >= kickCap) break;
           // KICK: step 0 always fires at high rationality; low rat may skip it (rare but possible)
           if(st===0){
             if(rat > 0.2 || Math.random() < 0.85) { dp.k[st]=true; kickCount++; }
@@ -5105,9 +5115,12 @@ function App(){
             if(Math.random()<sEff*sMod0*0.25) dp.s[st]=true; // 0.25 = extra rarity
           }
         }
+        // Hats were firing on basically every step. Halve base probability
+        // and drop it further when the AI is leading -- drums should sit
+        // UNDER the mix, not tap every 16th note.
+        const hatSparsity = userIsDrummer ? 0.75 : 0.40;
         for(let st=0;st<16;st++){
-          // HAT: archetype probability, groove offset baked in, skip kick-dominant beats
-          const hP0=bandTaste.stepProb('h',st,groove,chaos)*(rSug.h?1.2:1.0)*(hist.h?0.55:1.0)*0.85*hMod0;
+          const hP0=bandTaste.stepProb('h',st,groove,chaos)*(rSug.h?1.2:1.0)*(hist.h?0.55:1.0)*0.85*hMod0*hatSparsity;
           if(Math.random()<hP0*motifShape.densityMod) dp.h[st]=true;
           const isDesignatedOpen0=bandTaste.isOpenStep(st,groove);
           const openBase0 = isDesignatedOpen0 ? 0.55+chaos*0.25 : chaos*(isResponse?0.22:0.09);
@@ -5155,15 +5168,18 @@ function App(){
         rhythmMemory.mark(beat,stepsPerMeasure,{h:true});
       }
 
-      // Micro-subdivision: style-driven ghost 32nd-note hat
+      // Micro-subdivision: style-driven ghost 32nd-note hat.
+      // Only fire when the user IS drumming (so the AI fills in between
+      // your hits). When AI leads, these extras overload the groove.
       const stepSec=60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25;
-      if(Math.random()<styleP().microSubdiv && !sup.drum){
+      if(userIsDrummer && Math.random()<styleP().microSubdiv && !sup.drum){
         const ghostT=time+stepSec*0.5*(0.8+Math.random()*0.4);
-        synthHat(ctx,ghostT,false,chaos*0.6,warpMultiplier,bus.getInput('drum'),0.25,0.25); // ghost = very soft
+        synthHat(ctx,ghostT,false,chaos*0.6,warpMultiplier,bus.getInput('drum'),0.25,0.25);
       }
 
-      // Ghost snare (response phase) -- quiet, barely-there
-      if(playGhostSnare && !sup.drum){
+      // Ghost snare: same rule -- only when user is drumming, so they're
+      // fills between your hits, not clutter on top of an AI-led groove.
+      if(userIsDrummer && playGhostSnare && !sup.drum){
         synthSnare(ctx,time+(60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25*0.5),chaos,warpMultiplier,bus.getInput('drum'),0.18);
         voices.drum.play();
       }
