@@ -3626,6 +3626,54 @@ function synthShaker(ctx, t, warp, dest, velocity=0.4){
   autoClean(src,hp,bp,g);
 }
 
+// Noise-substitute pad: pure white noise through three parallel bandpass
+// filters tuned to the chord root / 5th / octave, with LFO-driven formant
+// sweeps. No oscillators at all -- every tonal element is noise shaped by
+// resonant filters, so it breathes, whispers, and shifts as the LFOs move.
+// The "groove orbit" affects the resonance depth so it pulses with the bar.
+function synthNoisePad(ctx, t, notes, chaos, warp, dest, durationBars=1, bpm=110){
+  if(!dest || !Array.isArray(notes) || !notes.length) return;
+  const s = drumSeed();
+  const beatSec = 60/bpm;
+  const dur = beatSec * 4 * durationBars / warp;
+  // Shared noise source -- fill a stereo buffer long enough for the duration
+  const nLen = Math.floor(ctx.sampleRate * dur);
+  const nBuf = ctx.createBuffer(2, nLen, ctx.sampleRate);
+  for(let ch=0; ch<2; ch++){
+    const nd = nBuf.getChannelData(ch);
+    for(let i=0; i<nLen; i++) nd[i] = (Math.random()*2-1)*0.6;
+  }
+  const src = ctx.createBufferSource(); src.buffer = nBuf;
+  // Master envelope with slow swell (fade in over 300ms, out over 25% of dur)
+  const master = ctx.createGain();
+  master.gain.setValueAtTime(0, t);
+  master.gain.linearRampToValueAtTime(0.18 + s.tone*0.06, t + 0.3);
+  master.gain.setValueAtTime(0.18 + s.tone*0.06, t + dur*0.75);
+  master.gain.linearRampToValueAtTime(0.0001, t + dur);
+  // One bandpass per chord tone -- the notes "pitch" the noise without any
+  // actual oscillator, and LFO sweeps the Q so resonance breathes.
+  for(const note of notes){
+    const freq = 440 * Math.pow(2, (note-69)/12) * warp;
+    const bp = ctx.createBiquadFilter(); bp.type = 'bandpass';
+    bp.frequency.value = freq;
+    bp.Q.value = 12 + chaos*18;
+    // LFO on Q for the "formant breathing" effect
+    const qLfo = ctx.createOscillator(); qLfo.type='sine';
+    qLfo.frequency.value = 0.15 + s.color*0.25;
+    const qAmt = ctx.createGain();
+    qAmt.gain.value = 8 + tensionArc.currentFor('mid').r*12;   // groove-aware
+    qLfo.connect(qAmt); qAmt.connect(bp.Q);
+    const bpGain = ctx.createGain();
+    bpGain.gain.value = 0.32;
+    src.connect(bp); bp.connect(bpGain); bpGain.connect(master);
+    qLfo.start(t); qLfo.stop(t + dur + 0.05);
+    autoClean(bp, qLfo, qAmt, bpGain);
+  }
+  master.connect(dest);
+  src.start(t); src.stop(t + dur + 0.05);
+  autoClean(src, master);
+}
+
 // Sustained pad: layered detuned sine/triangle oscillators with a slow
 // filter sweep. Plays the current chord tones for a full bar or longer.
 function synthPad(ctx, t, notes, chaos, warp, dest, durationBars=1, bpm=110){
@@ -5379,6 +5427,28 @@ function App(){
       const windingEnergy=voices.lead.winding*0.5+voices.mid.winding*0.3+voices.bass.winding*0.2;
       bandTaste.evolve(windingEnergy, chaos);
       brain.auto(userRole,[0,4,7,11],chaos,chordType); collectiveBrainSave();
+      // Groove-aware FX modulation: subtly scale the active wet gains so
+      // effects PULSE with the bar position rather than sitting static.
+      // Reverb swells into the back half of the arc; delay bumps on the
+      // downbeat; chorus breathes on a slow sine; crush modulates inversely
+      // to reverb so the mix doesn't pile up. Idempotent per bar.
+      if(bus && bus.ctx && !bus.lean){
+        const arcPos = tensionArc.arcIndex / tensionArc.PHRASE;  // 0..1
+        const now = bus.ctx.currentTime;
+        const pulse = (base, depth, phase)=>Math.max(0, base + depth*Math.sin((arcPos+phase)*Math.PI*2));
+        if(bus.fxEnabled.reverb && bus.reverbWet){
+          bus.reverbWet.gain.setTargetAtTime(pulse(0.42, 0.22, 0.25), now, 0.25);
+        }
+        if(bus.fxEnabled.delay && bus.delayWet){
+          bus.delayWet.gain.setTargetAtTime(pulse(0.42, 0.28, 0.00), now, 0.20);
+        }
+        if(bus.fxEnabled.chorus && bus.chorusWet){
+          bus.chorusWet.gain.setTargetAtTime(pulse(0.42, 0.20, 0.50), now, 0.30);
+        }
+        if(bus.fxEnabled.crush && bus.crushWet){
+          bus.crushWet.gain.setTargetAtTime(pulse(0.38, 0.22, 0.75), now, 0.25);
+        }
+      }
       // Conductor: update every bar based on who the user is playing as.
       conductor.update(userRole);
       // Motion tween: step the per-instrument swing + envelope values toward
@@ -5849,10 +5919,12 @@ function App(){
     if(extraInst === 'auto'){
       const hArc = tensionArc.currentFor('lead').h;
       const barInArc = (ar.measureCount % 8);
-      if(hArc > 0.65)       extraInst = 'arp';       // high tension = motion
-      else if(hArc < 0.25)  extraInst = 'pad';       // low tension = wash
-      else if(barInArc < 4) extraInst = 'shaker';    // first half = texture
-      else                   extraInst = 'perc';     // second half = percussion
+      if(hArc > 0.65)           extraInst = 'arp';       // high tension = motion
+      else if(hArc < 0.15)      extraInst = 'noisepad';  // stillness = noise wash
+      else if(hArc < 0.30)      extraInst = 'pad';       // low tension = pad
+      else if(barInArc < 2)     extraInst = 'cowbell';   // first two bars = cowbell
+      else if(barInArc < 4)     extraInst = 'shaker';    // texture
+      else                       extraInst = 'perc';      // percussion
     }
     if(extraInst==='perc'&&!mutes.drum){
       const percProb=density*0.5*(beat%2===1?1.4:0.4)*(DeviceComp.score<0.4?0.5:1.0);
@@ -5878,6 +5950,11 @@ function App(){
       // Fire a 1-bar pad on chord change / downbeat only.
       const padNotes = (ct.iv||[0,4,7]).map(v=>rootMidi+v);
       synthPad(ctx, time, padNotes, chaos, warpMultiplier, bus.getInput('mid'), 1, (ar.lockedBpm||ar.bpm||110));
+    }
+    if(extraInst==='noisepad'&&!mutes.mid&&beat===0){
+      // Noise-as-tone: filtered white noise instead of oscillators.
+      const padNotes = (ct.iv||[0,4,7]).map(v=>rootMidi+v);
+      synthNoisePad(ctx, time, padNotes, chaos, warpMultiplier, bus.getInput('mid'), 1, (ar.lockedBpm||ar.bpm||110));
     }
     if(extraInst==='arp'&&!mutes.lead){
       const arpProb=density*0.7*(DeviceComp.score<0.4?0.5:1.0);
@@ -6019,6 +6096,11 @@ function App(){
         AR.current.inputEnergy=rms/128;setInputEnergy(Math.min(1,rms/100));
 
         const now2=Date.now();
+        // Intensity = transient strength × volume-to-harmony ratio. Bigger
+        // transient at higher RMS with low tonal coherence = more intense.
+        AR.current._userIntensity = Math.max(0, Math.min(1,
+          (rms/100) * (0.5 + (AR.current.pitchConfLow ? 0.5 : 0))
+        ));
         const isOnset=rms>20&&rms>AR.current.previousEnergy*1.42&&(now2-AR.current.lastOnset)>120;
         if(isOnset){
           const delta=now2-AR.current.lastOnset;AR.current.lastOnset=now2;onsetRate++;
@@ -6032,6 +6114,21 @@ function App(){
             }
             if(swingPct>0&&frame%20===0){setSwing(swingPct);AR.current.swing=swingPct;setDSwing(swingPct);}
             if(sub>2&&frame%40===0)setSubdivisions(sub);
+            // Auto-pick groove based on detected tempo + subdivision so the
+            // AI kit actually follows what the user's playing, not a static
+            // default. Only re-picks once every ~2 seconds (frame%80).
+            if(frame%80===0){
+              let pick = 'standard';
+              if(sub===3 || swingPct > 25)         pick = 'jazzSwing';
+              else if(ab < 80)                     pick = 'halfTime';
+              else if(ab > 135)                    pick = 'fourOnFloor';
+              else if(AR.current._userIntensity > 0.65) pick = 'hiphop';
+              if(pick !== AR.current._userGroove){
+                AR.current._userGroove = pick;
+                AR.current._groove = pick;   // adopt immediately
+                addLog(`GROOVE: ${pick} (${ab}bpm sub ${sub})`);
+              }
+            }
           }
         }
         AR.current.previousEnergy=rms;
@@ -6964,7 +7061,7 @@ function App(){
           <div className="space-y-1.5">
             <div className="text-[8px] text-cyan-400 uppercase tracking-widest font-bold">Extra Instrument</div>
             <div className="grid grid-cols-3 gap-1.5">
-              {[['none','Off'],['auto','Auto'],['arp','Arp'],['perc','Perc'],['shaker','Shaker'],['cowbell','Cowbell'],['pad','Pad']].map(([id,label])=>(
+              {[['none','Off'],['auto','Auto'],['arp','Arp'],['perc','Perc'],['shaker','Shaker'],['cowbell','Cowbell'],['pad','Pad'],['noisepad','Noise']].map(([id,label])=>(
                 <button key={id} onClick={()=>setExtraInst(id)}
                   className={"py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all "+(extraInst===id?'bg-cyan-500/15 text-cyan-300 border-cyan-500/40':'bg-slate-800/50 text-slate-500 border-slate-700 hover:border-cyan-500/20')}>
                   {label}
