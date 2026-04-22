@@ -4,7 +4,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="$HERE/live_ai_band.html"
+SRC="$HERE/index.html"
 DST="$HERE/www/index.html"
 mkdir -p "$HERE/www"
 

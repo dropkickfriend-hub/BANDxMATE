@@ -3104,6 +3104,9 @@ function App(){
   const[keyChangeFlag,setKCFlag]=useState(false);
   const[tempoChangeFlag,setTCFlag]=useState(false);
   const[fxOn,setFxOn]=useState({reverb:false,delay:false,chorus:false,fuzz:false});
+  const[arcIntensity,setArcIntensity]=useState(70); // 0-100, drives tensionArc.intensity
+  const[arcName,setArcName]=useState('—');
+  const[arcBar,setArcBar]=useState(0);
   // Section mutes -- each can be muted; state preserved when re-enabled
   const[mutes,setMutes]=useState({drum:false,bass:false,sub:false,mid:false,lead:false});
   const muteSamplesRef=useRef({drum:null,bass:null,sub:null,mid:null,lead:null});
@@ -3260,6 +3263,17 @@ function App(){
 
   // -- SYNC REFS -------------------------------------------------------------
   useEffect(()=>{AR.current.chaos=chaos;AR.current.density=density;AR.current.swing=swing;AR.current.bpm=bpm;AR.current.drumRationality=drumRationality;AR.current.warpMultiplier=Math.pow(2,recordScratch/100)*(halftime?0.5:1);bus.updateDelayTime(bpm);},[chaos,density,swing,bpm,drumRationality,recordScratch,halftime]);
+
+  // Push arc-intensity slider into the tensionArc module; poll for the current
+  // arc name + bar so the UI reflects whatever the conductor picked.
+  useEffect(()=>{ tensionArc.intensity = arcIntensity/100; },[arcIntensity]);
+  useEffect(()=>{
+    const iv=setInterval(()=>{
+      setArcName(tensionArc.currentArc?.name||'—');
+      setArcBar(tensionArc.arcIndex||0);
+    },500);
+    return()=>clearInterval(iv);
+  },[]);
 
   // -- EXPOSE AR TO WINDOW so the SimColt bridge can read/write it -----------
   useEffect(()=>{ window._bandAR = AR.current; },[]);
@@ -4374,6 +4388,47 @@ function App(){
     a.download=filename; a.click(); URL.revokeObjectURL(a.href);
   };
 
+  // -- SOUNDBANK IMPORT/EXPORT ---------------------------------------------
+  // The soundbank + brain snapshot is the fingerprint of this install's
+  // learning. Export as JSON to back up or share with another device.
+  const exportSoundbank = async () => {
+    const [brainSnap, soundbankSnap, sim3Snap, phrasesSnap] = await Promise.all([
+      genesisLocal.get(BRAIN_NS),
+      genesisLocal.get('soundbank'),
+      genesisLocal.get('sim3'),
+      genesisLocal.get('phrases'),
+    ]);
+    const payload = {
+      _version: 1,
+      _exported_at: new Date().toISOString(),
+      brain: brainSnap, soundbank: soundbankSnap,
+      sim3: sim3Snap, phrases: phrasesSnap,
+    };
+    const blob = new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'bandxmate_soundbank_'+new Date().toISOString().slice(0,10)+'.json';
+    a.click(); URL.revokeObjectURL(a.href);
+    addLog('[SOUNDBANK] Exported '+(soundbankSnap?.ema?.samples||0)+' samples');
+  };
+  const importSoundbank = async (file) => {
+    if(!file) return;
+    try{
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      if(!payload || payload._version!==1) throw new Error('Unrecognised file version');
+      if(payload.brain)     await genesisLocal.put(BRAIN_NS, payload.brain);
+      if(payload.soundbank) await genesisLocal.put('soundbank', payload.soundbank);
+      if(payload.sim3)      await genesisLocal.put('sim3', payload.sim3);
+      if(payload.phrases)   await genesisLocal.put('phrases', payload.phrases);
+      await userSoundbank.load();
+      await collectiveBrainLoad();
+      addLog('[SOUNDBANK] Imported — reload to apply fully');
+    }catch(e){
+      addLog('[SOUNDBANK] Import failed: '+(e?.message||e));
+    }
+  };
+
   const playFullTrack = () => {
     const buf = fullTrackRef.current.buffer; if(!buf)return;
     let ctx = AR.current.ctx;
@@ -4915,7 +4970,11 @@ function App(){
       );
       if(isBassBeat){
         const _bm=styleP().bassMode||'electric';
-        const _bt=time+(Math.random()-0.5)*styleP().microJitter*0.7;
+        // Per-voice arc offset: high rhythmic tension pushes the note off-grid,
+        // and the direction alternates per bar so it feels like intentional pocket.
+        const _arcR=tensionArc.currentFor('bass').r;
+        const _arcDir=((ar.measureCount||0)%2===0)?1:-1;
+        const _bt=time+(Math.random()-0.5)*styleP().microJitter*0.7 + _arcR*0.024*_arcDir;
         const _bDest=bus.getInput('bass');
         if(_bm==='808'||_bm==='hiphop')      synth808(_bt!==undefined?ctx:ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
         else if(_bm==='upright')              synthUprightBass(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
@@ -4943,10 +5002,12 @@ function App(){
         const notes=chaos>0.72?[midBase,midBase+5,midBase+10]:chosenIvs.map(v=>midBase+v);
         const _mm=styleP().midMode||'keys';
         const _midWind = voices.mid.winding*0.07*(ar._breathMid||1.0);
+        const _midArc = tensionArc.currentFor('mid').r * 0.018 * (((ar.measureCount||0)%2===0)?-1:1);
+        const _midT = time + _midArc;
         if(_mm==='rhodes')
-          synthRhodes(ctx,time,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind);
+          synthRhodes(ctx,_midT,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind);
         else
-          synthMid(ctx,time,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind);
+          synthMid(ctx,_midT,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind);
         // Wood percussion layer (African + Indian)
         if(styleP().woodPerc && Math.random()<0.65){
           const _wd=bus.getInput('drum');
@@ -4986,7 +5047,9 @@ function App(){
         const leadNote=rootMidi+iv;
         let ln=leadNote;
         while(ln<60)ln+=12; while(ln>84)ln-=12;
-        synthLead(ctx,time,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0));
+        // Lead anticipates the beat when arc tension is high (leans into the phrase).
+        const _leadArc = -tensionArc.currentFor('lead').r * 0.020;
+        synthLead(ctx,time+_leadArc,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0));
         voices.lead.play();voices.lead.lastNote=ln;
         brain.reward('lead',iv,0.6+voices.lead.glow*0.2+bandTaste.darkness*(iv%12===10||iv%12===3?0.2:-0.1),chordType);
       }
@@ -5922,6 +5985,7 @@ function App(){
             {l:'Density',c:'text-purple-400',v:Math.round(density*100)+'%',min:0,max:1,step:.01,val:density,set:setDensity,f:true},
             {l:'Tempo',c:'text-slate-400',v:bpm+' BPM (max '+DeviceComp.maxBpm+')',min:40,max:DeviceComp.maxBpm,step:1,val:Math.min(bpm,DeviceComp.maxBpm),set:setBpm,f:false},
             {l:'Swing',c:'text-amber-400',v:swing+'%',min:0,max:100,step:1,val:swing,set:setSwing,f:false},
+            {l:'Arc',c:'text-emerald-400',v:arcName+(arcName!=='—'?' '+(arcBar+1)+'/8':'')+' · '+arcIntensity+'%',min:0,max:100,step:1,val:arcIntensity,set:setArcIntensity,f:false},
           ].map(({l,c,v,min,max,step,val,set,f})=>(
             <div key={l}>
               <div className="flex justify-between text-[8px] uppercase tracking-widest mb-1">
@@ -5953,6 +6017,20 @@ function App(){
             className={"w-full py-1.5 rounded-lg text-[10px] font-bold tracking-widest uppercase border transition-all "+(lockedIn?'bg-cyan-500/12 text-cyan-300 border-cyan-500/45 locked':'bg-slate-800/60 text-slate-400 border-slate-700 hover:border-cyan-500/30')}>
             {lockedIn?'[lock] Locked In':'[unlock] Lock In Groove'}
           </button>
+          <div>
+            <div className="text-[9px] text-emerald-400 uppercase tracking-widest font-bold mb-1.5">Soundbank</div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button onClick={exportSoundbank}
+                className="py-1.5 rounded-lg text-[9px] font-bold uppercase tracking-widest border bg-emerald-500/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20 transition-all">
+                Export
+              </button>
+              <label className="py-1.5 rounded-lg text-[9px] font-bold uppercase tracking-widest border bg-slate-800/60 text-slate-400 border-slate-700 hover:border-emerald-500/40 hover:text-emerald-400 text-center cursor-pointer transition-all">
+                Import
+                <input type="file" accept="application/json" className="hidden"
+                  onChange={e=>{importSoundbank(e.target.files[0]); e.target.value='';}}/>
+              </label>
+            </div>
+          </div>
         </div>
 
         {/* COL 3: FX + Launch */}
