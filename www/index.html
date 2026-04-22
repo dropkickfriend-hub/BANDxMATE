@@ -163,6 +163,16 @@ const bandTaste = {
   // Groove archetype weights -- which patterns feel "like us"
   // Each archetype is a 16-step kick/snare/hat template (1=strong, 0.5=maybe, 0=off)
   grooveArchetypes: {
+    // The default "normal drum beat". Kick on 1 and 3, snare on 2 and 4,
+    // closed hat on every 8th note. Textbook pop/rock backbeat -- what you
+    // hum when you think "drums".
+    standard: {
+      k:[1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0],
+      s:[0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0],
+      h:[1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0],
+      openSteps:[],   // no open hats by default
+      label:'standard'
+    },
     // name: [K0,K1..K15, S0..S15, H0..H15]  (16 steps each, 48 values)
     fourOnFloor: {
       k:[1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0],
@@ -215,8 +225,8 @@ const bandTaste = {
   },
 
   // Current archetype weights (evolve over time)
-  archetypeWeights: {fourOnFloor:0.3, breakbeat:0.15, halfTime:0.15,
-                     bossaNova:0.15, hiphop:0.15, jazzSwing:0.1},
+  archetypeWeights: {standard:0.55, fourOnFloor:0.15, breakbeat:0.08, halfTime:0.07,
+                     bossaNova:0.05, hiphop:0.05, jazzSwing:0.05},
 
   // Harmonic taste: preference weights per chord quality
   chordTaste: {maj:0.5,min:0.5,dom7:0.4,maj7:0.4,min7:0.4,
@@ -810,7 +820,8 @@ class AudioBus{
     this.delayNode=null;this.delayWet=null;
     this.chorusDelay=null;this.chorusWet=null;
     this.fuzzNode=null;this.fuzzWet=null;this.fuzzDry=null;
-    this.fxEnabled={reverb:false,delay:false,chorus:false,fuzz:false};
+    this.crushNode=null;this.crushWet=null;
+    this.fxEnabled={reverb:false,delay:false,chorus:false,fuzz:false,crush:false};
   }
 
   init(ctx, lean=false){
@@ -951,6 +962,26 @@ class AudioBus{
       this.fuzzNode.connect(fuzzHPF);fuzzHPF.connect(fuzzGain);fuzzGain.connect(masterGain);
     }
 
+    // CRUSH -- bitcrusher via waveshaper quantization on the harmonic bus
+    if(!lean){
+      const crushCurve=(()=>{
+        const n=4096, curve=new Float32Array(n);
+        const levels=20;   // ~4.3 bits, audibly crunchy but still musical
+        for(let i=0;i<n;i++){
+          const x=i*2/n-1;
+          curve[i]=Math.round(x*levels)/levels;
+        }
+        return curve;
+      })();
+      this.crushNode=ctx.createWaveShaper();
+      this.crushNode.curve=crushCurve;
+      this.crushNode.oversample='2x';
+      this.crushWet=ctx.createGain(); this.crushWet.gain.value=0; // off by default
+      const crushGain=ctx.createGain(); crushGain.gain.value=0.8;
+      this.send.connect(this.crushWet);this.crushWet.connect(this.crushNode);
+      this.crushNode.connect(crushGain);crushGain.connect(masterGain);
+    }
+
     // Dry send to master (always present)
     this.send.connect(masterGain);
   }
@@ -969,7 +1000,7 @@ class AudioBus{
     if(!this.ctx||this.lean)return false; // lean mode has no FX
     this.fxEnabled[name]=!this.fxEnabled[name];
     const on=this.fxEnabled[name];
-    const nodes={reverb:this.reverbWet,delay:this.delayWet,chorus:this.chorusWet};
+    const nodes={reverb:this.reverbWet,delay:this.delayWet,chorus:this.chorusWet,crush:this.crushWet};
     // Fuzz uses parallel wet/dry swap instead of a single wet gain
     if(name==='fuzz'){
       const on=this.fxEnabled.fuzz;
@@ -1491,7 +1522,7 @@ const autoFx = {
       mask = entry.mask.slice();
     }else{
       // Explore -- bias toward few FX at once (never more than 2)
-      mask = [Math.random()<0.35, Math.random()<0.25, Math.random()<0.22, Math.random()<0.10];
+      mask = [Math.random()<0.35, Math.random()<0.25, Math.random()<0.22, Math.random()<0.10, Math.random()<0.07];
       let on = mask.filter(Boolean).length;
       while(on > 2){
         const idx = mask.findIndex(v=>v);
@@ -1505,7 +1536,7 @@ const autoFx = {
 
   apply(bus, mask){
     if(!bus || !bus.ctx || bus.lean) return;
-    const names = ['reverb','delay','chorus','fuzz'];
+    const names = ['reverb','delay','chorus','fuzz','crush'];
     names.forEach((n,i)=>{
       if(!!bus.fxEnabled[n] !== !!mask[i]) bus.toggleFx(n);
     });
@@ -1781,6 +1812,37 @@ const tensionArc = {
     // Double-arc: two rise/falls per phrase for tighter breath.
     {name:'double', offsets:{drum:0,bass:2,mid:1,lead:3},
       fn:(b)=>{ const c=Math.abs(Math.sin((b/4)*Math.PI)); return {h:c, r:c*0.7}; }},
+    // To-to-pause-from: push, push, silent bar, then pull all the way back.
+    // Two bars of growing tension, one bar of near-stillness, five bars of
+    // gradual resolution. The pause is the punchline.
+    {name:'to_to_pause_from', offsets:{drum:0,bass:1,mid:3,lead:5},
+      fn:(b)=>{
+        if(b===0) return {h:0.5, r:0.4};
+        if(b===1) return {h:0.85, r:0.6};
+        if(b===2) return {h:0.10, r:0.05};      // PAUSE bar
+        const t = (b-3)/4;                       // 0..1 across bars 3..7
+        const c = 0.75 * (1 - t);
+        return {h:c, r:c*0.8};
+      }},
+    // From-from-from: already tense, STAY tense, slowly earn the release.
+    // For moments where nothing should resolve cleanly.
+    {name:'from_from_from', offsets:{drum:0,bass:2,mid:4,lead:6},
+      fn:(b)=>{
+        const c = 0.75 - (b/7)*0.35;             // 0.75 down to 0.40
+        return {h:c + 0.1*Math.sin(b*1.3), r:c*0.7};
+      }},
+    // Stutter: tension flickers in short bursts. Great for glitch feel.
+    {name:'stutter', offsets:{drum:0,bass:3,mid:1,lead:5},
+      fn:(b)=>{
+        const hi = (b%2===0);
+        return {h: hi ? 0.80 : 0.20, r: hi ? 0.85 : 0.15};
+      }},
+    // Wave: long rising swell, short crash back to zero. Cinematic.
+    {name:'wave', offsets:{drum:0,bass:2,mid:3,lead:5},
+      fn:(b)=>{
+        if(b<6){ const t=b/5; return {h: t*t, r: t*0.85}; }
+        return {h: 0.05, r: 0.05};
+      }},
   ],
 
   pickArc(){
@@ -2004,6 +2066,26 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
 
   // Always the classic sine-sweep body. No recipe rotation on drums.
   kickSineSweep(ctx, t, warp, dest, f0, f1, decay, punch, s, sp);
+
+  // ── 808-STYLE SUB: classic deep-pitch-glide layer for hiphop/edm/
+  // westcoast/eastcoast kick styles. Long sine that glides from ~90Hz down
+  // to ~40Hz over decay*4, driven into saturation so it hits chest-level.
+  if(kickStyle==='edm'||kickStyle==='hiphop'||kickStyle==='westcoast'||kickStyle==='eastcoast'){
+    const sub808 = ctx.createOscillator(); sub808.type='sine';
+    sub808.frequency.setValueAtTime(90*warp, t);
+    sub808.frequency.exponentialRampToValueAtTime(Math.max(35, 42*warp), t + decay*3.5);
+    const sat = ctx.createWaveShaper();
+    const sc = new Float32Array(512);
+    for(let i=0;i<512;i++){ const x=i*2/512-1; sc[i]=Math.tanh(x*2.2); }
+    sat.curve = sc;
+    const sg = ctx.createGain();
+    sg.gain.setValueAtTime(0, t);
+    sg.gain.linearRampToValueAtTime(punch*0.85, t+0.003);
+    sg.gain.exponentialRampToValueAtTime(0.0001, t + decay*4 + 0.05);
+    sub808.connect(sat); sat.connect(sg); sg.connect(dest);
+    sub808.start(t); sub808.stop(t + decay*4 + 0.08);
+    autoClean(sub808, sat, sg);
+  }
 
   // ── EDM extra: pre-kick click burst (the "knock") ────────────────────
   // Shared across recipes -- it's a style cue, not a body character.
@@ -3494,6 +3576,28 @@ function synthArp(ctx, t, note, chaos, warp, dest, windBoost=0){
   autoClean(exc,res1,res2,g1,g2,mix,env);
 }
 
+// Cowbell: classic Roland/Yamaha TR-style cowbell. Two detuned square
+// oscillators at 540Hz and 800Hz (industry-standard cowbell partials) put
+// through a bandpass, with a sharp amplitude envelope.
+function synthCowbell(ctx, t, warp, dest, velocity=0.6){
+  if(!dest) return;
+  const s = drumSeed();
+  const f1 = 540 * warp * (1 + (s.pitch-0.85)*0.05);
+  const f2 = 800 * warp * (1 + (s.pitch-0.85)*0.05);
+  const o1 = ctx.createOscillator(); o1.type='square'; o1.frequency.value=f1;
+  const o2 = ctx.createOscillator(); o2.type='square'; o2.frequency.value=f2;
+  const bp = ctx.createBiquadFilter(); bp.type='bandpass';
+  bp.frequency.value = 800 * warp; bp.Q.value = 1.8 + s.tone*0.8;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(velocity*0.5, t+0.001);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + (0.15 + s.decay*0.10)/warp);
+  o1.connect(bp); o2.connect(bp); bp.connect(g); g.connect(dest);
+  o1.start(t); o2.start(t);
+  o1.stop(t+0.30/warp); o2.stop(t+0.30/warp);
+  autoClean(o1,o2,bp,g);
+}
+
 // Shaker / cabasa texture. Granular noise burst bandpassed in the shaker
 // frequency range. Each call produces a slightly different shake.
 function synthShaker(ctx, t, warp, dest, velocity=0.4){
@@ -3659,7 +3763,7 @@ function App(){
   const[motifFlag,setMotifFlag]=useState(false);
   const[keyChangeFlag,setKCFlag]=useState(false);
   const[tempoChangeFlag,setTCFlag]=useState(false);
-  const[fxOn,setFxOn]=useState({reverb:false,delay:false,chorus:false,fuzz:false});
+  const[fxOn,setFxOn]=useState({reverb:false,delay:false,chorus:false,fuzz:false,crush:false});
   const[autoFxActive,setAutoFxActive]=useState(false);
   const[gateActive,setGateActive]=useState(false);
   const[arcIntensity,setArcIntensity]=useState(70); // 0-100, drives tensionArc.intensity
@@ -3835,8 +3939,8 @@ function App(){
       if(autoFx.active && bus && bus.fxEnabled){
         setFxOn(p=>{
           const b=bus.fxEnabled;
-          if(p.reverb===b.reverb && p.delay===b.delay && p.chorus===b.chorus && p.fuzz===b.fuzz) return p;
-          return {reverb:!!b.reverb, delay:!!b.delay, chorus:!!b.chorus, fuzz:!!b.fuzz};
+          if(p.reverb===b.reverb && p.delay===b.delay && p.chorus===b.chorus && p.fuzz===b.fuzz && p.crush===b.crush) return p;
+          return {reverb:!!b.reverb, delay:!!b.delay, chorus:!!b.chorus, fuzz:!!b.fuzz, crush:!!b.crush};
         });
       }
     },500);
@@ -5420,11 +5524,12 @@ function App(){
     // -- DRUMS (groove-archetype driven) ------------------------------------
     if(!sup.drum&&!mutes.drum){
       // Pick archetype once per measure (beat 0), carry it forward
-      // Pick an archetype once and hold it. Only change on 8-bar phrase
-      // boundaries -- the drummer doesn't switch grooves every bar.
-      if(!ar._groove || (beat===0 && (ar.measureCount % 8) === 0)){
-        ar._groove = bandTaste.pickArchetype();
-      }
+      // Lock the drum groove to 'standard' (kick 1&3, snare 2&4, 8th hats)
+      // unless the user has explicitly picked another archetype via the UI.
+      // The drummer doesn't change groove unless told to.
+      if(!ar._groove) ar._groove = ar._userGroove || 'standard';
+      // If the user has changed their groove selection since last bar, adopt it.
+      if(ar._userGroove && ar._userGroove !== ar._groove) ar._groove = ar._userGroove;
       const groove=ar._groove||'fourOnFloor';
       const b16=beat%16;
 
@@ -5761,6 +5866,12 @@ function App(){
       if(Math.random()<shakerProb){
         const vel = 0.25 + tensionArc.currentFor('drum').r*0.2;
         synthShaker(ctx,time,warpMultiplier,bus.getInput('drum'),vel);
+      }
+    }
+    if(extraInst==='cowbell'&&!mutes.drum){
+      // Roland/Yamaha TR cowbell: fires on the "and" of each beat.
+      if(beat%4===2 && density > 0.3){
+        synthCowbell(ctx,time,warpMultiplier,bus.getInput('drum'),0.5+density*0.3);
       }
     }
     if(extraInst==='pad'&&!mutes.mid&&beat===0){
@@ -6654,6 +6765,18 @@ function App(){
               );
             })}
           </div>
+          <button onClick={()=>{
+            // Wipe learned synth params + soundbank EMA so drumSeed produces a
+            // completely fresh timbral distribution on next hit. Doesn't touch
+            // Q-table or groove -- just the SOUND DESIGN of each voice.
+            paramMemory.voices = {drum:{m:{},n:0}, bass:{m:{},n:0}, mid:{m:{},n:0}, lead:{m:{},n:0}};
+            userSoundbank.ema = null;
+            genesisLocal.put('soundbank', {ema:null, _ts:Date.now()});
+            addLog('[SOUND] Regenerated -- voices will drift into a new timbre');
+          }}
+            className="w-full py-1.5 rounded-lg text-[9px] font-bold uppercase tracking-widest border bg-slate-800/60 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/15 hover:border-emerald-500/50 transition-all">
+            Regen Sound Design
+          </button>
           <div className="text-[7px] text-slate-600 uppercase">Neural sub+bass . never stack</div>
           {isPlaying&&<div className="space-y-1">
             <div className="text-[7px] text-slate-600 uppercase tracking-widest">GR meters</div>
@@ -6764,8 +6887,8 @@ function App(){
                 </button>
               </div>
             </div>
-            <div className="grid grid-cols-4 gap-1.5">
-              {['reverb','delay','chorus','fuzz'].map(n=>(
+            <div className="grid grid-cols-5 gap-1.5">
+              {['reverb','delay','chorus','fuzz','crush'].map(n=>(
                 <button key={n} onClick={()=>toggleFx(n)}
                   className={"py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all "+(fxOn[n]?'bg-emerald-500/15 text-emerald-300 border-emerald-500/40':'bg-slate-800/60 text-slate-500 border-slate-700 hover:border-slate-500')}>
                   {n}{autoFxActive?' *':''}
@@ -6841,7 +6964,7 @@ function App(){
           <div className="space-y-1.5">
             <div className="text-[8px] text-cyan-400 uppercase tracking-widest font-bold">Extra Instrument</div>
             <div className="grid grid-cols-3 gap-1.5">
-              {[['none','Off'],['auto','Auto'],['arp','Arp'],['perc','Perc'],['shaker','Shaker'],['pad','Pad']].map(([id,label])=>(
+              {[['none','Off'],['auto','Auto'],['arp','Arp'],['perc','Perc'],['shaker','Shaker'],['cowbell','Cowbell'],['pad','Pad']].map(([id,label])=>(
                 <button key={id} onClick={()=>setExtraInst(id)}
                   className={"py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all "+(extraInst===id?'bg-cyan-500/15 text-cyan-300 border-cyan-500/40':'bg-slate-800/50 text-slate-500 border-slate-700 hover:border-cyan-500/20')}>
                   {label}
