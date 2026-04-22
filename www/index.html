@@ -512,6 +512,7 @@ const collectiveBrainLoad=async()=>{
     if(p.convergence) convergenceTracker.load(p.convergence);
   if(p.taste) bandTaste.load(p.taste);
   if(p.songHistory) songHistory.load(p.songHistory);
+    if(p.tensionArc) tensionArc.load(p.tensionArc);
     const voicingCount=Object.values(brain.voicingMem).reduce((s,a)=>s+a.length,0);
     console.log('[GenesisBrain] Loaded -- n:'+brain.n+' phrases:'+motifEng.phrases.length+' voicings:'+voicingCount);
   }catch(e){console.warn('[GenesisBrain] Brain load failed',e);}
@@ -535,6 +536,7 @@ const collectiveBrainSave=()=>{
         convergence: convergenceTracker.serialize(),
         taste:       bandTaste.serialize(),
         songHistory: songHistory.serialize(),
+        tensionArc:  tensionArc.serialize(),
         _ts:         Date.now()
       };
       await genesisLocal.put(BRAIN_NS,payload);
@@ -1194,12 +1196,20 @@ class Brain{
   choose(role,opts,chaos,chordCtx){
     this.n++; this.eps=Math.max(0.04,0.35-this.n*0.0002);
     const ctx=chordCtx||this._ctx;
+    // Harmonic tension bias from the current arc: 0 = favor consonance,
+    // 1 = actively seek dissonance. Interpolates the consonance preference
+    // so at full tension the dissonant intervals win.
+    const th = (typeof tensionArc!=='undefined' && tensionArc.currentFor)
+      ? tensionArc.currentFor(role).h : 0;
     if(Math.random()>this.eps){
       let b=opts[0],bw=-Infinity;
       for(const v of opts){
         const ctxVal =(this.q[this._k(role,v,ctx)]??0.5);
         const globVal=(this.q[this._k(role,v,'global')]??0.5);
-        const w=(ctxVal*0.7+globVal*0.3)*(1+this.con(v)*(1-chaos*.6));
+        const cons=this.con(v);
+        // effectiveCon flips from cons -> (1-cons) as tension rises.
+        const effectiveCon = cons*(1-th) + (1-cons)*th;
+        const w=(ctxVal*0.7+globVal*0.3)*(1+effectiveCon*(1-chaos*.6));
         if(w>bw){bw=w;b=v;}
       }
       return b;
@@ -1518,10 +1528,106 @@ function mergeProfile(base, bias){
   return out;
 }
 
+// -- TENSION ARC -------------------------------------------------------------
+// Every 8 bars a conductor picks an "arc" from the library and assigns each
+// voice a phase offset so voices stretch into and out of dissonance on their
+// own schedule. `currentFor(role)` returns {h,r}: harmonic + rhythmic tension
+// in 0..1. h biases Brain.choose toward dissonance; r widens microJitter,
+// tightens note length, nudges swing via styleP's mergeProfile.
+const tensionArc = {
+  PHRASE: 8,
+  currentArc: null,
+  phaseOffset: {drum:0, bass:2, mid:4, lead:6},
+  arcIndex: 0,
+  intensity: 0.7,           // global 0..1 scaling -- can be turned up for chaotic moods
+  lastArcName: null,
+
+  library: [
+    // Straight: everyone rises to bar 4 and resolves by bar 7.
+    {name:'straight', offsets:{drum:0,bass:0,mid:0,lead:0},
+      fn:(b)=>{ const c=Math.sin((b/7)*Math.PI); return {h:c, r:c*0.75}; }},
+    // Mirror: harmony and rhythm swap -- when one is tense, the other rests.
+    {name:'mirror', offsets:{drum:0,bass:0,mid:2,lead:4},
+      fn:(b)=>{ const t=b/7; return {h:Math.sin(t*Math.PI), r:Math.sin((t+0.5)*Math.PI)}; }},
+    // Call-and-response: tension flips each bar, passing voice-to-voice via offsets.
+    {name:'call_response', offsets:{drum:0,bass:1,mid:2,lead:3},
+      fn:(b)=>({h:(b%2===0)?0.9:0.15, r:(b%2===0)?0.3:0.7})},
+    // Slow bloom: 6 bars of gradual tension, hard release on bar 7.
+    {name:'slow_bloom', offsets:{drum:0,bass:1,mid:2,lead:3},
+      fn:(b)=>{ if(b===7) return {h:0.05, r:0.1}; return {h:(b/6)*0.95, r:(b/6)*0.55}; }},
+    // Shock-settle: max tension on bar 0, earn the resolution back over 7 bars.
+    {name:'shock_settle', offsets:{drum:0,bass:2,mid:4,lead:6},
+      fn:(b)=>({h:Math.max(0, 1 - b/6), r:Math.max(0, 0.8 - b/7)})},
+    // Polyrhythm: harmony steady, rhythm pulses 3-over-4.
+    {name:'polyrhythm', offsets:{drum:0,bass:0,mid:1,lead:2},
+      fn:(b)=>({h:0.45, r:(b%3===0)?0.9:0.2})},
+    // Ballad breathe: low overall tension, gentle swells.
+    {name:'ballad', offsets:{drum:0,bass:1,mid:3,lead:5},
+      fn:(b)=>{ const c=0.3+0.25*Math.sin((b/7)*Math.PI*2); return {h:c, r:c*0.45}; }},
+    // Double-arc: two rise/falls per phrase for tighter breath.
+    {name:'double', offsets:{drum:0,bass:2,mid:1,lead:3},
+      fn:(b)=>{ const c=Math.abs(Math.sin((b/4)*Math.PI)); return {h:c, r:c*0.7}; }},
+  ],
+
+  pickArc(){
+    const lib=this.library;
+    let idx=Math.floor(Math.random()*lib.length);
+    if(lib[idx].name===this.lastArcName && lib.length>1) idx=(idx+1)%lib.length;
+    const pick=lib[idx];
+    this.currentArc=pick;
+    this.phaseOffset={...pick.offsets};
+    this.lastArcName=pick.name;
+  },
+
+  advance(barCount){
+    if(!this.currentArc || barCount%this.PHRASE===0) this.pickArc();
+    this.arcIndex=((barCount%this.PHRASE)+this.PHRASE)%this.PHRASE;
+  },
+
+  currentFor(role){
+    if(!this.currentArc) return {h:0, r:0};
+    const off=this.phaseOffset[role]||0;
+    const b=((this.arcIndex+off)%this.PHRASE+this.PHRASE)%this.PHRASE;
+    const raw=this.currentArc.fn(b);
+    return {
+      h:Math.max(0,Math.min(1,(raw.h||0)*this.intensity)),
+      r:Math.max(0,Math.min(1,(raw.r||0)*this.intensity)),
+    };
+  },
+
+  // Rhythmic bias for styleP (feeds the same mergeProfile path as userSoundbank).
+  // Uses the drum voice's rhythm tension (with a bass tail) since styleP is global.
+  rhythmicBias(){
+    const dR=this.currentFor('drum').r;
+    const bR=this.currentFor('bass').r;
+    const r=Math.max(dR, bR*0.8);
+    return {
+      microJitter: 1 + r*1.5,     // up to 2.5x grid scatter under max tension
+      swingBoost:  r*6 - 3,       // small swing drift: -3..+3 ticks
+      noteLenMult: 1 - r*0.15,    // tenser = shorter, more staccato
+      attackMult:  1 - r*0.25,    // tenser = punchier attack
+    };
+  },
+
+  serialize(){ return {name:this.currentArc?.name||null, idx:this.arcIndex, int:this.intensity}; },
+  load(d){
+    if(!d) return;
+    if(d.name){
+      const f=this.library.find(a=>a.name===d.name);
+      if(f){ this.currentArc=f; this.phaseOffset={...f.offsets}; this.lastArcName=f.name; }
+    }
+    if(typeof d.idx==='number') this.arcIndex=d.idx;
+    if(typeof d.int==='number') this.intensity=d.int;
+  },
+};
+if(typeof window!=='undefined') window.tensionArc=tensionArc;
+
 // Helper: returns the current style profile object, biased by the user soundbank
+// and then by the current rhythmic tension arc.
 function styleP(){
   const base = STYLE_PROFILES[kickStyle]||STYLE_PROFILES.pop;
-  return mergeProfile(base, userSoundbank.currentBias());
+  const withUser = mergeProfile(base, userSoundbank.currentBias());
+  return mergeProfile(withUser, tensionArc.rhythmicBias());
 }
 
 // Lerp between profile range values using a seed float [0-1]
@@ -4524,6 +4630,12 @@ function App(){
       const windingEnergy=voices.lead.winding*0.5+voices.mid.winding*0.3+voices.bass.winding*0.2;
       bandTaste.evolve(windingEnergy, chaos);
       brain.auto(userRole,[0,4,7,11],chaos,chordType); collectiveBrainSave();
+      // Advance the tension arc one bar (may switch to a new arc on phrase boundary).
+      const _prevArc = tensionArc.currentArc?.name;
+      tensionArc.advance(ar.measureCount);
+      if(tensionArc.currentArc?.name !== _prevArc){
+        addLog('[ARC] '+tensionArc.currentArc.name+' (phase '+ar.measureCount+')');
+      }
       // Feed this bar's inputs into the per-install soundbank.
       userSoundbank.observe({
         chaosAvg:   chaos,
