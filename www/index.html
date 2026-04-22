@@ -513,6 +513,7 @@ const collectiveBrainLoad=async()=>{
   if(p.taste) bandTaste.load(p.taste);
   if(p.songHistory) songHistory.load(p.songHistory);
     if(p.tensionArc) tensionArc.load(p.tensionArc);
+    if(p.paramMemory) paramMemory.load(p.paramMemory);
     const voicingCount=Object.values(brain.voicingMem).reduce((s,a)=>s+a.length,0);
     console.log('[GenesisBrain] Loaded -- n:'+brain.n+' phrases:'+motifEng.phrases.length+' voicings:'+voicingCount);
   }catch(e){console.warn('[GenesisBrain] Brain load failed',e);}
@@ -537,6 +538,7 @@ const collectiveBrainSave=()=>{
         taste:       bandTaste.serialize(),
         songHistory: songHistory.serialize(),
         tensionArc:  tensionArc.serialize(),
+        paramMemory: paramMemory.serialize(),
         _ts:         Date.now()
       };
       await genesisLocal.put(BRAIN_NS,payload);
@@ -1327,16 +1329,82 @@ const rhythmMemory={
 // Every hit is uniquely generated -- random seeds shape timbre, not just volume.
 // No two kicks, snares, hats, or bass notes sound identical.
 
-// Unique seed -> unique timbre parameters for each hit
-function drumSeed(){return{
-  pitch:   0.85+Math.random()*0.30,   // fundamental pitch offset
-  punch:   0.72+Math.random()*0.26,   // attack intensity
-  decay:   0.38+Math.random()*0.28,   // body length
-  tone:    0.60+Math.random()*0.40,   // tonal vs noisy balance
-  sub:     0.50+Math.random()*0.50,   // sub-octave weight
-  click:   0.30+Math.random()*0.70,   // transient click brightness
-  color:   Math.random(),             // spectral character (used differently per drum)
-};}
+// -- LFO BANK ---------------------------------------------------------------
+// Always-running low-frequency oscillators shared by every synth voice.
+// Each voice samples LFO values when it fires and uses them to modulate
+// cutoff / pitch / filter / sub gain / velocity so no two hits land on
+// exactly the same timbre even when the random seed repeats.
+// LFOs have different rates so long-form drift and short-form pulse coexist.
+const lfoBank = {
+  // rates in Hz. slow = long-form drift; breath = multi-bar swell;
+  // med = phrase-level motion; fast = vibrato; pulse = 4-bar sawtooth.
+  rates: { slow: 0.07, med: 0.41, fast: 2.3, pulse: 0.22, breath: 0.033 },
+  // returns value in roughly [-1, 1]. t is AudioContext.currentTime.
+  get(name, t){
+    const r = this.rates[name] ?? 1;
+    const dt = (t||0) * r;
+    if(name === 'pulse') return ((dt % 1) * 2 - 1);
+    return Math.sin(dt * Math.PI * 2);
+  },
+  // Composite scalar in [0,1] for "openness" of timbre at time t -- used to
+  // judge whether random artifacts are currently welcome or unwanted.
+  openness(t){
+    return Math.max(0, Math.min(1, 0.5 + 0.35*this.get('slow',t) + 0.15*this.get('breath',t)));
+  },
+};
+if(typeof window!=='undefined') window.lfoBank=lfoBank;
+
+// -- PARAM MEMORY -----------------------------------------------------------
+// Per-voice EMA of synth-parameter values weighted by how "good" the hit
+// was (voice winding at observation time). Random seeds get pulled toward
+// the learned-good distribution, so unwanted artifacts (weird clicky kicks,
+// thin snares) gradually lose weight. `bias()` blends raw random with the
+// learned mean by a factor proportional to our confidence (sample count).
+const paramMemory = {
+  voices: { drum:{m:{},n:0}, bass:{m:{},n:0}, mid:{m:{},n:0}, lead:{m:{},n:0} },
+
+  observe(role, params, score){
+    const v = this.voices[role]; if(!v) return;
+    const s = Math.max(0, Math.min(1, score||0));
+    if(s < 0.05) return;                  // ignore silent / neutral hits
+    const a = 0.05 + 0.15*s;               // learning rate 0.05..0.20
+    for(const [k, val] of Object.entries(params)){
+      if(typeof val !== 'number' || !isFinite(val)) continue;
+      v.m[k] = v.m[k] != null ? v.m[k]*(1-a) + val*a : val;
+    }
+    v.n++;
+  },
+
+  // Pull a raw random value toward the learned mean. `confidence` scales
+  // with how many observations we have (capped so we don't fully lock in).
+  bias(role, key, rawValue){
+    const v = this.voices[role]; if(!v || v.m[key] == null) return rawValue;
+    const conf = Math.min(0.55, v.n/40);   // 0 when fresh, 0.55 after ~40 obs
+    return rawValue*(1-conf) + v.m[key]*conf;
+  },
+
+  serialize(){ return Object.fromEntries(Object.entries(this.voices).map(([k,v])=>[k,{m:v.m,n:v.n}])); },
+  load(d){ if(!d) return; for(const k of Object.keys(this.voices)){ if(d[k]) this.voices[k]={m:d[k].m||{},n:d[k].n||0}; } },
+};
+if(typeof window!=='undefined') window.paramMemory=paramMemory;
+
+// Unique seed -> unique timbre parameters for each hit. Wider ranges +
+// occasional "wildcard" hits so the kit never settles into one voice.
+// Biased by paramMemory.bias() so good random choices get reinforced.
+function drumSeed(){
+  const wild = Math.random() < 0.07;     // ~7% of hits break out of normal range
+  const r = () => wild ? Math.random()*1.6 - 0.3 : Math.random();   // wildcard can go negative / >1
+  return {
+    pitch:   paramMemory.bias('drum','pitch', 0.70 + r()*0.55),  // wider fundamental offset
+    punch:   paramMemory.bias('drum','punch', 0.60 + r()*0.42),
+    decay:   paramMemory.bias('drum','decay', 0.28 + r()*0.48),
+    tone:    paramMemory.bias('drum','tone',  0.45 + r()*0.55),
+    sub:     paramMemory.bias('drum','sub',   0.35 + r()*0.70),
+    click:   paramMemory.bias('drum','click', 0.20 + r()*0.85),
+    color:   Math.random(),                                       // left unbiased -- wildcard spectrum
+    _wild:   wild,
+  };
+}
 
 // Anti-click: schedule a micro fade-in/out on any gain node
 // This ensures waveform returns to zero before node stops -- eliminates pops
@@ -1636,12 +1704,20 @@ function styleLerp(range, seed){ return range[0] + seed*(range[1]-range[0]); }
 function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   const s=drumSeed();
   const sp=styleP(); // current style profile
+  // LFO samples at trigger time -- continuous drift across hits
+  const lSlow = lfoBank.get('slow',t);
+  const lMed  = lfoBank.get('med',t);
+  const lBr   = lfoBank.get('breath',t);
+  // Observe: punchy non-wildcard kicks teach the "good kick" distribution.
+  if(!s._wild && inputEnergy > 0.45){
+    paramMemory.observe('drum', {pitch:s.pitch,punch:s.punch,decay:s.decay,tone:s.tone,sub:s.sub,click:s.click}, inputEnergy);
+  }
 
-  // ── Style-shaped parameters ────────────────────────────────────────────
-  const f0 = styleLerp(sp.kickF0, s.pitch+inputEnergy*0.3) * warp;
-  const f1 = styleLerp(sp.kickF1, s.pitch) * warp;
-  const decay = styleLerp(sp.kickDecay, s.decay+inputEnergy*0.2) / warp;
-  const punch = styleLerp(sp.kickPunch, s.punch) * (0.8+inputEnergy*0.2);
+  // ── Style-shaped parameters (LFO-nudged so each hit differs) ──────────
+  const f0 = styleLerp(sp.kickF0, s.pitch+inputEnergy*0.3) * warp * (1 + lSlow*0.04);
+  const f1 = styleLerp(sp.kickF1, s.pitch) * warp * (1 + lMed*0.06);
+  const decay = styleLerp(sp.kickDecay, s.decay+inputEnergy*0.2) / warp * (1 + lBr*0.18);
+  const punch = styleLerp(sp.kickPunch, s.punch) * (0.8+inputEnergy*0.2) * (1 + lMed*0.08);
 
   // ── EDM extra: pre-kick click burst (the "knock") ────────────────────
   if(kickStyle==='edm'){
@@ -1731,8 +1807,10 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
 
 function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5){
   const s=drumSeed();
-  const bodyFreq=(155+s.pitch*90+inputTight*50)*warp;
-  const tightness=s.tone*(0.5+inputTight*0.5);
+  const lSlow = lfoBank.get('slow',t);
+  const lMed  = lfoBank.get('med',t);
+  const bodyFreq=(155+s.pitch*90+inputTight*50)*warp * (1 + lSlow*0.05);
+  const tightness=s.tone*(0.5+inputTight*0.5) * (1 + lMed*0.12);
 
   // -- BODY: tonal thump -- unique pitch and decay per hit ------------------
   const body=ctx.createOscillator();
@@ -1797,7 +1875,13 @@ function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7){
   const isRide  = open && !isCrash && s.tone > 0.65;
   const cymType = isCrash?'crash':isRide?'ride':open?'open':'closed';
   const hatMode = styleP().hatMode || 'metallic';
-  synthCymbal(ctx, t, cymType, s, warp, dest, inputBright, velocity, hatMode);
+  // LFO-modulated brightness so consecutive hat hits drift in timbre
+  const lBr = lfoBank.get('breath',t);
+  const lFast = lfoBank.get('fast',t);
+  synthCymbal(ctx, t, cymType, s, warp, dest,
+    Math.max(0.05, Math.min(1, inputBright + lBr*0.15)),
+    velocity * (1 + lFast*0.08),
+    hatMode);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2647,6 +2731,14 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   const freq=440*Math.pow(2,(note-69)/12)*warp;
   const s=drumSeed();
   const pc=((note%12)+12)%12; const pcMod=pc/12;
+  // LFO modulation for bass: slow filter sweep, med cutoff wobble, fast vibrato
+  const lSlow = lfoBank.get('slow',t);
+  const lMed  = lfoBank.get('med',t);
+  const lFast = lfoBank.get('fast',t);
+  // Bias a few per-hit parameters toward learned-good bass values.
+  const biasP = paramMemory.bias('bass','punch', s.punch);
+  const biasT = paramMemory.bias('bass','tone',  s.tone);
+  s.punch = biasP; s.tone = biasT;
 
   // Neural inputs -- same brain as sub, different inference
   const inputs=bassBrain.update(windBoost*10, chaos, pcMod, beat);
@@ -2664,18 +2756,20 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   // -- BODY OSCILLATOR ---------------------------------------------------
   const body=ctx.createOscillator(); body.type=bodyType;
   body.frequency.value=freq*(1+s.color*0.004);
-  body.detune.value=(pcMod*8-4)+(s.color*5-2.5);
+  body.detune.value=(pcMod*8-4)+(s.color*5-2.5) + lFast*3.5; // vibrato from LFO
 
   // -- RESONANT FILTER: neural cutoff + mode-specific envelope ----------
   const flt=ctx.createBiquadFilter(); flt.type='lowpass';
   const baseQ={pluck:4.5,slap:6.0,sustain:2.5,growl:8.0}[mode];
-  flt.Q.value=baseQ+chaos*8+nn.filterCutoff*5+s.punch*3;
+  flt.Q.value=baseQ+chaos*8+nn.filterCutoff*5+s.punch*3 + lMed*0.8;
 
-  // Filter envelope: each mode has distinct shape
+  // Filter envelope: each mode has distinct shape. LFO widens the opening
+  // point over time so the same note picks a different cutoff on each hit.
   const fOpen={pluck:800,slap:2200,sustain:600,growl:1400}[mode];
   const fClose={pluck:80,slap:120,sustain:180,growl:60}[mode];
-  flt.frequency.setValueAtTime((fOpen+windBoost*400+inputChar*600+chaos*1200+pcMod*300)*warp, t);
-  flt.frequency.exponentialRampToValueAtTime((fClose+pcMod*30)*warp, t+decayTime);
+  const lfoCutoff = lSlow*220 + lMed*140;
+  flt.frequency.setValueAtTime(Math.max(80,(fOpen+windBoost*400+inputChar*600+chaos*1200+pcMod*300+lfoCutoff)*warp), t);
+  flt.frequency.exponentialRampToValueAtTime(Math.max(40,(fClose+pcMod*30)*warp), t+decayTime);
 
   // -- GAIN ENVELOPE -----------------------------------------------------
   const _atk=styleP().attackMult;
@@ -2736,6 +2830,10 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   body.connect(flt); flt.connect(g); g.connect(dest);
   body.start(t); body.stop(t+decayTime+0.08);
   autoClean(body,flt,g);
+  // Teach the bass "good-params" distribution on strong, non-wildcard hits.
+  if(!s._wild && windBoost > 0.28){
+    paramMemory.observe('bass', {punch:s.punch,tone:s.tone,color:s.color,pitch:s.pitch}, Math.min(1, windBoost*1.6));
+  }
 }
 
 function synthMid(ctx,t,notes,chordType,chaos,warp,dest,windBoost=0){
@@ -2819,9 +2917,17 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0){
   const _lStyle=styleP();
   const mode = _lStyle.leadMode || 'saw';
   const freq=440*Math.pow(2,(note-69)/12)*warp;
-  const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult/warp;
+  // LFO drives lead timbre drift + vibrato + note length
+  const lSlow = lfoBank.get('slow',t);
+  const lMed  = lfoBank.get('med',t);
+  const lFast = lfoBank.get('fast',t);
+  // Bias random params toward learned-good lead values
+  s.punch = paramMemory.bias('lead','punch', s.punch);
+  s.tone  = paramMemory.bias('lead','tone',  s.tone);
+  s.color = paramMemory.bias('lead','color', s.color);
+  const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult*(1+lSlow*0.15)/warp;
   const atk = _lStyle.attackMult * 0.006;
-  const vol = 0.09+windBoost*0.04+s.punch*0.03;
+  const vol = (0.09+windBoost*0.04+s.punch*0.03) * (1 + lMed*0.10);
 
   // Hard ceiling: 10kHz lowpass on ALL lead modes -- prevents deafening highs
   // Gentle slope (Q=0.5) so it doesn't ring, just rolls off
@@ -2965,6 +3071,10 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0){
     vib.start(t);vib.stop(t+durT+0.02);
     sub.start(t);sub.stop(t+durT+0.02);
     autoClean(carrier,vib,vibGain,sub,subGain,lpf,master);
+  }
+  // Teach the lead "good-params" distribution on strong, non-wildcard hits.
+  if(!s._wild && windBoost > 0.25){
+    paramMemory.observe('lead', {punch:s.punch,tone:s.tone,color:s.color,decay:s.decay}, Math.min(1, windBoost*1.8));
   }
 }
 
@@ -4124,14 +4234,17 @@ function App(){
       if(this.seen.length>this.maxHistory) this.seen.pop();
     },
 
-    // Penalize Q-table entries that match seen chord progressions
+    // Penalize Q-table entries that match seen chord progressions.
+    // Drums get a much lighter penalty (factor 0.92 vs 0.75) because a rational
+    // groove is SUPPOSED to recur -- we don't want to un-learn the backbeat.
     penalizeBrain(events, rootPC){
       const seenPCs = new Set(events.filter(e=>e.note).map(e=>((((e.note%12)-rootPC)+12)%12)));
+      const ROLE_FACTOR = {lead:0.75, mid:0.75, bass:0.75, drum:0.92};
       for(const pc of seenPCs){
-        for(const role of['lead','mid','bass']){
+        for(const role of['lead','mid','bass','drum']){
           const key=`${role}_${pc}`;
           for(const k of Object.keys(brain.q)){
-            if(k.startsWith(key)) brain.q[k] = (brain.q[k]||0.5)*0.75; // reduce by 25%
+            if(k.startsWith(key)) brain.q[k] = (brain.q[k]||0.5)*ROLE_FACTOR[role];
           }
         }
       }
@@ -4809,9 +4922,15 @@ function App(){
         const kMod0 = isCall?1.2 : isResponse?0.65 : isTurnaround?1.4 : 1;
         const sMod0 = isCall?0.7 : isResponse?0.50 : isTurnaround?1.0 : 0.7; // snare much less
         const hMod0 = isCall?0.9 : isResponse?1.30 : isTurnaround?0.7 : 1;
-        // Rationality: 1.0 = strict archetype adherence, 0.0 = chaotic variation
-        // High rationality locks in the archetype template; low rationality introduces noise.
-        const rat = Math.max(0, Math.min(1, ar.drumRationality ?? 0.75));
+        // Rationality: 1.0 = strict archetype adherence, 0.0 = chaotic variation.
+        // Follow-vs-lead: if the user is drumming (role=drum OR lots of mic onsets),
+        // the AI drums loosen up and leave room. If the user is NOT drumming,
+        // the AI takes charge -- push rationality up so the kit leads the groove.
+        const userIsDrummer = (userRole === 'drum') || ((ar._onsetRate||0) > 2.3);
+        const baseRat = ar.drumRationality ?? 0.75;
+        const rat = userIsDrummer
+          ? Math.max(0, Math.min(1, baseRat * 0.55))       // follow: loosen, let user lead
+          : Math.max(0, Math.min(1, Math.max(baseRat, 0.82))); // lead: high floor, stick to archetype
         const dp = {k:new Array(16).fill(false), s:new Array(16).fill(false),
                     h:new Array(16).fill(false), hOpen:new Array(16).fill(false)};
         let kickCount = 0;
@@ -5254,7 +5373,9 @@ function App(){
 
         // Role classification
         if(frame%38===0){
-          const nr=classifyRole(bF,rms,confidenceRef.current,onsetRate/38);onsetRate=0;
+          const normOnsets=onsetRate/38;
+          AR.current._onsetRate = normOnsets; // expose to scheduler for follow-vs-lead
+          const nr=classifyRole(bF,rms,confidenceRef.current,normOnsets);onsetRate=0;
           if(nr!==AR.current.userRole){
             AR.current.userRole=nr;setUserRole(nr);
             if(nr!=='unknown')addLog(`You: ${nr.toUpperCase()} . AI fills: ${['drum','bass','mid','lead'].filter(r=>r!==nr).join(', ')}`);
