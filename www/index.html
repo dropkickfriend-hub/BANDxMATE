@@ -821,6 +821,7 @@ class AudioBus{
     this.chorusDelay=null;this.chorusWet=null;
     this.fuzzNode=null;this.fuzzWet=null;this.fuzzDry=null;
     this.crushNode=null;this.crushWet=null;
+    this.dropFilter=null;         // biquad in master path, animated during buildup
     this.fxEnabled={reverb:false,delay:false,chorus:false,fuzz:false,crush:false};
   }
 
@@ -830,6 +831,14 @@ class AudioBus{
     this.master=ctx.createGain();this.master.gain.value=1;this.master.connect(ctx.destination);
     this.ctx=ctx;this.inited=true;
 
+    // -- DROP FILTER: biquad in master path, default allpass/flat. During
+    // EDM/hiphop beat-drop buildups it's automated to sweep for the classic
+    // riser effect. Idle = wide open highpass at 20Hz (effectively bypass).
+    this.dropFilter=ctx.createBiquadFilter();
+    this.dropFilter.type='highpass';
+    this.dropFilter.frequency.value=20;
+    this.dropFilter.Q.value=0.7;
+
     // -- LIMITER: brick wall at -0.5 dBFS -- speakers safe, nothing clips ---
     // threshold=-0.5dB, ratio=20:1, knee=0, attack=0.001s, release=0.05s
     this.limiter=ctx.createDynamicsCompressor();
@@ -838,6 +847,7 @@ class AudioBus{
     this.limiter.ratio.value=20.0;   // effectively infinite limiting
     this.limiter.attack.value=0.001; // 1ms -- catches fast transients
     this.limiter.release.value=0.05; // 50ms -- quick recovery
+    this.dropFilter.connect(this.limiter);
     this.limiter.connect(ctx.destination);
 
     // -- MASTER BUS COMPRESSOR: glue everything together ------------------
@@ -848,7 +858,7 @@ class AudioBus{
     this.masterComp.ratio.value=2.5;
     this.masterComp.attack.value=0.025;  // 25ms -- lets kick/snare transients breathe
     this.masterComp.release.value=0.18;  // 180ms
-    this.masterComp.connect(this.limiter);
+    this.masterComp.connect(this.dropFilter);
 
     const masterGain=ctx.createGain();masterGain.gain.value=0.80;
     masterGain.connect(this.masterComp);
@@ -1898,6 +1908,50 @@ const tensionArc = {
 };
 if(typeof window!=='undefined') window.tensionArc=tensionArc;
 
+// -- BEAT DROP ENGINE -------------------------------------------------------
+// Classic EDM/hiphop tension-and-release structure. Every N bars (default 16)
+// the last couple of bars are a stutter buildup and the top of the next
+// cycle is THE DROP. During buildup the tension arc is forced to 'stutter'
+// and the master gets a filter swell. On the drop, kick gets an extra
+// 200Hz EQ bump and bass+sub get forced hits on the 1 so the layers stack.
+// Auto-enables for hiphop/edm/westcoast/eastcoast styles -- can be toggled
+// off from the UI.
+const beatDropEngine = {
+  active: false,             // user-toggled (or auto-enabled by style)
+  cycleBars: 16,             // full cycle length
+  buildupBars: 2,            // how many bars of stutter/build
+  lastDropBar: -1,
+
+  // Which styles deserve this behaviour by default. User can override.
+  autoStyles: new Set(['hiphop','edm','westcoast','eastcoast']),
+
+  shouldAutoEnable(style){ return this.autoStyles.has(style); },
+
+  _barInCycle(measureCount){
+    return ((measureCount % this.cycleBars) + this.cycleBars) % this.cycleBars;
+  },
+
+  isBuildup(measureCount){
+    if(!this.active) return false;
+    const b = this._barInCycle(measureCount);
+    return b >= (this.cycleBars - this.buildupBars);
+  },
+
+  isDrop(measureCount){
+    if(!this.active || measureCount <= 0) return false;
+    return this._barInCycle(measureCount) === 0;
+  },
+
+  // 0 -> 1 across the buildup bars. Used to sweep the filter.
+  buildupProgress(measureCount){
+    if(!this.isBuildup(measureCount)) return 0;
+    const b = this._barInCycle(measureCount);
+    const rel = b - (this.cycleBars - this.buildupBars);
+    return (rel + 1) / this.buildupBars;
+  },
+};
+if(typeof window!=='undefined') window.beatDropEngine=beatDropEngine;
+
 // -- CONDUCTOR + MOTION TWEENS ------------------------------------------------
 // The "conductor" is the voice everyone else follows. If the user plays drums,
 // bass takes the baton and provides the harmonic/timing anchor. If the user
@@ -2066,6 +2120,31 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
 
   // Always the classic sine-sweep body. No recipe rotation on drums.
   kickSineSweep(ctx, t, warp, dest, f0, f1, decay, punch, s, sp);
+
+  // DROP MODE: when beatDropEngine says this is the drop bar, stack the
+  // kick much heavier. Extra 200Hz EQ bump, longer decay, extra 808 layer.
+  const isDrop = !!(typeof window!=='undefined' && window._bandAR && window._bandAR._isDrop);
+  if(isDrop){
+    // Big 200Hz peaking EQ for chest thump
+    const dropEq = ctx.createBiquadFilter(); dropEq.type='peaking';
+    dropEq.frequency.value = 160; dropEq.Q.value = 1.2;
+    dropEq.gain.value = 10;     // +10dB at ~160Hz on drop
+    const dropEq2 = ctx.createBiquadFilter(); dropEq2.type='peaking';
+    dropEq2.frequency.value = 60; dropEq2.Q.value = 0.9;
+    dropEq2.gain.value = 6;     // +6dB at 60Hz for sub shelf
+    dropEq.connect(dropEq2); dropEq2.connect(dest);
+    // Re-run the sine-sweep body into this EQ chain for extra thump
+    const dropBody = ctx.createOscillator(); dropBody.type='sine';
+    dropBody.frequency.setValueAtTime(f0*1.05, t);
+    dropBody.frequency.exponentialRampToValueAtTime(f1*0.8, t + decay*1.6);
+    const dbg = ctx.createGain();
+    dbg.gain.setValueAtTime(0, t);
+    dbg.gain.linearRampToValueAtTime(punch*0.9, t+0.003);
+    dbg.gain.exponentialRampToValueAtTime(0.0001, t + decay*1.6 + 0.04);
+    dropBody.connect(dbg); dbg.connect(dropEq);
+    dropBody.start(t); dropBody.stop(t + decay*1.6 + 0.06);
+    autoClean(dropBody, dbg, dropEq, dropEq2);
+  }
 
   // ── 808-STYLE SUB: classic deep-pitch-glide layer for hiphop/edm/
   // westcoast/eastcoast kick styles. Long sine that glides from ~90Hz down
@@ -3814,6 +3893,7 @@ function App(){
   const[fxOn,setFxOn]=useState({reverb:false,delay:false,chorus:false,fuzz:false,crush:false});
   const[autoFxActive,setAutoFxActive]=useState(false);
   const[gateActive,setGateActive]=useState(false);
+  const[dropEngineOn,setDropEngineOn]=useState(false);
   const[arcIntensity,setArcIntensity]=useState(70); // 0-100, drives tensionArc.intensity
   const[arcName,setArcName]=useState('—');
   const[arcBar,setArcBar]=useState(0);
@@ -3983,6 +4063,8 @@ function App(){
     const iv=setInterval(()=>{
       setArcName(tensionArc.currentArc?.name||'—');
       setArcBar(tensionArc.arcIndex||0);
+      // Drop engine can be auto-enabled by style; sync its UI toggle.
+      if(dropEngineOn !== beatDropEngine.active) setDropEngineOn(beatDropEngine.active);
       // Keep FX button LEDs in sync when autoFx flips toggles under us.
       if(autoFx.active && bus && bus.fxEnabled){
         setFxOn(p=>{
@@ -5461,6 +5543,51 @@ function App(){
       if(tensionArc.currentArc?.name !== _prevArc){
         addLog('[ARC] '+tensionArc.currentArc.name+' (phase '+ar.measureCount+')');
       }
+
+      // Beat-drop: auto-enable for EDM/hiphop/westcoast/eastcoast styles,
+      // then override the arc during buildup bars with 'stutter' and sweep
+      // the master dropFilter upward. The DROP happens at bar 0 of the
+      // next cycle -- we signal it via ar._isDrop, which synthKick reads.
+      beatDropEngine.active = beatDropEngine.active || beatDropEngine.shouldAutoEnable(kickStyle);
+      if(beatDropEngine.active){
+        if(beatDropEngine.isBuildup(ar.measureCount)){
+          // Force the stutter arc for the buildup (if available)
+          const stutterArc = tensionArc.library.find(a=>a.name==='stutter');
+          if(stutterArc && tensionArc.currentArc?.name !== 'stutter'){
+            tensionArc.currentArc = stutterArc;
+            tensionArc.phaseOffset = {...stutterArc.offsets};
+            tensionArc.lastArcName = 'stutter';
+          }
+          // Sweep the drop filter: highpass rises 20Hz -> 180Hz over buildup,
+          // and the Q climbs to 6 for that classic riser squeal.
+          if(bus && bus.ctx && bus.dropFilter){
+            const p = beatDropEngine.buildupProgress(ar.measureCount);
+            const now = bus.ctx.currentTime;
+            bus.dropFilter.frequency.setTargetAtTime(20 + p*220, now, 0.18);
+            bus.dropFilter.Q.setTargetAtTime(0.7 + p*6, now, 0.18);
+          }
+          ar._isDrop = false;
+        } else if(beatDropEngine.isDrop(ar.measureCount)){
+          // THE DROP: release the filter, boost bass, signal synthKick
+          if(bus && bus.ctx && bus.dropFilter){
+            const now = bus.ctx.currentTime;
+            bus.dropFilter.frequency.setTargetAtTime(20, now, 0.05);  // slam back open
+            bus.dropFilter.Q.setTargetAtTime(0.7, now, 0.05);
+          }
+          ar._isDrop = true;
+          addLog('[DROP] measure '+ar.measureCount);
+        } else {
+          ar._isDrop = false;
+          // Keep the filter resting during verse
+          if(bus && bus.ctx && bus.dropFilter){
+            const now = bus.ctx.currentTime;
+            bus.dropFilter.frequency.setTargetAtTime(20, now, 0.4);
+            bus.dropFilter.Q.setTargetAtTime(0.7, now, 0.4);
+          }
+        }
+      } else {
+        ar._isDrop = false;
+      }
       // Auto-FX: on arc change OR every 4 bars, re-decide the FX combo.
       // Observe winding of harmonic voices (mid+lead) to reward the last choice.
       if(autoFx.active){
@@ -5769,12 +5896,31 @@ function App(){
       while(baseNote<28)baseNote+=12;
       while(baseNote>52)baseNote-=12;
 
-      // Sub bass: plays on beat 0 and beat bb (half note positions)
+      // Sub bass: plays on beat 0 and beat bb (half note positions).
+      // On DROP bar: force sub+bass to ALL fire at beat 0 with the kick so
+      // the layers stack for a unified mega-hit on the 1. Drop also forces
+      // an extra-loud bass hit simultaneously.
       const isSubBeat=(beat===0||(beat===bb&&Math.random()<0.75));
       if(isSubBeat&&!mutes.sub){
         synthSubBass(ctx,time,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,beat);
         voices.bass.play();voices.bass.lastNote=baseNote;
         if(deafModeRef.current||hapticModeRef.current==='bass')hap.subBass(ar.lockedBpm||ar.bpm);
+      }
+      // DROP LAYERING: on beat 0 of the drop bar, also fire the bass note
+      // so kick + sub + bass all hit together. This is what makes drops
+      // slam -- the transient of the kick is reinforced by the attack
+      // envelope of the bass at the same moment.
+      if(ar._isDrop && beat===0 && !mutes.bass){
+        const _bDest = bus.getInput('bass');
+        const _bm = styleP().bassMode || 'electric';
+        const w = voices.bass.winding*0.08 + 0.15;   // extra impact
+        if(_bm==='808'||_bm==='hiphop')   synth808(ctx,time,baseNote,chaos,warpMultiplier,w,_bDest);
+        else if(_bm==='upright')           synthUprightBass(ctx,time,baseNote,chaos,warpMultiplier,w,_bDest);
+        else if(_bm==='gfunk')             synthGFunkBass(ctx,time,baseNote,chaos,warpMultiplier,w,voices.bass.lastNote||baseNote,_bDest);
+        else if(_bm==='boombap')           synthBoomBapBass(ctx,time,baseNote,chaos,warpMultiplier,w,_bDest);
+        else if(_bm==='afrosub')           synthAfroSub(ctx,time,baseNote,chaos,warpMultiplier,ie,w,_bDest);
+        else                                synthBass(ctx,time,baseNote,chaos,warpMultiplier,w,ie,beat,_bDest);
+        voices.bass.play();
       }
 
       // Bass: motif-shaped -- call=driving, response=sparse, turnaround=anticipate.
@@ -7059,7 +7205,14 @@ function App(){
 
           {/* EXTRA INSTRUMENT */}
           <div className="space-y-1.5">
-            <div className="text-[8px] text-cyan-400 uppercase tracking-widest font-bold">Extra Instrument</div>
+            <div className="flex justify-between items-center">
+              <div className="text-[8px] text-cyan-400 uppercase tracking-widest font-bold">Extra Instrument</div>
+              <button onClick={()=>{ beatDropEngine.active = !beatDropEngine.active; setDropEngineOn(beatDropEngine.active); addLog('[DROP] engine '+(beatDropEngine.active?'ON':'OFF')); }}
+                title="Beat drop engine: 2-bar stutter buildup + filter swell every 16 bars, with a layered mega-kick on the drop bar."
+                className={"px-1.5 py-0.5 rounded text-[7px] font-bold uppercase tracking-widest border transition-all "+(dropEngineOn?'bg-amber-500/20 text-amber-300 border-amber-500/50':'bg-slate-800/60 text-slate-500 border-slate-700 hover:border-amber-500/30')}>
+                Drop
+              </button>
+            </div>
             <div className="grid grid-cols-3 gap-1.5">
               {[['none','Off'],['auto','Auto'],['arp','Arp'],['perc','Perc'],['shaker','Shaker'],['cowbell','Cowbell'],['pad','Pad'],['noisepad','Noise']].map(([id,label])=>(
                 <button key={id} onClick={()=>setExtraInst(id)}
