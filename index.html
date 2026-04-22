@@ -515,6 +515,7 @@ const collectiveBrainLoad=async()=>{
     if(p.tensionArc) tensionArc.load(p.tensionArc);
     if(p.paramMemory) paramMemory.load(p.paramMemory);
     if(p.autoFx) autoFx.load(p.autoFx);
+    if(p.sessionJudge) sessionJudge.load(p.sessionJudge);
     const voicingCount=Object.values(brain.voicingMem).reduce((s,a)=>s+a.length,0);
     console.log('[GenesisBrain] Loaded -- n:'+brain.n+' phrases:'+motifEng.phrases.length+' voicings:'+voicingCount);
   }catch(e){console.warn('[GenesisBrain] Brain load failed',e);}
@@ -541,6 +542,7 @@ const collectiveBrainSave=()=>{
         tensionArc:  tensionArc.serialize(),
         paramMemory: paramMemory.serialize(),
         autoFx:      autoFx.serialize(),
+        sessionJudge: sessionJudge.serialize(),
         _ts:         Date.now()
       };
       await genesisLocal.put(BRAIN_NS,payload);
@@ -1188,6 +1190,32 @@ class Brain{
     this.n=0;
     this.eps=0.35;
     this._ctx='maj';
+    // Seed Q-table with consonance-weighted priors so we're not brute-forcing
+    // evolution from nothing. Each (role, interval, chord) starts with a
+    // value derived from music theory (P5/P4/M3 high, tritone/m2 low),
+    // not 0.5-flat. Learning refines this; it doesn't build it from scratch.
+    this._seedPriors();
+  }
+
+  // Pre-populate q[] for every (role, interval, chord) combination. Lead and
+  // mid favor consonance more strongly than bass (bass already moves in 5ths
+  // as its job, so dissonance carries more weight there). This replaces
+  // "start at 0.5 and explore" with "start with good taste and refine".
+  _seedPriors(){
+    const roles = ['lead','mid','bass'];
+    const chords = ['maj','min','dom7','maj7','min7','dom9','min11','quar','dim','aug','lydian','global'];
+    const roleBias = {lead:0.8, mid:0.7, bass:0.55};   // how much consonance matters
+    for(const role of roles){
+      const bias = roleBias[role] ?? 0.7;
+      for(const ct of chords){
+        for(let iv=0; iv<12; iv++){
+          const cons = this.con(iv);
+          // Low end ~0.35 (dissonance), high end ~0.85 (consonance), shaped by role.
+          const prior = 0.35 + cons * 0.50 * bias;
+          this.q[`${role}_${iv}_${ct}`] = prior;
+        }
+      }
+    }
   }
 
   // Consonance grading. Perfect 5th (7) is the strongest in-key interval --
@@ -3466,6 +3494,113 @@ function synthArp(ctx, t, note, chaos, warp, dest, windBoost=0){
   autoClean(exc,res1,res2,g1,g2,mix,env);
 }
 
+// Shaker / cabasa texture. Granular noise burst bandpassed in the shaker
+// frequency range. Each call produces a slightly different shake.
+function synthShaker(ctx, t, warp, dest, velocity=0.4){
+  if(!dest) return;
+  const s = drumSeed();
+  const len = Math.floor(ctx.sampleRate * (0.045 + s.tone*0.03));
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  // Granular: fast exponential decay + micro-bursts to simulate beads
+  for(let i=0; i<len; i++){
+    const burst = (i % Math.floor(6 + s.color*6) === 0) ? 1.6 : 1.0;
+    d[i] = (Math.random()*2-1) * Math.pow(1 - i/len, 3.2) * burst;
+  }
+  const src = ctx.createBufferSource(); src.buffer = buf;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass';
+  bp.frequency.value = (5500 + s.click*3000) * warp;
+  bp.Q.value = 1.8 + s.tone*1.4;
+  const hp = ctx.createBiquadFilter(); hp.type = 'highpass';
+  hp.frequency.value = 2000 * warp;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(velocity*0.9, t + 0.002);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.050/warp);
+  src.connect(hp); hp.connect(bp); bp.connect(g); g.connect(dest);
+  src.start(t); src.stop(t + 0.08/warp);
+  autoClean(src,hp,bp,g);
+}
+
+// Sustained pad: layered detuned sine/triangle oscillators with a slow
+// filter sweep. Plays the current chord tones for a full bar or longer.
+function synthPad(ctx, t, notes, chaos, warp, dest, durationBars=1, bpm=110){
+  if(!dest || !Array.isArray(notes) || !notes.length) return;
+  const s = drumSeed();
+  const beatSec = 60/bpm;
+  const dur = beatSec * 4 * durationBars / warp;   // 1 bar of 4/4
+  // One oscillator per chord tone, plus a detune partner for width
+  const master = ctx.createGain();
+  master.gain.setValueAtTime(0, t);
+  master.gain.linearRampToValueAtTime(0.22 + s.tone*0.08, t + 0.18);  // slow swell
+  master.gain.setValueAtTime(0.22 + s.tone*0.08, t + dur*0.75);
+  master.gain.linearRampToValueAtTime(0.0001, t + dur);
+  const lpf = ctx.createBiquadFilter(); lpf.type='lowpass';
+  lpf.Q.value = 0.7;
+  lpf.frequency.setValueAtTime((500 + chaos*800) * warp, t);
+  lpf.frequency.linearRampToValueAtTime((1200 + chaos*1600) * warp, t + dur*0.6);
+  lpf.frequency.exponentialRampToValueAtTime(Math.max(100,(600 + chaos*300) * warp), t + dur);
+  master.connect(lpf); lpf.connect(dest);
+  for(const note of notes){
+    const freq = 440*Math.pow(2,(note-69)/12) * warp;
+    for(let d=-1; d<=1; d++){
+      const osc = ctx.createOscillator();
+      osc.type = d===0 ? 'triangle' : 'sine';
+      osc.frequency.value = freq;
+      osc.detune.value = d * (6 + s.color*8);
+      osc.connect(master);
+      osc.start(t); osc.stop(t + dur + 0.05);
+      autoClean(osc);
+    }
+  }
+  autoClean(master, lpf);
+}
+
+// -- SESSION JUDGE -----------------------------------------------------------
+// Scores each bar 0..1 and funnels that into brain.reward + bandTaste so the
+// band actually learns in session. Starts with priors from music theory (see
+// Brain._seedPriors) so it isn't brute-forcing; the judge nudges taste toward
+// what's landing well THIS session.
+// Inputs:
+//   voiceWinding: average winding of mid+lead (proxy for "is this interesting?")
+//   arcAlignment: did the bar's dissonance match tensionArc's target? [0..1]
+//   userAlignment: did the mic/MIDI user play align with the AI? [0..1]
+// Output: score rolled into an EMA; feeds the brain's recent picks and the
+//   bandTaste groove-archetype weight.
+const sessionJudge = {
+  score: 0.5,            // running EMA of quality [0..1]
+  barsJudged: 0,
+
+  evaluate({voiceWinding=0, arcAlignment=0.5, userAlignment=0.5}){
+    // Weight: voice winding 50%, arc alignment 30%, user alignment 20%.
+    const raw = voiceWinding*0.5 + arcAlignment*0.3 + userAlignment*0.2;
+    const quality = Math.max(0, Math.min(1, raw));
+    // EMA so a single bad bar doesn't nuke weeks of learning
+    this.score = this.score*0.85 + quality*0.15;
+    this.barsJudged++;
+    return this.score;
+  },
+
+  // Feed the quality score back into the brain + taste. Recent Q entries that
+  // led to a high-scoring bar get a small positive reinforcement; low-scoring
+  // bars get a small negative.
+  feedback(recentPicks, currentGroove){
+    const delta = this.score - 0.5;    // negative = below average, positive = above
+    const gain = delta * 0.08;          // small step; learning adds up over time
+    for(const pick of recentPicks){
+      const k = `${pick.role}_${((pick.iv%12)+12)%12}_${pick.chord||'global'}`;
+      brain.q[k] = Math.max(0, Math.min(1, (brain.q[k]??0.5) + gain));
+    }
+    if(currentGroove && bandTaste.archetypeWeights[currentGroove] != null){
+      bandTaste.reinforceArchetype(currentGroove, Math.max(0.1, Math.min(0.9, this.score)));
+    }
+  },
+
+  serialize(){ return {score:this.score, barsJudged:this.barsJudged}; },
+  load(d){ if(!d) return; if(typeof d.score==='number') this.score=d.score; if(typeof d.barsJudged==='number') this.barsJudged=d.barsJudged; },
+};
+if(typeof window!=='undefined') window.sessionJudge=sessionJudge;
+
 // -- ONBOARDING FLOW -----------------------------------------------------------
 const GUIDE_STEPS=[
   {id:'welcome',title:'Welcome to Live AI Band',
@@ -5110,6 +5245,23 @@ function App(){
 
     if(beat===0){
       ar.measureCount=(ar.measureCount||0)+1;
+      // Per-voice pause system: voices can take 1-2 bars off so the groove
+      // can breathe. New rests are seeded sparingly (roughly every 6-10
+      // bars per voice) and only when tension is low.
+      if(!ar._restBars) ar._restBars = {bass:0, mid:0, lead:0};
+      for(const r of ['bass','mid','lead']){
+        if(ar._restBars[r] > 0) ar._restBars[r]--;
+      }
+      const arcTension = tensionArc.currentFor('lead').h;
+      if(arcTension < 0.35){
+        // Seed a fresh rest at low tension
+        for(const r of ['bass','mid','lead']){
+          if(ar._restBars[r] === 0 && Math.random() < 0.10){
+            ar._restBars[r] = Math.random() < 0.65 ? 1 : 2;
+            addLog('[REST] '+r+' pauses '+ar._restBars[r]+' bar'+(ar._restBars[r]>1?'s':''));
+          }
+        }
+      }
       flushBarQueue(); // Apply queued user inputs at bar boundary
       ar.measuresThisChord=(ar.measuresThisChord||0)+1;
       // Motif phase: call(1-2) / response(3) / turnaround(4) within each phrase
@@ -5163,6 +5315,17 @@ function App(){
       // Commit last measure's rhythm pattern to memory
       const windingSum=(voices.drum.winding+voices.bass.winding+voices.mid.winding+voices.lead.winding)*0.25;
       rhythmMemory.commitMeasure(chordType, windingSum, stepsPerMeasure);
+      // Session judge: score the bar that just finished. Rewards flow to the
+      // brain's recent picks so the band actually learns what worked this
+      // session, starting from the seeded priors rather than from nothing.
+      const harmonicWind = (voices.mid.winding + voices.lead.winding)*0.5 / 20; // roughly 0..1
+      const arcH = tensionArc.currentFor('lead').h;
+      // Alignment: did we match the arc's target tension via our chord picks?
+      const arcAlignment = Math.max(0, 1 - Math.abs(arcH - (bandTaste.tension||0.4)));
+      const userAlignment = (ar.inputEnergy||0) > 0.05 ? 0.6 : 0.5; // neutral if idle
+      sessionJudge.evaluate({voiceWinding:Math.min(1, harmonicWind), arcAlignment, userAlignment});
+      sessionJudge.feedback(ar._recentPicks || [], ar._groove);
+      ar._recentPicks = [];   // reset for next bar
       // -- LEARNING ENGINES --------------------------------------------------
       const sim3Ch=window._sim3ChaosLatest||chaos;
       chaosRewardEngine.update(sim3Ch, chordType);
@@ -5422,6 +5585,7 @@ function App(){
     // Bass fills offbeats and syncopations. They share winding memory.
     if(!sup.bass&&!mutes.bass&&bassOpts.length){
       const iv=brain.choose(userRole,bassOpts,chaos,effectiveChord);
+      (ar._recentPicks ||= []).push({role:'bass', iv, chord:effectiveChord});
       // Force bass into bass register: E1-E3 (28-52)
       // Take root pitch class + iv, find correct octave
       const bassPC=((rootMidi+iv)%12+12)%12;
@@ -5438,9 +5602,36 @@ function App(){
         if(deafModeRef.current||hapticModeRef.current==='bass')hap.subBass(ar.lockedBpm||ar.bpm);
       }
 
-      // Bass: motif-shaped -- call=driving, response=sparse, turnaround=anticipate
-      const bassDensityMod = isCall?1.3 : isResponse?0.55 : isTurnaround?1.5 : 1.0;
-      const isBassBeat = beat!==0&&beat!==bb&&(
+      // Bass: motif-shaped -- call=driving, response=sparse, turnaround=anticipate.
+      // Per-bar call/response: call/turnaround bars play denser, response bars
+      // play sparser so consecutive bars actually answer each other.
+      const bassDensityMod = isCall?1.4 : isResponse?0.40 : isTurnaround?1.6 : 1.0;
+      // PAUSES: if bass is on a rest turn, skip the whole bar's non-downbeat
+      // hits. Lets the groove breathe and catch up.
+      const bassIsResting = (ar._restBars?.bass || 0) > 0;
+      // PICKUP: at the last 16th of the bar, optionally schedule a note that
+      // lands just before the next beat 0. Only when NOT resting and only if
+      // the voice is not already playing on that step. Gives the bass room
+      // to play off-grid but still land on the 1.
+      if(beat === stepsPerMeasure-1 && !bassIsResting && !sup.bass && !mutes.bass && bassOpts.length && Math.random() < 0.30){
+        const stepSec0 = 60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25;
+        const pickupT = time + stepSec0*0.75;   // 3/4 of a step in = lands just before beat 0
+        const pickupIv = brain.choose(userRole, bassOpts, chaos, effectiveChord);
+        const pickupPC = ((rootMidi+pickupIv)%12+12)%12;
+        let pn = 24+pickupPC; while(pn<28)pn+=12; while(pn>52)pn-=12;
+        const _bDest = bus.getInput('bass');
+        const _bm = styleP().bassMode || 'electric';
+        const w = voices.bass.winding*0.08;
+        if(_bm==='808'||_bm==='hiphop')   synth808(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
+        else if(_bm==='upright')           synthUprightBass(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
+        else if(_bm==='gfunk')             synthGFunkBass(ctx,pickupT,pn,chaos,warpMultiplier,w,voices.bass.lastNote||pn,_bDest);
+        else if(_bm==='boombap')           synthBoomBapBass(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
+        else if(_bm==='afrosub')           synthAfroSub(ctx,pickupT,pn,chaos,warpMultiplier,ie,w,_bDest);
+        else if(_bm==='tanpura')           synthTanpuraBass(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
+        else                                synthBass(ctx,pickupT,pn,chaos,warpMultiplier,w,ie,beat,_bDest);
+        voices.bass.lastNote = pn;
+      }
+      const isBassBeat = !bassIsResting && beat!==0&&beat!==bb&&(
         beat===Math.floor(bb/2)||beat===Math.floor(bb*1.5)||
         (isTurnaround&&beat===stepsPerMeasure-2)||
         Math.random()<density*bassDensityMod*0.55*(hist.b?0.08:1.5)
@@ -5467,7 +5658,8 @@ function App(){
     }
 
     // -- MID ---------------------------------------------------------------
-    if(!sup.mid&&!mutes.mid&&midOpts.length){
+    const midIsResting = (ar._restBars?.mid || 0) > 0;
+    if(!midIsResting && !sup.mid&&!mutes.mid&&midOpts.length){
       const midMotifMod = isCall?1.2 : isResponse?0.6 : isTurnaround?1.4 : 1.0;
       // Exclusion principle: when kick/snare is sounding, mid ducks hard (80% chance to rest)
       const midExclusion = window._isDrumHitting ? 0.18 : 1.0;
@@ -5505,12 +5697,22 @@ function App(){
     }
 
     // -- LEAD -------------------------------------------------------------
-    if(!sup.lead&&!mutes.lead&&leadOpts.length){
+    const leadIsResting = (ar._restBars?.lead || 0) > 0;
+    // Lead pickup: at last 16th, optionally drop an anticipation just before beat 0.
+    if(beat === stepsPerMeasure-1 && !leadIsResting && !sup.lead && !mutes.lead && leadOpts.length && Math.random() < 0.22){
+      const stepSec0 = 60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25;
+      const pickupT = time + stepSec0*0.75;
+      const pIv = brain.choose(userRole, leadOpts, chaos, effectiveChord);
+      let pNote = rootMidi + pIv; while(pNote<60) pNote+=12; while(pNote>84) pNote-=12;
+      synthLead(ctx,pickupT,pNote,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07);
+    }
+    if(!leadIsResting && !sup.lead&&!mutes.lead&&leadOpts.length){
       // Exclusion principle: lead ducks even harder than mid when drums hit (90% rest)
       const leadExclusion = window._isDrumHitting ? 0.10 : 1.0;
       const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion;
       if(Math.random()<prob){
         let iv=brain.choose(userRole,leadOpts,chaos,effectiveChord);
+        (ar._recentPicks ||= []).push({role:'lead', iv, chord:effectiveChord});
         // Melodic direction: bias toward stepwise motion (like a real musician)
         // 60% of time, prefer notes close to the last note played
         if(voices.lead.lastNote!=null && Math.random()<0.6){
@@ -5535,17 +5737,38 @@ function App(){
       }
     }
 
-    // -- ARP / EXTRA INSTRUMENT -------------------------------------------
-    if(extraInstRef.current==='perc'&&!mutes.drum){
-      // Extra percussion: syncopated hi-perc hits between main beats
+    // -- EXTRA INSTRUMENTS -------------------------------------------------
+    // 'auto' rotates between perc / arp / shaker / pad based on the current
+    // tension arc phase so the variety is musical, not random soup.
+    let extraInst = extraInstRef.current;
+    if(extraInst === 'auto'){
+      const hArc = tensionArc.currentFor('lead').h;
+      const barInArc = (ar.measureCount % 8);
+      if(hArc > 0.65)       extraInst = 'arp';       // high tension = motion
+      else if(hArc < 0.25)  extraInst = 'pad';       // low tension = wash
+      else if(barInArc < 4) extraInst = 'shaker';    // first half = texture
+      else                   extraInst = 'perc';     // second half = percussion
+    }
+    if(extraInst==='perc'&&!mutes.drum){
       const percProb=density*0.5*(beat%2===1?1.4:0.4)*(DeviceComp.score<0.4?0.5:1.0);
       if(Math.random()<percProb){
-        // Light metallic perc -- use hat synthesis at higher freq
         synthHat(ctx,time,false,chaos*0.5,warpMultiplier,bus.getInput('drum'),0.3);
       }
     }
-    // -- ARP layer ---------------------------------------------------------
-    if(extraInstRef.current==='arp'&&!mutes.lead){
+    if(extraInst==='shaker'&&!mutes.drum){
+      // Shaker on off-16ths, velocity follows tensionArc so it breathes.
+      const shakerProb = (beat%2===1 ? 0.85 : 0.2) * density * (DeviceComp.score<0.4?0.5:1.0);
+      if(Math.random()<shakerProb){
+        const vel = 0.25 + tensionArc.currentFor('drum').r*0.2;
+        synthShaker(ctx,time,warpMultiplier,bus.getInput('drum'),vel);
+      }
+    }
+    if(extraInst==='pad'&&!mutes.mid&&beat===0){
+      // Fire a 1-bar pad on chord change / downbeat only.
+      const padNotes = (ct.iv||[0,4,7]).map(v=>rootMidi+v);
+      synthPad(ctx, time, padNotes, chaos, warpMultiplier, bus.getInput('mid'), 1, (ar.lockedBpm||ar.bpm||110));
+    }
+    if(extraInst==='arp'&&!mutes.lead){
       const arpProb=density*0.7*(DeviceComp.score<0.4?0.5:1.0);
       if(Math.random()<arpProb){
         const arpIv=brain.choose(userRole,leadOpts.concat(ct.iv.map(v=>v+7)),chaos,chordType);
@@ -6618,7 +6841,7 @@ function App(){
           <div className="space-y-1.5">
             <div className="text-[8px] text-cyan-400 uppercase tracking-widest font-bold">Extra Instrument</div>
             <div className="grid grid-cols-3 gap-1.5">
-              {[['none','Off'],['arp','Arp'],['perc','Perc']].map(([id,label])=>(
+              {[['none','Off'],['auto','Auto'],['arp','Arp'],['perc','Perc'],['shaker','Shaker'],['pad','Pad']].map(([id,label])=>(
                 <button key={id} onClick={()=>setExtraInst(id)}
                   className={"py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all "+(extraInst===id?'bg-cyan-500/15 text-cyan-300 border-cyan-500/40':'bg-slate-800/50 text-slate-500 border-slate-700 hover:border-cyan-500/20')}>
                   {label}
