@@ -1190,9 +1190,27 @@ class Brain{
     this._ctx='maj';
   }
 
+  // Consonance grading. Perfect 5th (7) is the strongest in-key interval --
+  // it's what unison folds into an octave and sits at the top. Perfect
+  // 4th, octave/unison and thirds follow. The lower end (m2, tritone,
+  // M7) are the hard dissonances we deliberately travel THROUGH during
+  // tense sections and resolve back from.
   con(iv){
     const m=((iv%12)+12)%12;
-    return{0:1.0,7:.92,5:.88,4:.80,3:.72,9:.68,8:.62,2:.40,10:.40,1:.08,6:.05,11:.18}[m]??0.3;
+    return{
+      7: 1.00,   // perfect 5th -- most consonant, "home"
+      0: 0.96,   // unison / octave
+      5: 0.92,   // perfect 4th
+      4: 0.84,   // major 3rd
+      3: 0.78,   // minor 3rd
+      9: 0.72,   // major 6th
+      8: 0.66,   // minor 6th
+      2: 0.42,   // major 2nd -- mild dissonance
+      10:0.40,   // minor 7th
+      11:0.20,   // major 7th -- sharp dissonance
+      1: 0.08,   // minor 2nd -- harshest dissonance
+      6: 0.04    // tritone -- diabolus in musica
+    }[m]??0.3;
   }
 
   setChord(ct){ this._ctx=ct||'maj'; }
@@ -1202,9 +1220,9 @@ class Brain{
   choose(role,opts,chaos,chordCtx){
     this.n++; this.eps=Math.max(0.04,0.35-this.n*0.0002);
     const ctx=chordCtx||this._ctx;
-    // Harmonic tension bias from the current arc: 0 = favor consonance,
-    // 1 = actively seek dissonance. Interpolates the consonance preference
-    // so at full tension the dissonant intervals win.
+    // Harmonic tension from the current arc: 0 = "home" (favor P5/P4/unison),
+    // 1 = "away" (actively seek tritone/m2/M7). We travel THROUGH dissonance
+    // during call/response/turnaround and RESOLVE back to consonance.
     const th = (typeof tensionArc!=='undefined' && tensionArc.currentFor)
       ? tensionArc.currentFor(role).h : 0;
     if(Math.random()>this.eps){
@@ -1213,9 +1231,11 @@ class Brain{
         const ctxVal =(this.q[this._k(role,v,ctx)]??0.5);
         const globVal=(this.q[this._k(role,v,'global')]??0.5);
         const cons=this.con(v);
-        // effectiveCon flips from cons -> (1-cons) as tension rises.
-        const effectiveCon = cons*(1-th) + (1-cons)*th;
-        const w=(ctxVal*0.7+globVal*0.3)*(1+effectiveCon*(1-chaos*.6));
+        // Low tension: consonance preference (~cons). High tension: actively
+        // invert and REWARD the low-consonance intervals. The 1.6 multiplier
+        // at th=1 means a tritone can beat a P5 when the arc is at its peak.
+        const consWeight = cons*(1-th) + (1-cons)*th*1.6;
+        const w=(ctxVal*0.7+globVal*0.3)*(1+consWeight*(1-chaos*.6));
         if(w>bw){bw=w;b=v;}
       }
       return b;
@@ -1787,6 +1807,51 @@ const tensionArc = {
   },
 };
 if(typeof window!=='undefined') window.tensionArc=tensionArc;
+
+// -- CONDUCTOR + MOTION TWEENS ------------------------------------------------
+// The "conductor" is the voice everyone else follows. If the user plays drums,
+// bass takes the baton and provides the harmonic/timing anchor. If the user
+// plays anything else, drums are the conductor. Other voices reference the
+// conductor's phase/swing so they don't sound like they're ignoring each other.
+const conductor = {
+  role: 'drum',                  // 'drum' | 'bass' | 'mid' | 'lead'
+  update(userRole){
+    this.role = (userRole === 'drum') ? 'bass' : 'drum';
+  },
+};
+if(typeof window!=='undefined') window.conductor=conductor;
+
+// Smoothly interpolate a value toward a target. Used for swing and for
+// envelope-shape morphing so parameters don't snap between bars. Rate is
+// 0..1, higher = faster snap. Returns the new value. Safe on first call.
+const motionTween = {
+  // per-instrument swing amount [0..1], each moves toward a shared target at
+  // its own rate so voices sway in loose sync rather than lockstep.
+  swing: { drum: 0.18, bass: 0.18, mid: 0.18, lead: 0.18, target: 0.18 },
+  // per-instrument envelope "openness" [0..1] -- drives attack/release shape
+  // inside each synth function. Tweens toward a target driven by taste + arc.
+  env:   { drum: 0.5,  bass: 0.5,  mid: 0.5,  lead: 0.5,  target: 0.5 },
+
+  // Rates per instrument so drums snap faster (they define the pocket),
+  // lead tweens slowest (it floats on top).
+  rates: { drum: 0.35, bass: 0.22, mid: 0.18, lead: 0.14 },
+
+  // Called each bar with fresh targets. Targets are derived from the tension
+  // arc and bandTaste (so swing/envelope flow with the music, not a dial).
+  step(arcTension){
+    this.swing.target = Math.max(0, Math.min(1, 0.15 + arcTension*0.35 + bandTaste.groove*0.25));
+    this.env.target   = Math.max(0.15, Math.min(1, 0.35 + arcTension*0.4 + bandTaste.density*0.2));
+    for(const r of ['drum','bass','mid','lead']){
+      const rate = this.rates[r];
+      this.swing[r] = this.swing[r] + (this.swing.target - this.swing[r]) * rate;
+      this.env[r]   = this.env[r]   + (this.env.target   - this.env[r])   * rate;
+    }
+  },
+
+  swingFor(role){ return this.swing[role] ?? this.swing.target; },
+  envFor(role){   return this.env[role]   ?? this.env.target;   },
+};
+if(typeof window!=='undefined') window.motionTween=motionTween;
 
 // Helper: returns the current style profile object, biased by the user soundbank
 // and then by the current rhythmic tension arc.
@@ -2862,7 +2927,10 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   const mode=modeVal<0.28?'pluck':modeVal<0.52?'slap':modeVal<0.76?'sustain':'growl';
 
   const _styleLen=styleP().noteLenMult;
-  const decayTime={pluck:0.22*_styleLen,slap:0.18*_styleLen,sustain:0.55*_styleLen,growl:0.40*_styleLen}[mode]/warp;
+  // Envelope tween: scale decay by the slow-moving envelope target for bass.
+  // Tight (low env) = shorter/punchier. Open (high env) = longer, breathier.
+  const _bassEnv = motionTween.envFor('bass');
+  const decayTime={pluck:0.22*_styleLen,slap:0.18*_styleLen,sustain:0.55*_styleLen,growl:0.40*_styleLen}[mode]/warp * (0.6 + _bassEnv*0.8);
   const bodyType={pluck:'triangle',slap:'square',sustain:'sawtooth',growl:'sawtooth'}[mode];
 
   // -- BODY OSCILLATOR ---------------------------------------------------
@@ -3044,8 +3112,11 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0){
   if(!s._wild && paramMemory.shouldGate('lead', s)){
     s.punch *= 0.7; s.decay *= 0.8; windBoost *= 0.7;
   }
-  const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult/warp;
-  const atk = _lStyle.attackMult * 0.006;
+  // Envelope tween for lead: longer, more-open envelope when motionTween
+  // targets higher values. At low env = punchy/tight, at high env = sustained.
+  const _leadEnv = motionTween.envFor('lead');
+  const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult*(0.65 + _leadEnv*0.75)/warp;
+  const atk = _lStyle.attackMult * 0.006 * (0.75 + _leadEnv*0.5);
   const vol = 0.09+windBoost*0.04+s.punch*0.03;
 
   // Hard ceiling: 10kHz lowpass on ALL lead modes -- prevents deafening highs
@@ -4931,6 +5002,12 @@ function App(){
       const windingEnergy=voices.lead.winding*0.5+voices.mid.winding*0.3+voices.bass.winding*0.2;
       bandTaste.evolve(windingEnergy, chaos);
       brain.auto(userRole,[0,4,7,11],chaos,chordType); collectiveBrainSave();
+      // Conductor: update every bar based on who the user is playing as.
+      conductor.update(userRole);
+      // Motion tween: step the per-instrument swing + envelope values toward
+      // a target derived from current arc tension + taste. Each bar the values
+      // interpolate, they never snap -- everything sways in loose sync.
+      motionTween.step(tensionArc.currentFor(conductor.role).h);
       // Advance the tension arc one bar (may switch to a new arc on phrase boundary).
       const _prevArc = tensionArc.currentArc?.name;
       tensionArc.advance(ar.measureCount);
@@ -5063,75 +5140,78 @@ function App(){
       const groove=ar._groove||'fourOnFloor';
       const b16=beat%16;
 
-      // -- RATIONAL GRID: build full 16-step pattern once at measure start --
-      // No per-step randomness. Pattern is committed for the whole measure.
-      // Snare is ~4x less frequent than kick by design (backbeat only + rare fills).
+      // -- GROOVE TEMPLATE (deterministic when AI leads) --------------------
+      // Real drummers don't roll dice per step; they play a groove. The
+      // archetype templates in bandTaste are treated as VELOCITY MAPS:
+      // template[i] = how loud that step plays (0 = rest, 1 = accent,
+      // 0.3 = ghost). When AI is leading, every non-zero step fires at
+      // its stored velocity -- no Math.random() on whether to play.
+      // When the user is drumming, we thin out with probability so the
+      // user can be the loudest thing in the room.
       if(beat===0){
-        const kMod0 = isCall?1.2 : isResponse?0.65 : isTurnaround?1.4 : 1;
-        const sMod0 = isCall?0.7 : isResponse?0.50 : isTurnaround?1.0 : 0.7; // snare much less
-        const hMod0 = isCall?0.9 : isResponse?1.30 : isTurnaround?0.7 : 1;
-        // Rationality: 1.0 = strict archetype adherence, 0.0 = chaotic variation.
-        // `userIsDrummer` is set at the top of scheduleNote so every drum
-        // sub-block sees the same signal.
+        const kMod0 = isCall?1.05 : isResponse?0.80 : isTurnaround?1.15 : 1;
+        const sMod0 = isCall?0.9  : isResponse?0.70 : isTurnaround?1.0  : 1;
+        const hMod0 = isCall?0.9  : isResponse?1.15 : isTurnaround?0.8  : 1;
         const baseRat = ar.drumRationality ?? 0.75;
         const rat = userIsDrummer
-          ? Math.max(0, Math.min(1, baseRat * 0.55))       // follow: loosen, let user lead
-          : Math.max(0, Math.min(1, Math.max(baseRat, 0.82))); // lead: high floor, stick to archetype
-        const dp = {k:new Array(16).fill(false), s:new Array(16).fill(false),
-                    h:new Array(16).fill(false), hOpen:new Array(16).fill(false)};
-        let kickCount = 0;
-        // When AI is leading, cap total kicks to 4 per 16-step bar so the
-        // groove breathes. When the user is drumming, no cap -- they get
-        // the fills and we stay out of their way.
-        const kickCap = userIsDrummer ? 16 : 4;
-        for(let st=0;st<16;st++){
-          if(kickCount >= kickCap) break;
-          // KICK: step 0 always fires at high rationality; low rat may skip it (rare but possible)
-          if(st===0){
-            if(rat > 0.2 || Math.random() < 0.85) { dp.k[st]=true; kickCount++; }
-            continue;
+          ? Math.max(0, Math.min(1, baseRat * 0.55))
+          : Math.max(0, Math.min(1, Math.max(baseRat, 0.82)));
+        const arc = bandTaste.grooveArchetypes[groove] || bandTaste.grooveArchetypes.fourOnFloor;
+        // dp.k/s/h stored as velocity [0..1]. 0 means rest.
+        const dp = {k:new Array(16).fill(0), s:new Array(16).fill(0),
+                    h:new Array(16).fill(0), hOpen:new Array(16).fill(false)};
+
+        // Thresholds: below these, a step is a rest. Above, it fires
+        // at the template velocity. Ghost notes fire quiet but still fire.
+        const kickFloor  = userIsDrummer ? 0.85 : 0.35;  // AI leads = play everything >= 0.35
+        const snareFloor = userIsDrummer ? 0.85 : 0.45;
+        const hatFloor   = userIsDrummer ? 0.75 : 0.40;
+        // When AI leads, play ALL template steps at their velocity (deterministic).
+        // When user drums, only fire if random chance AND velocity is high -- we become supportive.
+        const fire = (vel, floor) => {
+          if(vel < floor) return 0;
+          if(userIsDrummer){
+            // Sparse follow: high-velocity hits fire ~70% of the time, quieter ones skip
+            return Math.random() < (vel-floor)*1.1 ? vel*0.75 : 0;
           }
-          const kP0=bandTaste.stepProb('k',st,groove,chaos)*(rSug.k?1.4:1.0)*(hist.k?0.12:1.0);
-          // Blend: at rat=1 use pure archetype prob; at rat=0 mix in chaotic noise
-          const kNoise = chaos * (Math.random() < 0.45 ? 1.3 : 0.3);
-          const kEff = kP0 * rat + kNoise * (1 - rat);
-          if(Math.random()<kEff*kMod0){ dp.k[st]=true; kickCount++; }
-        }
+          return vel;
+        };
+
         for(let st=0;st<16;st++){
-          // SNARE: backbeat (bb) probabilistic at 55%, extra hits very rare
-          // Constraint: snare can't fire on same step as kick
-          if(dp.k[st]) continue;
-          if(st===bb){
-            // High rationality = reliable backbeat; low rat = backbeat probability drops
-            const bbProb = 0.55 * rat + (0.3 * chaos * Math.random()) * (1 - rat);
-            dp.s[st]=Math.random()<bbProb*sMod0; continue;
-          }
-          const sP0=bandTaste.stepProb('s',st,groove,chaos)*(rSug.s?1.3:1.0)*(hist.s?0.12:1.0);
-          const sNoise = chaos * Math.random() * 0.5;
-          const sEff = sP0 * rat + sNoise * (1 - rat);
-          // Extra snare hits capped so total snare <= kickCount/4
-          const snareCount=dp.s.filter(Boolean).length;
-          if(snareCount < Math.max(1, Math.floor(kickCount/4))){
-            if(Math.random()<sEff*sMod0*0.25) dp.s[st]=true; // 0.25 = extra rarity
-          }
+          dp.k[st] = fire(arc.k[st] * kMod0, kickFloor);
+          // snare can't fire on same step as kick
+          if(dp.k[st] > 0) continue;
+          dp.s[st] = fire(arc.s[st] * sMod0, snareFloor);
         }
-        // Hats were firing on basically every step. Halve base probability
-        // and drop it further when the AI is leading -- drums should sit
-        // UNDER the mix, not tap every 16th note.
-        const hatSparsity = userIsDrummer ? 0.75 : 0.40;
+        // Hat: separate pass, allowed to overlap with kick/snare (real kits do this)
+        const hatSparsity = userIsDrummer ? 0.75 : 0.6;
         for(let st=0;st<16;st++){
-          const hP0=bandTaste.stepProb('h',st,groove,chaos)*(rSug.h?1.2:1.0)*(hist.h?0.55:1.0)*0.85*hMod0*hatSparsity;
-          if(Math.random()<hP0*motifShape.densityMod) dp.h[st]=true;
-          const isDesignatedOpen0=bandTaste.isOpenStep(st,groove);
-          const openBase0 = isDesignatedOpen0 ? 0.55+chaos*0.25 : chaos*(isResponse?0.22:0.09);
-          dp.hOpen[st] = Math.random()<openBase0*(groove==='jazzSwing'?1.8:groove==='bossaNova'?1.3:1);
+          const hv = arc.h[st] * hMod0 * hatSparsity;
+          dp.h[st] = fire(hv, hatFloor);
+          const isDesignatedOpen0 = bandTaste.isOpenStep(st, groove);
+          // Open-hat only on designated steps, and only when that step actually plays
+          dp.hOpen[st] = isDesignatedOpen0 && dp.h[st] > 0 && (Math.random() < 0.55 + chaos*0.2);
         }
-        ar._drumPattern=dp;
+        // Fills: only at the end of a 4-bar phrase, and only when AI leads.
+        // This is the one controlled place we allow off-template hits.
+        const endOfPhrase = (ar.measureCount % 4) === 3;
+        if(!userIsDrummer && endOfPhrase && Math.random() < 0.55){
+          // Add a fill on the last two beats (steps 12-15): extra snare hits
+          for(let st=12; st<16; st++){
+            if(dp.k[st] === 0 && dp.s[st] === 0 && Math.random() < 0.55){
+              dp.s[st] = 0.65;
+            }
+          }
+        }
+        ar._drumPattern = dp;
       }
-      const dp=ar._drumPattern||{k:[],s:[],h:[],hOpen:[]};
-      const playK  = !!dp.k[b16];
-      const playS  = !!dp.s[b16];
-      const playH  = !!dp.h[b16];
+      const dp=ar._drumPattern||{k:new Array(16).fill(0),s:new Array(16).fill(0),h:new Array(16).fill(0),hOpen:new Array(16).fill(false)};
+      const kVel = dp.k[b16]||0;
+      const sVel = dp.s[b16]||0;
+      const hVel = dp.h[b16]||0;
+      const playK  = kVel > 0;
+      const playS  = sVel > 0;
+      const playH  = hVel > 0;
       const openH  = !!dp.hOpen[b16];
       // Ghost snare: response phase only, quiet, between main snares (not in grid -- these are fills)
       const playGhostSnare = isResponse && !dp.s[b16] && !dp.k[b16] && beat%4===2 && Math.random()<chaos*0.35;
@@ -5141,7 +5221,10 @@ function App(){
       const playRide = isResponse && (groove==='jazzSwing'||groove==='bossaNova') && beat%4===0 && Math.random()<0.4;
 
       if(playK){
-        synthKick(ctx,time,warpMultiplier,bus.getInput('drum'),ie);
+        // Velocity from the groove template (already shaped by the archetype).
+        // Accent vs ghost comes straight from the template value, not random.
+        const kickVel = Math.max(0.35, Math.min(1, kVel*0.65 + ie*0.35));
+        synthKick(ctx,time,warpMultiplier,bus.getInput('drum'),kickVel);
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{k:true});
         if(hapticModeRef.current==='bass'||deafModeRef.current)hap.kick();else hap.tap();
@@ -5150,7 +5233,8 @@ function App(){
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
       }
       if(playS){
-        synthSnare(ctx,time+(Math.random()-0.5)*styleP().microJitter,chaos,warpMultiplier,bus.getInput('drum'),1-ie);
+        const snVel = Math.max(0.35, Math.min(1, sVel*0.7 + 0.15));
+        synthSnare(ctx,time+(Math.random()-0.5)*styleP().microJitter,chaos,warpMultiplier,bus.getInput('drum'),snVel);
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{s:true});
         if(hapticModeRef.current==='rhythm')hap.snare();
@@ -5159,12 +5243,14 @@ function App(){
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
       }
       if(playH){
-        // Velocity: accented steps (high hP base from archetype) hit harder
-        const hatVel = Math.max(0.2, Math.min(1.0, bandTaste.stepProb('h',b16,groove,0)*0.6 + 0.35 + (Math.random()-0.5)*0.15));
-        // Groove timing offset: style-aware push/pull beyond microJitter
+        // Velocity = template velocity (accent/ghost) with a small humanization.
+        const hatVel = Math.max(0.18, Math.min(1.0, hVel*0.85 + (Math.random()-0.5)*0.08));
         const grooveOff = (styleP().hatGrooveOffset||0) * (0.7 + Math.random()*0.6);
-        const hatT = time + (Math.random()-0.5)*styleP().microJitter*1.5 + grooveOff;
-        synthHat(ctx,hatT,openH,chaos,warpMultiplier,bus.getInput('drum'),ie,hatVel);
+        // Swing tween: per-voice smoothly-animating push that rides on top of the
+        // style's microJitter. Zero-centered around 0.18, up to ~+16ms push at 1.0.
+        const drumSwingPush = (motionTween.swingFor('drum') - 0.18) * 0.020;
+        const hatT = time + (Math.random()-0.5)*styleP().microJitter*1.5 + grooveOff + drumSwingPush;
+        synthHat(ctx,hatT,dp.hOpen[b16],chaos,warpMultiplier,bus.getInput('drum'),ie,hatVel);
         rhythmMemory.mark(beat,stepsPerMeasure,{h:true});
       }
 
@@ -5250,7 +5336,8 @@ function App(){
         // and the direction alternates per bar so it feels like intentional pocket.
         const _arcR=tensionArc.currentFor('bass').r;
         const _arcDir=((ar.measureCount||0)%2===0)?1:-1;
-        const _bt=time+(Math.random()-0.5)*styleP().microJitter*0.7 + _arcR*0.024*_arcDir;
+        const _bassSwing = (motionTween.swingFor('bass') - 0.18) * 0.022;
+        const _bt=time+(Math.random()-0.5)*styleP().microJitter*0.7 + _arcR*0.024*_arcDir + _bassSwing;
         const _bDest=bus.getInput('bass');
         if(_bm==='808'||_bm==='hiphop')      synth808(_bt!==undefined?ctx:ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
         else if(_bm==='upright')              synthUprightBass(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
@@ -5279,7 +5366,8 @@ function App(){
         const _mm=styleP().midMode||'keys';
         const _midWind = voices.mid.winding*0.07*(ar._breathMid||1.0);
         const _midArc = tensionArc.currentFor('mid').r * 0.018 * (((ar.measureCount||0)%2===0)?-1:1);
-        const _midT = time + _midArc;
+        const _midSwing = (motionTween.swingFor('mid') - 0.18) * 0.018;
+        const _midT = time + _midArc + _midSwing;
         if(_mm==='rhodes')
           synthRhodes(ctx,_midT,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind);
         else
@@ -5325,7 +5413,8 @@ function App(){
         while(ln<60)ln+=12; while(ln>84)ln-=12;
         // Lead anticipates the beat when arc tension is high (leans into the phrase).
         const _leadArc = -tensionArc.currentFor('lead').r * 0.020;
-        synthLead(ctx,time+_leadArc,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0));
+        const _leadSwing = (motionTween.swingFor('lead') - 0.18) * 0.016;
+        synthLead(ctx,time+_leadArc+_leadSwing,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0));
         voices.lead.play();voices.lead.lastNote=ln;
         brain.reward('lead',iv,0.6+voices.lead.glow*0.2+bandTaste.darkness*(iv%12===10||iv%12===3?0.2:-0.1),chordType);
       }
