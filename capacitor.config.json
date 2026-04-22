@@ -1,0 +1,11 @@
+{
+  "appId": "com.bandxmate.app",
+  "appName": "BANDxMATE",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}
