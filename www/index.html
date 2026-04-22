@@ -1864,6 +1864,104 @@ function styleP(){
 // Lerp between profile range values using a seed float [0-1]
 function styleLerp(range, seed){ return range[0] + seed*(range[1]-range[0]); }
 
+// -- KICK RECIPE BANK --------------------------------------------------------
+// Three structurally-different synthesis paths for kick. Per hit, one is
+// chosen stochastically so consecutive kicks are actually DIFFERENT sounds,
+// not the same sound with different values. Weighted so the style-shaped
+// sine-sweep is still the most common, but fm and noise-body variants
+// genuinely pop up 30-40% of the time and change the timbre.
+function kickSineSweep(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
+  // Existing sine-sweep body (what we had). Carrier sweeps exponentially
+  // from f0 down to f1 over `decay`. Optional 200Hz EQ thump for hip-hop/edm.
+  const body=ctx.createOscillator(); body.type='sine';
+  body.frequency.setValueAtTime(f0,t);
+  body.frequency.setValueAtTime(f0*(kickStyle==='jazz'?0.88:0.92),t+0.002);
+  body.frequency.exponentialRampToValueAtTime(f1,t+decay);
+  const bg=ctx.createGain();
+  bg.gain.setValueAtTime(0,t);
+  const attackT = kickStyle==='jazz'?0.008:kickStyle==='edm'?0.0005:0.003;
+  bg.gain.linearRampToValueAtTime(punch, t+attackT);
+  bg.gain.setValueAtTime(punch*(0.88+s.punch*0.08), t+attackT*3);
+  bg.gain.linearRampToValueAtTime(0.0001, t+decay+(kickStyle==='edm'?0.12:0.04));
+  bg.gain.setValueAtTime(0, t+decay+(kickStyle==='edm'?0.14:0.06));
+  if(kickStyle==='edm'||kickStyle==='hiphop'||kickStyle==='westcoast'||kickStyle==='eastcoast'){
+    const eq200=ctx.createBiquadFilter(); eq200.type='peaking';
+    eq200.frequency.value=200; eq200.Q.value=1.4;
+    eq200.gain.value=(kickStyle==='edm'?6:kickStyle==='westcoast'?5:4);
+    body.connect(eq200); eq200.connect(bg); bg.connect(dest);
+    autoClean(eq200);
+  }else{
+    body.connect(bg); bg.connect(dest);
+  }
+  body.start(t); body.stop(t+decay+(kickStyle==='edm'?0.16:0.08));
+  autoClean(body,bg);
+}
+function kickFM(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
+  // FM kick: carrier at f0 is frequency-modulated by a sine at f0*ratio.
+  // High modulation index at the attack creates inharmonic metallic "punch",
+  // index rolls off into the decay so the tail settles into a pure tone.
+  const ratio = 0.5 + s.tone*1.8;     // 0.5..2.3 -- wildly varies timbre
+  const carrier = ctx.createOscillator(); carrier.type='sine';
+  carrier.frequency.setValueAtTime(f0, t);
+  carrier.frequency.exponentialRampToValueAtTime(f1, t+decay);
+  const mod = ctx.createOscillator(); mod.type='sine';
+  mod.frequency.setValueAtTime(f0*ratio, t);
+  mod.frequency.exponentialRampToValueAtTime(f1*ratio, t+decay*0.9);
+  const modIdx = ctx.createGain();
+  const peakIdx = f0 * (2.5 + punch*4);   // index in Hz
+  modIdx.gain.setValueAtTime(peakIdx, t);
+  modIdx.gain.exponentialRampToValueAtTime(Math.max(1, f0*0.2), t+decay*0.55);
+  mod.connect(modIdx); modIdx.connect(carrier.frequency);
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(punch, t+0.002);
+  g.gain.exponentialRampToValueAtTime(0.0001, t+decay+0.02);
+  g.gain.setValueAtTime(0, t+decay+0.04);
+  carrier.connect(g); g.connect(dest);
+  carrier.start(t); mod.start(t);
+  carrier.stop(t+decay+0.05); mod.stop(t+decay+0.05);
+  autoClean(carrier,mod,modIdx,g);
+}
+function kickNoiseBody(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
+  // Noise-body kick: filtered white noise burst through a resonant bandpass
+  // tuned to f0. Gives a punchy, slightly dirty attack with a pitched body.
+  // Paired with a faint sine sub so the low-end still anchors.
+  const bufLen = Math.floor(ctx.sampleRate * Math.min(0.25, decay+0.05));
+  const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+  const nd = buf.getChannelData(0);
+  for(let i=0;i<bufLen;i++) nd[i] = (Math.random()*2-1) * Math.pow(1-i/bufLen, 2.2);
+  const src = ctx.createBufferSource(); src.buffer=buf;
+  const bp = ctx.createBiquadFilter(); bp.type='bandpass';
+  bp.frequency.setValueAtTime(f0*1.8, t);
+  bp.frequency.exponentialRampToValueAtTime(Math.max(40, f1*1.2), t+decay);
+  bp.Q.value = 3 + s.punch*6;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(punch*0.85, t+0.001);
+  g.gain.exponentialRampToValueAtTime(0.0001, t+decay+0.04);
+  src.connect(bp); bp.connect(g); g.connect(dest);
+  src.start(t); src.stop(t+decay+0.06);
+  // Thin sine sub so it still feels like a kick, not a snare
+  const sub = ctx.createOscillator(); sub.type='sine';
+  sub.frequency.setValueAtTime(f0, t);
+  sub.frequency.exponentialRampToValueAtTime(f1, t+decay*0.8);
+  const sg = ctx.createGain();
+  sg.gain.setValueAtTime(punch*0.45, t);
+  sg.gain.exponentialRampToValueAtTime(0.0001, t+decay);
+  sub.connect(sg); sg.connect(dest);
+  sub.start(t); sub.stop(t+decay+0.04);
+  autoClean(src,bp,g,sub,sg);
+}
+// Pick one recipe per kick hit. Weighted so sine-sweep stays the backbone
+// but fm and noise variants surface often enough that you hear the kit change.
+function pickKickRecipe(s){
+  const r = Math.random();
+  if(s._wild) return r<0.5 ? kickFM : kickNoiseBody;   // wildcards lean weird
+  if(r < 0.50) return kickSineSweep;
+  if(r < 0.78) return kickFM;
+  return kickNoiseBody;
+}
+
 function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   const s=drumSeed();
   const sp=styleP(); // current style profile
@@ -1889,7 +1987,12 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   const decay = styleLerp(sp.kickDecay, s.decay+inputEnergy*0.2) / warp * (1 + lBr*0.18);
   const punch = styleLerp(sp.kickPunch, s.punch) * (0.8+inputEnergy*0.2) * (1 + lMed*0.08);
 
+  // Pick ONE of three structurally-different synthesis paths per hit.
+  const recipe = pickKickRecipe(s);
+  recipe(ctx, t, warp, dest, f0, f1, decay, punch, s, sp);
+
   // ── EDM extra: pre-kick click burst (the "knock") ────────────────────
+  // Shared across recipes -- it's a style cue, not a body character.
   if(kickStyle==='edm'){
     const knock=ctx.createOscillator(); knock.type='square';
     knock.frequency.setValueAtTime(f0*2.5,t);
@@ -1899,32 +2002,6 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
     knock.connect(kg); kg.connect(dest); knock.start(t); knock.stop(t+0.015/warp);
     autoClean(knock,kg);
   }
-
-  // ── BODY: sine sweep ──────────────────────────────────────────────────
-  const body=ctx.createOscillator(); body.type='sine';
-  body.frequency.setValueAtTime(f0,t);
-  body.frequency.setValueAtTime(f0*(kickStyle==='jazz'?0.88:0.92),t+0.002);
-  body.frequency.exponentialRampToValueAtTime(f1,t+decay);
-  const bg=ctx.createGain();
-  bg.gain.setValueAtTime(0,t);
-  // Jazz: slower attack for brushed feel; EDM: instant
-  const attackT = kickStyle==='jazz'?0.008:kickStyle==='edm'?0.0005:0.003;
-  bg.gain.linearRampToValueAtTime(punch, t+attackT);
-  bg.gain.setValueAtTime(punch*(0.88+s.punch*0.08), t+attackT*3);
-  bg.gain.linearRampToValueAtTime(0.0001, t+decay+(kickStyle==='edm'?0.12:0.04));
-  bg.gain.setValueAtTime(0, t+decay+(kickStyle==='edm'?0.14:0.06));
-  // 200Hz punch boost for hiphop/edm/westcoast -- gives kick the chest thump
-  if(kickStyle==='edm'||kickStyle==='hiphop'||kickStyle==='westcoast'||kickStyle==='eastcoast'){
-    const eq200=ctx.createBiquadFilter(); eq200.type='peaking';
-    eq200.frequency.value=200; eq200.Q.value=1.4;
-    eq200.gain.value=(kickStyle==='edm'?6:kickStyle==='westcoast'?5:4); // dB
-    body.connect(eq200); eq200.connect(bg); bg.connect(dest);
-    autoClean(eq200);
-  }else{
-    body.connect(bg); bg.connect(dest);
-  }
-  body.start(t); body.stop(t+decay+(kickStyle==='edm'?0.16:0.08));
-  autoClean(body,bg);
 
   // ── SUB LAYER: style-weighted ─────────────────────────────────────────
   const subFreq=(22+s.pitch*14)*warp;
@@ -1975,6 +2052,87 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   }
 }
 
+// -- SNARE RECIPE BANK -------------------------------------------------------
+// Three body types per hit: classic tonal thump + ring, FM metallic crack, or
+// stacked clap bursts. The noise crack + wire tail are shared downstream so
+// snares still sound like snares, not like three different instruments.
+function snareClassic(ctx,t,bodyFreq,warp,dest,s){
+  const body=ctx.createOscillator();
+  body.type=s.color>0.5?'triangle':'sine';
+  body.frequency.setValueAtTime(bodyFreq,t);
+  body.frequency.exponentialRampToValueAtTime(bodyFreq*(0.55+s.tone*0.2),t+0.09/warp);
+  const bg=ctx.createGain();
+  bg.gain.setValueAtTime(s.punch*0.62,t);
+  bg.gain.linearRampToValueAtTime(0.0001,t+(0.13+s.decay*0.08)/warp);
+  bg.gain.setValueAtTime(0,t+(0.14+s.decay*0.08)/warp);
+  body.connect(bg);bg.connect(dest);body.start(t);body.stop(t+(0.15+s.decay*0.08)/warp);
+  autoClean(body,bg);
+  // Ring overtone -- adds metallic character on some hits
+  if(s.color>0.3){
+    const ring=ctx.createOscillator();ring.type='sine';
+    ring.frequency.value=bodyFreq*(1.4+s.color*0.8);
+    const rg=ctx.createGain();
+    rg.gain.setValueAtTime(s.color*0.22,t);
+    rg.gain.linearRampToValueAtTime(0.0001,t+(0.06+s.color*0.06)/warp);
+    ring.connect(rg);rg.connect(dest);ring.start(t);ring.stop(t+0.16/warp);
+    autoClean(ring,rg);
+  }
+}
+function snareFM(ctx,t,bodyFreq,warp,dest,s){
+  // FM body: carrier modulated by sine at ratio ~2.3 with rapidly-decaying
+  // index. Produces a sharp metallic crack distinct from sine+ring.
+  const car=ctx.createOscillator(); car.type='sine';
+  car.frequency.setValueAtTime(bodyFreq*1.1,t);
+  car.frequency.exponentialRampToValueAtTime(bodyFreq*0.45,t+0.11/warp);
+  const mod=ctx.createOscillator(); mod.type='sine';
+  mod.frequency.value=bodyFreq*(1.8+s.color*1.2);
+  const idx=ctx.createGain();
+  idx.gain.setValueAtTime(bodyFreq*(3.5+s.punch*4),t);
+  idx.gain.exponentialRampToValueAtTime(bodyFreq*0.3,t+0.06/warp);
+  mod.connect(idx); idx.connect(car.frequency);
+  const g=ctx.createGain();
+  g.gain.setValueAtTime(s.punch*0.55,t);
+  g.gain.exponentialRampToValueAtTime(0.0001,t+(0.10+s.decay*0.06)/warp);
+  g.gain.setValueAtTime(0,t+(0.12+s.decay*0.06)/warp);
+  car.connect(g); g.connect(dest);
+  car.start(t); mod.start(t);
+  car.stop(t+0.14/warp); mod.stop(t+0.14/warp);
+  autoClean(car,mod,idx,g);
+}
+function snareClap(ctx,t,bodyFreq,warp,dest,s){
+  // Clap: 3-4 tiny noise bursts offset by a few ms each, bandpassed in the
+  // 1.2-3kHz region -- the classic TR-808-style clap feel.
+  const nLen=Math.floor(ctx.sampleRate*0.05);
+  const makeBurst=(offset,gain)=>{
+    const buf=ctx.createBuffer(1,nLen,ctx.sampleRate);
+    const nd=buf.getChannelData(0);
+    for(let i=0;i<nLen;i++) nd[i]=(Math.random()*2-1)*Math.pow(1-i/nLen,3);
+    const src=ctx.createBufferSource(); src.buffer=buf;
+    const bp=ctx.createBiquadFilter(); bp.type='bandpass';
+    bp.frequency.value=(1100+s.color*1800)*warp;
+    bp.Q.value=2.2+s.tone*2.5;
+    const g=ctx.createGain();
+    g.gain.setValueAtTime(0,t+offset);
+    g.gain.linearRampToValueAtTime(gain*s.punch,t+offset+0.001);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+offset+0.035/warp);
+    src.connect(bp); bp.connect(g); g.connect(dest);
+    src.start(t+offset); src.stop(t+offset+0.06/warp);
+    autoClean(src,bp,g);
+  };
+  // Four closely-spaced bursts with slight timing variation each hit
+  makeBurst(0,        0.45);
+  makeBurst(0.009/warp,0.70);
+  makeBurst(0.017/warp,0.60);
+  makeBurst(0.028/warp+ (Math.random()*0.004), 0.40);
+}
+function pickSnareRecipe(s){
+  const r = Math.random();
+  if(s._wild) return r<0.5 ? snareFM : snareClap;
+  if(r < 0.50) return snareClassic;
+  if(r < 0.80) return snareFM;
+  return snareClap;
+}
+
 function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5){
   const s=drumSeed();
   const lSlow = lfoBank.get('slow',t);
@@ -1986,28 +2144,9 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5){
   const bodyFreq=(155+s.pitch*90+inputTight*50)*warp * (1 + lSlow*0.05);
   const tightness=s.tone*(0.5+inputTight*0.5) * (1 + lMed*0.12);
 
-  // -- BODY: tonal thump -- unique pitch and decay per hit ------------------
-  const body=ctx.createOscillator();
-  body.type=s.color>0.5?'triangle':'sine';  // varies timbre class
-  body.frequency.setValueAtTime(bodyFreq,t);
-  body.frequency.exponentialRampToValueAtTime(bodyFreq*(0.55+s.tone*0.2),t+0.09/warp);
-  const bg=ctx.createGain();
-  bg.gain.setValueAtTime(s.punch*0.62,t);
-  bg.gain.linearRampToValueAtTime(0.0001,t+(0.13+s.decay*0.08)/warp);
-  bg.gain.setValueAtTime(0,t+(0.14+s.decay*0.08)/warp);
-  body.connect(bg);bg.connect(dest);body.start(t);body.stop(t+(0.15+s.decay*0.08)/warp);
-  autoClean(body,bg);
-
-  // -- RING: metallic overtone, unique ratio and decay ---------------------
-  if(s.color>0.3){  // not every hit has ring -- variation
-    const ring=ctx.createOscillator();ring.type='sine';
-    ring.frequency.value=bodyFreq*(1.4+s.color*0.8);  // unique ring pitch
-    const rg=ctx.createGain();
-    rg.gain.setValueAtTime(s.color*0.22,t);
-    rg.gain.linearRampToValueAtTime(0.0001,t+(0.06+s.color*0.06)/warp);
-    ring.connect(rg);rg.connect(dest);ring.start(t);ring.stop(t+0.16/warp);
-    autoClean(ring,rg);
-  }
+  // Pick ONE body recipe per hit. Three structurally distinct paths.
+  const recipe = pickSnareRecipe(s);
+  recipe(ctx, t, bodyFreq, warp, dest, s);
 
   // -- CRACK: unique noise burst -- different spectral shape every hit ------
   // Generate noise with unique RNG seed pattern for spectral variety
@@ -2048,7 +2187,14 @@ function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7){
   const isCrash = open && chaos > 0.68 && Math.random()<0.22;
   const isRide  = open && !isCrash && s.tone > 0.65;
   const cymType = isCrash?'crash':isRide?'ride':open?'open':'closed';
-  const hatMode = styleP().hatMode || 'metallic';
+  // Per-hit hatMode rotation: the style profile's hatMode is the "home"
+  // choice but 35% of hits swap to a completely different cymbal character
+  // (brush, digital, tape, vinyl, shaker, tabla). Wildcards always swap.
+  const HAT_POOL = ['metallic','brush','digital','tape','vinyl','shaker','tabla'];
+  const defaultHat = styleP().hatMode || 'metallic';
+  const hatMode = (s._wild || Math.random() < 0.35)
+    ? HAT_POOL[Math.floor(Math.random()*HAT_POOL.length)]
+    : defaultHat;
   // LFO-modulated brightness so consecutive hat hits drift in timbre
   const lBr = lfoBank.get('breath',t);
   const lFast = lfoBank.get('fast',t);
@@ -3099,7 +3245,14 @@ function synthMid(ctx,t,notes,chordType,chaos,warp,dest,windBoost=0){
 function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0){
   const s=drumSeed();
   const _lStyle=styleP();
-  const mode = _lStyle.leadMode || 'saw';
+  // Per-hit lead mode rotation: style default ~60% of the time, but 40% of
+  // hits pick a different lead character (saw / fm / bell / whistle / pluck).
+  // Wildcards always rotate. Makes the lead stop sounding like one patch.
+  const LEAD_POOL = ['saw','fm','bell','whistle','pluck'];
+  const defaultLead = _lStyle.leadMode || 'saw';
+  const mode = (s._wild || Math.random() < 0.40)
+    ? LEAD_POOL[Math.floor(Math.random()*LEAD_POOL.length)]
+    : defaultLead;
   const freq=440*Math.pow(2,(note-69)/12)*warp;
   // LFO only for long-form timbre drift. No note-length / volume wobble --
   // those made phrases sound like they were breathing wrong.
