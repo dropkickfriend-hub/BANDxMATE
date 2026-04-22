@@ -514,6 +514,7 @@ const collectiveBrainLoad=async()=>{
   if(p.songHistory) songHistory.load(p.songHistory);
     if(p.tensionArc) tensionArc.load(p.tensionArc);
     if(p.paramMemory) paramMemory.load(p.paramMemory);
+    if(p.autoFx) autoFx.load(p.autoFx);
     const voicingCount=Object.values(brain.voicingMem).reduce((s,a)=>s+a.length,0);
     console.log('[GenesisBrain] Loaded -- n:'+brain.n+' phrases:'+motifEng.phrases.length+' voicings:'+voicingCount);
   }catch(e){console.warn('[GenesisBrain] Brain load failed',e);}
@@ -539,6 +540,7 @@ const collectiveBrainSave=()=>{
         songHistory: songHistory.serialize(),
         tensionArc:  tensionArc.serialize(),
         paramMemory: paramMemory.serialize(),
+        autoFx:      autoFx.serialize(),
         _ts:         Date.now()
       };
       await genesisLocal.put(BRAIN_NS,payload);
@@ -1383,10 +1385,104 @@ const paramMemory = {
     return rawValue*(1-conf) + v.m[key]*conf;
   },
 
-  serialize(){ return Object.fromEntries(Object.entries(this.voices).map(([k,v])=>[k,{m:v.m,n:v.n}])); },
-  load(d){ if(!d) return; for(const k of Object.keys(this.voices)){ if(d[k]) this.voices[k]={m:d[k].m||{},n:d[k].n||0}; } },
+  // Mean absolute distance of `params` from the learned-good means for `role`.
+  // Returns 0 if memory isn't confident yet (n < 30).
+  artifactScore(role, params){
+    const v = this.voices[role]; if(!v || v.n < 30) return 0;
+    let sum = 0, count = 0;
+    for(const [k, val] of Object.entries(params)){
+      if(v.m[k] == null || typeof val !== 'number') continue;
+      sum += Math.abs(val - v.m[k]); count++;
+    }
+    return count ? sum/count : 0;
+  },
+
+  // True when the params drift more than `threshold` away from the learned mean
+  // AND the hard-gate toggle is on.
+  shouldGate(role, params){
+    if(!this.gateOn) return false;
+    return this.artifactScore(role, params) > 0.38;
+  },
+
+  gateOn: false,   // user-controlled -- wired to a UI button
+
+  serialize(){ return {voices:Object.fromEntries(Object.entries(this.voices).map(([k,v])=>[k,{m:v.m,n:v.n}])), gateOn:this.gateOn}; },
+  load(d){
+    if(!d) return;
+    const src = d.voices||d;    // accept old shape too
+    for(const k of Object.keys(this.voices)){ if(src[k]) this.voices[k]={m:src[k].m||{},n:src[k].n||0}; }
+    if(typeof d.gateOn === 'boolean') this.gateOn = d.gateOn;
+  },
 };
 if(typeof window!=='undefined') window.paramMemory=paramMemory;
+
+// -- AUTO FX: Q-learner that picks reverb/delay/chorus/fuzz combinations ----
+// Keyed on (style × chord × arc × tension-bucket). Each context remembers the
+// best mask it has tried. Rewarded when the mid/lead voice winding rises
+// after the decision was applied. FX are master-send only in this codebase,
+// so "per-voice" in practice means: pick the FX set that flatters the
+// currently-dominant harmonic voice given where we are in the arc.
+const autoFx = {
+  active: false,              // toggled from UI
+  table: {},                  // key -> {mask:[r,d,c,f], score, uses}
+  lastKey: null,
+  lastMask: null,
+  lastWinding: 0,
+  eps: 0.3,
+
+  _key(style, chord, arc, tBucket){ return `${style||'-'}|${chord||'-'}|${arc||'-'}|${tBucket}`; },
+  _bucket(h){ return h<0.3?'lo':h<0.6?'md':'hi'; },
+
+  decide(ctx){
+    const key = this._key(ctx.style, ctx.chord, ctx.arc, this._bucket(ctx.tension));
+    const entry = this.table[key];
+    let mask;
+    if(entry && Math.random() > this.eps){
+      mask = entry.mask.slice();
+    }else{
+      // Explore -- bias toward few FX at once (never more than 2)
+      mask = [Math.random()<0.35, Math.random()<0.25, Math.random()<0.22, Math.random()<0.10];
+      let on = mask.filter(Boolean).length;
+      while(on > 2){
+        const idx = mask.findIndex(v=>v);
+        mask[idx] = false; on--;
+      }
+    }
+    this.lastKey = key;
+    this.lastMask = mask.slice();
+    return mask;
+  },
+
+  apply(bus, mask){
+    if(!bus || !bus.ctx || bus.lean) return;
+    const names = ['reverb','delay','chorus','fuzz'];
+    names.forEach((n,i)=>{
+      if(!!bus.fxEnabled[n] !== !!mask[i]) bus.toggleFx(n);
+    });
+  },
+
+  // Reward based on harmonic-voice winding delta since the last decision.
+  observe(windingNow){
+    if(!this.lastKey || !this.lastMask) return;
+    const delta = windingNow - this.lastWinding;
+    this.lastWinding = windingNow;
+    const reward = Math.max(-1, Math.min(1, delta*0.5 + (windingNow-0.4)*0.3));
+    const e = this.table[this.lastKey] || {mask:this.lastMask.slice(), score:0.5, uses:0};
+    const newScore = e.score*0.85 + Math.max(0, Math.min(1, 0.5+reward*0.5))*0.15;
+    // Only replace the stored mask if the current one outscored the remembered one.
+    if(!this.table[this.lastKey] || newScore >= this.table[this.lastKey].score){
+      this.table[this.lastKey] = {mask:this.lastMask.slice(), score:newScore, uses:e.uses+1};
+    }else{
+      this.table[this.lastKey].uses++;
+    }
+    // Decay exploration as the table fills in
+    this.eps = Math.max(0.05, 0.3 - Object.keys(this.table).length*0.004);
+  },
+
+  serialize(){ return {table:this.table, eps:this.eps, active:this.active}; },
+  load(d){ if(!d) return; if(d.table) this.table=d.table; if(typeof d.eps==='number') this.eps=d.eps; if(typeof d.active==='boolean') this.active=d.active; },
+};
+if(typeof window!=='undefined') window.autoFx=autoFx;
 
 // Unique seed -> unique timbre parameters for each hit. Wider ranges +
 // occasional "wildcard" hits so the kit never settles into one voice.
@@ -1708,6 +1804,13 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   const lSlow = lfoBank.get('slow',t);
   const lMed  = lfoBank.get('med',t);
   const lBr   = lfoBank.get('breath',t);
+  // Artifact gate: if this seed is far from the learned-good kick region
+  // (and we're not explicitly exploring via a wildcard), soften the hit so
+  // the bad random values don't ruin the pocket.
+  if(!s._wild && paramMemory.shouldGate('drum', s)){
+    s.punch *= 0.55; s.decay *= 0.65; s.click *= 0.6;
+    inputEnergy *= 0.55;
+  }
   // Observe: punchy non-wildcard kicks teach the "good kick" distribution.
   if(!s._wild && inputEnergy > 0.45){
     paramMemory.observe('drum', {pitch:s.pitch,punch:s.punch,decay:s.decay,tone:s.tone,sub:s.sub,click:s.click}, inputEnergy);
@@ -1809,6 +1912,10 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5){
   const s=drumSeed();
   const lSlow = lfoBank.get('slow',t);
   const lMed  = lfoBank.get('med',t);
+  // Artifact gate for snare -- uses the shared 'drum' memory.
+  if(!s._wild && paramMemory.shouldGate('drum', s)){
+    s.punch *= 0.60; s.decay *= 0.70; s.tone = (s.tone+0.5)*0.5;
+  }
   const bodyFreq=(155+s.pitch*90+inputTight*50)*warp * (1 + lSlow*0.05);
   const tightness=s.tone*(0.5+inputTight*0.5) * (1 + lMed*0.12);
 
@@ -2736,9 +2843,12 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   const lMed  = lfoBank.get('med',t);
   const lFast = lfoBank.get('fast',t);
   // Bias a few per-hit parameters toward learned-good bass values.
-  const biasP = paramMemory.bias('bass','punch', s.punch);
-  const biasT = paramMemory.bias('bass','tone',  s.tone);
-  s.punch = biasP; s.tone = biasT;
+  s.punch = paramMemory.bias('bass','punch', s.punch);
+  s.tone  = paramMemory.bias('bass','tone',  s.tone);
+  // Gate bass if the remaining seed is still far off the learned norm.
+  if(!s._wild && paramMemory.shouldGate('bass', s)){
+    s.punch *= 0.65; s.tone *= 0.8; windBoost *= 0.6;
+  }
 
   // Neural inputs -- same brain as sub, different inference
   const inputs=bassBrain.update(windBoost*10, chaos, pcMod, beat);
@@ -2925,6 +3035,10 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0){
   s.punch = paramMemory.bias('lead','punch', s.punch);
   s.tone  = paramMemory.bias('lead','tone',  s.tone);
   s.color = paramMemory.bias('lead','color', s.color);
+  // Artifact gate for lead -- if params drift far from learned-good, soften.
+  if(!s._wild && paramMemory.shouldGate('lead', s)){
+    s.punch *= 0.7; s.decay *= 0.8; windBoost *= 0.7;
+  }
   const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult*(1+lSlow*0.15)/warp;
   const atk = _lStyle.attackMult * 0.006;
   const vol = (0.09+windBoost*0.04+s.punch*0.03) * (1 + lMed*0.10);
@@ -3214,6 +3328,8 @@ function App(){
   const[keyChangeFlag,setKCFlag]=useState(false);
   const[tempoChangeFlag,setTCFlag]=useState(false);
   const[fxOn,setFxOn]=useState({reverb:false,delay:false,chorus:false,fuzz:false});
+  const[autoFxActive,setAutoFxActive]=useState(false);
+  const[gateActive,setGateActive]=useState(false);
   const[arcIntensity,setArcIntensity]=useState(70); // 0-100, drives tensionArc.intensity
   const[arcName,setArcName]=useState('—');
   const[arcBar,setArcBar]=useState(0);
@@ -3377,10 +3493,20 @@ function App(){
   // Push arc-intensity slider into the tensionArc module; poll for the current
   // arc name + bar so the UI reflects whatever the conductor picked.
   useEffect(()=>{ tensionArc.intensity = arcIntensity/100; },[arcIntensity]);
+  useEffect(()=>{ autoFx.active = autoFxActive; },[autoFxActive]);
+  useEffect(()=>{ paramMemory.gateOn = gateActive; },[gateActive]);
   useEffect(()=>{
     const iv=setInterval(()=>{
       setArcName(tensionArc.currentArc?.name||'—');
       setArcBar(tensionArc.arcIndex||0);
+      // Keep FX button LEDs in sync when autoFx flips toggles under us.
+      if(autoFx.active && bus && bus.fxEnabled){
+        setFxOn(p=>{
+          const b=bus.fxEnabled;
+          if(p.reverb===b.reverb && p.delay===b.delay && p.chorus===b.chorus && p.fuzz===b.fuzz) return p;
+          return {reverb:!!b.reverb, delay:!!b.delay, chorus:!!b.chorus, fuzz:!!b.fuzz};
+        });
+      }
     },500);
     return()=>clearInterval(iv);
   },[]);
@@ -4804,6 +4930,21 @@ function App(){
       if(tensionArc.currentArc?.name !== _prevArc){
         addLog('[ARC] '+tensionArc.currentArc.name+' (phase '+ar.measureCount+')');
       }
+      // Auto-FX: on arc change OR every 4 bars, re-decide the FX combo.
+      // Observe winding of harmonic voices (mid+lead) to reward the last choice.
+      if(autoFx.active){
+        const harmWind = (voices.mid.winding + voices.lead.winding)*0.5;
+        autoFx.observe(harmWind);
+        if(tensionArc.currentArc?.name !== _prevArc || (ar.measureCount%4)===0){
+          const mask = autoFx.decide({
+            style: kickStyle,
+            chord: chordType,
+            arc:   tensionArc.currentArc?.name,
+            tension: tensionArc.currentFor('lead').h,
+          });
+          autoFx.apply(bus, mask);
+        }
+      }
       // Feed this bar's inputs into the per-install soundbank.
       userSoundbank.observe({
         chaosAvg:   chaos,
@@ -6165,12 +6306,26 @@ function App(){
               onChange={e=>setRS(parseInt(e.target.value))} onMouseUp={()=>setRS(0)} onTouchEnd={()=>setRS(0)}/>
           </div>
           <div>
-            <div className="text-[8px] text-slate-500 uppercase tracking-widest mb-1.5">Effects</div>
+            <div className="flex justify-between items-center mb-1.5">
+              <div className="text-[8px] text-slate-500 uppercase tracking-widest">Effects</div>
+              <div className="flex gap-1">
+                <button onClick={()=>setAutoFxActive(v=>!v)}
+                  title="Auto-FX learner: picks reverb/delay/chorus/fuzz per context and learns what works."
+                  className={"px-1.5 py-0.5 rounded text-[7px] font-bold uppercase tracking-widest border transition-all "+(autoFxActive?'bg-indigo-500/20 text-indigo-300 border-indigo-500/50':'bg-slate-800/60 text-slate-500 border-slate-700 hover:border-indigo-500/30')}>
+                  Auto
+                </button>
+                <button onClick={()=>setGateActive(v=>!v)}
+                  title="Artifact gate: softens drum/bass/lead hits whose random seed is far from the learned-good region."
+                  className={"px-1.5 py-0.5 rounded text-[7px] font-bold uppercase tracking-widest border transition-all "+(gateActive?'bg-rose-500/20 text-rose-300 border-rose-500/50':'bg-slate-800/60 text-slate-500 border-slate-700 hover:border-rose-500/30')}>
+                  Gate
+                </button>
+              </div>
+            </div>
             <div className="grid grid-cols-4 gap-1.5">
               {['reverb','delay','chorus','fuzz'].map(n=>(
                 <button key={n} onClick={()=>toggleFx(n)}
                   className={"py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all "+(fxOn[n]?'bg-emerald-500/15 text-emerald-300 border-emerald-500/40':'bg-slate-800/60 text-slate-500 border-slate-700 hover:border-slate-500')}>
-                  {n}
+                  {n}{autoFxActive?' *':''}
                 </button>
               ))}
             </div>
