@@ -5864,13 +5864,17 @@ function App(){
       if(!ar._vampMode) ar._vampLogged=false;
 
       // -- ARRANGEMENT: intro + breakdowns -------------------------------
-      // Intro: hat-only for the first ~2 bars. Gives the groove time to
-      // settle before the kick/snare announce.
+      // Intro: hat-only for the first ~2 bars. Every other voice stays
+      // silent so the groove establishes before the band lands.
+      // Breakdown: kick+snare+sub drop out, but bass/mid/lead keep going
+      // — classic breakdown feel, not dead silence.
       if((ar._introBars||0) > 0){
         ar._introBars -= 1;
-        ar._quietBar = true;
+        ar._quietBar = true;   // kills kick / snare / sub
+        ar._introActive = true; // also kills bass / mid / lead
         if(ar._introBars === 0) addLog('[INTRO] Band drops in.');
       } else {
+        ar._introActive = false;
         // Dynamic breakdowns: every ~8 bars, drop the kick/snare for 1 bar
         // so the groove breathes. Randomize placement ±3 bars.
         if(typeof ar._breakdownIn === 'number') ar._breakdownIn -= 1;
@@ -6128,7 +6132,7 @@ function App(){
     // -- SUB BASS + BASS -- alternating, never simultaneous -----------------
     // Sub owns downbeat (beat 0) and the half-note (beat 8 in 4/4).
     // Bass fills offbeats and syncopations. They share winding memory.
-    if(!sup.bass&&!mutes.bass&&bassOpts.length){
+    if(!sup.bass&&!mutes.bass&&!ar._introActive&&bassOpts.length){
       const iv=brain.choose(userRole,bassOpts,chaos,effectiveChord);
       // Force bass into bass register: E1-E3 (28-52)
       // Take root pitch class + iv, find correct octave
@@ -6175,7 +6179,7 @@ function App(){
     }
 
     // -- MID ---------------------------------------------------------------
-    if(!sup.mid&&!mutes.mid&&midOpts.length){
+    if(!sup.mid&&!mutes.mid&&!ar._introActive&&midOpts.length){
       const midMotifMod = isCall?1.2 : isResponse?0.6 : isTurnaround?1.4 : 1.0;
       // Exclusion principle: when kick/snare is sounding, mid ducks hard (80% chance to rest)
       const midExclusion = window._isDrumHitting ? 0.18 : 1.0;
@@ -6249,7 +6253,7 @@ function App(){
     }
 
     // -- LEAD -------------------------------------------------------------
-    if(!sup.lead&&!mutes.lead&&leadOpts.length){
+    if(!sup.lead&&!mutes.lead&&!ar._introActive&&leadOpts.length){
       // Exclusion principle: lead ducks even harder than mid when drums hit (90% rest)
       const leadExclusion = window._isDrumHitting ? 0.10 : 1.0;
       // Live-mic reactivity: the lead defers hard to the user (0.35 when user
