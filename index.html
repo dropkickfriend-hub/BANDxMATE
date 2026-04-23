@@ -1387,6 +1387,46 @@ const motifEng=new MotifEngine();
 
 // -- DEVICE CAPABILITY PROFILER -----------------------------------------------
 // Runs once on load. Shapes scheduler timing, BPM cap, and polyphony budget.
+// Safety net around AudioParam ramps: Web Audio throws if you pass NaN /
+// Infinity / negative-in-exp-ramp to setValueAtTime / linearRampToValueAtTime /
+// exponentialRampToValueAtTime. A single bad input in a synth would kill
+// the whole scheduler tick and cascade. Instead we clamp and log once per
+// unique non-finite so we can track the offender down without the app dying.
+(function(){
+  if(typeof AudioParam === 'undefined') return;
+  const _seen = new Set();
+  const _report = (kind, v) => {
+    const key = kind + ':' + (typeof v === 'number' ? (Number.isNaN(v)?'NaN':(v===Infinity?'+Inf':v===-Infinity?'-Inf':'bad')) : typeof v);
+    if(_seen.has(key)) return;
+    _seen.add(key);
+    try{
+      const stack = (new Error().stack || '').split('\n').slice(2,5).join(' | ');
+      console.warn('[AudioParam] non-finite ' + kind + ' = ' + v + ' — ' + stack);
+    }catch(_){}
+  };
+  const wrap = (name, defaultVal) => {
+    const orig = AudioParam.prototype[name];
+    if(!orig) return;
+    AudioParam.prototype[name] = function(value, time){
+      if(typeof value !== 'number' || !Number.isFinite(value)){
+        _report(name, value);
+        value = defaultVal;
+      }
+      if(typeof time !== 'number' || !Number.isFinite(time)){
+        _report(name+'(time)', time);
+        time = 0;
+      }
+      // exponentialRampToValueAtTime can't take 0 either
+      if(name === 'exponentialRampToValueAtTime' && value <= 0) value = 0.00001;
+      return orig.call(this, value, time);
+    };
+  };
+  wrap('setValueAtTime', 0);
+  wrap('linearRampToValueAtTime', 0);
+  wrap('exponentialRampToValueAtTime', 0.00001);
+  wrap('setTargetAtTime', 0);
+})();
+
 const DeviceComp = (() => {
   const cores = navigator.hardwareConcurrency || 2;
   const mem   = navigator.deviceMemory || 4;
@@ -8731,6 +8771,9 @@ function App(){
           motifEng.addOnset(now2);
           // User-activity tracking: scheduler reads these to duck the band
           // when the user is singing and to trigger a response on silence.
+          // Timestamp uses the AudioContext clock so it lines up with the
+          // scheduled band-onset times in ar._bandOnsets.
+          const ctxNow = (AR.current.ctx ? AR.current.ctx.currentTime : now2/1000);
           AR.current._userLastOnsetAt = ctxNow;
           AR.current._userIsActive = true;
           const result=motifEng._analyzeRhythm();
