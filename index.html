@@ -1433,13 +1433,20 @@ const motifEng=new MotifEngine();
           args[1] = 0;
         }
       }
-      // Third arg (setTargetAtTime only: timeConstant) passes through,
-      // but guard against NaN there too.
-      if(args.length >= 3){
-        const tc = args[2];
-        if(typeof tc !== 'number' || !Number.isFinite(tc) || tc <= 0){
-          _report(name+'(timeConstant)', tc);
-          args[2] = 0.01;
+      // Third arg (setTargetAtTime only: timeConstant). Web Audio requires
+      // it — without it you get "3 arguments required, but only 2 present".
+      // If a caller forgot it, supply a sensible default so the app keeps
+      // running; the log points us at the offending call site.
+      if(name === 'setTargetAtTime'){
+        if(args.length < 3){
+          _report(name+'(missing timeConstant)', undefined);
+          args[2] = 0.05;
+        } else {
+          const tc = args[2];
+          if(typeof tc !== 'number' || !Number.isFinite(tc) || tc <= 0){
+            _report(name+'(timeConstant)', tc);
+            args[2] = 0.05;
+          }
         }
       }
       return orig.apply(this, args);
