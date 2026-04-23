@@ -1548,6 +1548,88 @@ function buildDrumKitPattern(style){
   return dp;
 }
 
+// Per-bar variation: takes the locked base pattern and applies bar-level
+// edits based on position in a 4-bar phrase. Keeps the kit identity intact
+// but stops the groove from being a metronome repeating 1-2-3-4 forever.
+// A real drummer varies kick placement bar-to-bar, drops ghost snares in
+// different spots, and plays a fill on the turnaround. EDM stays simple
+// because four-on-floor is supposed to be relentless — other genres get
+// the full treatment.
+function applyBarVariation(basePat, barIdx, style, chaos){
+  if(!basePat) return basePat;
+  // Shallow-copy the arrays so per-bar edits don't mutate the base kit.
+  const dp = {
+    k: basePat.k.slice(), s: basePat.s.slice(), h: basePat.h.slice(),
+    hOpen: basePat.hOpen.slice(), hVel: basePat.hVel.slice(),
+    hDur: basePat.hDur.slice(), hWobble: basePat.hWobble.slice(),
+    sWobble: basePat.sWobble.slice(), kWobble: basePat.kWobble.slice(),
+    style: basePat.style,
+  };
+
+  const phase = ((barIdx%4)+4)%4;          // 0..3 within a 4-bar phrase
+  const isTurnaround = phase === 3;
+  const isEDM = style === 'edm';
+  const chaosAmt = Math.max(0, Math.min(1, chaos||0));
+
+  if(isEDM){
+    // EDM stays relentless. Only variation is a build-drop on the last bar
+    // of a phrase: pull the beat-4 kick so the groove breathes for a half
+    // beat before the next phrase slams back in.
+    if(isTurnaround && Math.random() < 0.35){
+      dp.k[12] = false;
+      dp.hOpen[14] = true;
+    }
+    return dp;
+  }
+
+  // ---- Non-EDM: real bar-to-bar variation --------------------------------
+  if(phase === 1){
+    // Bar 2: pickup kick on the &-of-1 or the &-of-4-prev-bar feel.
+    if(Math.random() < 0.45 && !dp.s[3]) dp.k[3] = true;
+    // Ghost snare mid-bar
+    if(Math.random() < 0.55 && !dp.k[6]) dp.s[6] = true;
+    // Open hat accent for groove breath
+    if(Math.random() < 0.30) dp.hOpen[6] = true;
+  } else if(phase === 2){
+    // Bar 3: push-pull — delay the beat-3 kick by a 16th.
+    if(Math.random() < 0.40 && dp.k[8]){
+      dp.k[8] = false;
+      dp.k[9] = true;
+      dp.kWobble[9] = 0.004;
+    }
+    // Extra ghost-snare on &-of-4 for flow into bar 4
+    if(Math.random() < 0.50 && !dp.k[14]) dp.s[14] = true;
+  } else if(isTurnaround){
+    // Bar 4: TURNAROUND FILL. Clear the back half of the bar and replace
+    // with a snare roll. This is the drummer saying "here comes the top".
+    dp.k[10] = false; dp.k[11] = false; dp.k[12] = false;
+    dp.s[12] = true;
+    dp.s[13] = Math.random() < 0.65;
+    dp.s[14] = true;
+    dp.s[15] = Math.random() < 0.75;
+    dp.sWobble[12] = 0;
+    dp.hOpen[14] = true;
+    dp.hVel[14] = 'hard';
+    // Style-specific fill color
+    if(style==='jazz'){
+      // Jazz fill is softer — keep the ride on 15 but quieter snare
+      dp.s[13] = false;
+    } else if(style==='hiphop'||style==='westcoast'||style==='eastcoast'){
+      // Hip-hop: add one extra kick way at the end (the push)
+      if(Math.random() < 0.35) dp.k[15] = true;
+    }
+  }
+  // Chaos-scaled micro-edits on any bar: stray ghost snare somewhere
+  if(chaosAmt > 0.35 && Math.random() < chaosAmt*0.45){
+    const candidates = [3,5,6,7,10,11,14].filter(st=>!dp.k[st]&&!dp.s[st]);
+    if(candidates.length){
+      const st = candidates[Math.floor(Math.random()*candidates.length)];
+      dp.s[st] = true;
+    }
+  }
+  return dp;
+}
+
 // Locked patterns keyed by style. Reseeding a row rebuilds just that row.
 let _drumKitPattern = null;
 let _drumKitPatternStyle = null;
@@ -1799,11 +1881,13 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   // Apply articulation to input energy (soft = quieter / less punchy, accent = opposite)
   if(art==='soft')  inputEnergy = Math.max(0.08, inputEnergy*0.55);
   if(art==='accent')inputEnergy = Math.min(1.00, inputEnergy*1.30+0.10);
+  // Articulation also scales decay — soft = short thud, accent = long boom.
+  const decayMul = art==='soft' ? 0.55 : art==='accent' ? 1.35 : 1.0;
 
   // ── Style-shaped parameters ────────────────────────────────────────────
   const f0 = styleLerp(sp.kickF0, s.pitch+inputEnergy*0.3) * warp;
   const f1 = styleLerp(sp.kickF1, s.pitch) * warp;
-  const decay = styleLerp(sp.kickDecay, s.decay+inputEnergy*0.2) / warp;
+  const decay = styleLerp(sp.kickDecay, s.decay+inputEnergy*0.2) * decayMul / warp;
   const punch = styleLerp(sp.kickPunch, s.punch) * (0.8+inputEnergy*0.2);
 
   // ── EDM extra: pre-kick click burst (the "knock") ────────────────────
@@ -2664,7 +2748,13 @@ function synth808(ctx, t, note, chaos, warp, windBoost=0, destIn=null){
   const dest=destIn||bus.getInput('bass'); if(!dest)return;
   const baseFreq=440*Math.pow(2,(note-69)/12);
   const s=drumSeed();
-  const decay=(1.2+s.decay*0.8+windBoost*0.4)/warp;  // long 808 tail
+  // Per-note length class: 25% short (stab), 55% medium, 20% long (sub boom).
+  // The old fixed 1.2-2.4 s decay made every 808 ring into the next beat,
+  // which is what the user was complaining about. Now it varies hit-to-hit
+  // and a lot of them are short enough to leave air for the next note.
+  const lenRoll = Math.random();
+  const lenClass = lenRoll < 0.25 ? 0.35 : lenRoll < 0.80 ? 0.70 : 1.20;
+  const decay=(lenClass + s.decay*0.25 + windBoost*0.25)/warp;
   const punch=0.90+s.punch*0.15;
 
   // ── Pitch envelope: drops from 2× to fundamental ──────────────────────────
@@ -5908,7 +5998,18 @@ function App(){
       const b16=beat%16;
 
       // Ensure the locked kit pattern matches the active style.
-      const dp = ensureDrumKitPattern(kickStyle||'pop');
+      // Per-bar variation layer on top of the locked kit pattern. The base
+      // pattern sets the drummer's identity; applyBarVariation edits each
+      // bar based on its position in a 4-bar phrase so the groove breathes
+      // (pickup kicks, ghost snares, fills on turnarounds). Cached per bar
+      // so the 16 ticks inside one bar don't each rebuild the variation.
+      const basePat = ensureDrumKitPattern(kickStyle||'pop');
+      const _barIdx = (ar.measureCount||0);
+      if(!ar._barPat || ar._barPatBar !== _barIdx){
+        ar._barPat = applyBarVariation(basePat, _barIdx, kickStyle||'pop', chaos);
+        ar._barPatBar = _barIdx;
+      }
+      const dp = ar._barPat;
 
       // During an intro or breakdown bar we suppress kick/snare so the hat
       // groove carries the tempo alone. Hats always play.
