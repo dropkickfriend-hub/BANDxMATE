@@ -7120,7 +7120,41 @@ function App(){
           // Open-hat only on designated steps, and only when that step actually plays
           dp.hOpen[st] = isDesignatedOpen0 && dp.h[st] > 0 && (Math.random() < 0.55 + chaos*0.2);
         }
-        // No fills, no random extras. The template is the groove.
+        // ---- PER-BAR VARIATION -------------------------------------------
+        // Real drummers don't play the same bar 4 times in a row. The
+        // template sets the identity; each bar in a 4-bar phrase gets a
+        // light edit so the groove breathes. EDM stays relentless because
+        // four-on-floor is supposed to be.
+        const barIdx = (ar.measureCount || 0);
+        const phase = ((barIdx % 4) + 4) % 4;
+        const isEDM = (typeof kickStyle !== 'undefined' && kickStyle === 'edm');
+        if(!isEDM){
+          if(phase === 1){
+            // Bar 2: pickup kick on the & of 1 + ghost snare mid-bar
+            if(!dp.k[3] && !dp.s[3] && Math.random()<0.55) dp.k[3] = 0.5;
+            if(!dp.k[6] && !dp.s[6] && Math.random()<0.55) dp.s[6] = 0.32;
+          } else if(phase === 2){
+            // Bar 3: push-pull — shift the beat-3 kick a 16th late
+            if(dp.k[8] > 0 && Math.random()<0.40){
+              dp.k[9] = dp.k[8]; dp.k[8] = 0;
+            }
+            if(!dp.k[14] && !dp.s[14] && Math.random()<0.45) dp.s[14] = 0.35;
+          } else if(phase === 3){
+            // Bar 4: TURNAROUND FILL — clear back-half kicks, snare roll
+            dp.k[10] = 0; dp.k[11] = 0; dp.k[12] = 0;
+            dp.s[12] = 0.75;
+            if(Math.random()<0.60) dp.s[13] = 0.55;
+            dp.s[14] = 0.80;
+            if(Math.random()<0.70) dp.s[15] = 0.65;
+            dp.hOpen[14] = true;
+          }
+        } else {
+          // EDM turnaround: 35% chance to pull the beat-4 kick for tension
+          if(phase === 3 && Math.random()<0.35){
+            dp.k[12] = 0;
+            dp.hOpen[14] = true;
+          }
+        }
         ar._drumPattern = dp;
       }
       const dp=ar._drumPattern||{k:new Array(16).fill(0),s:new Array(16).fill(0),h:new Array(16).fill(0),hOpen:new Array(16).fill(false)};
@@ -7139,10 +7173,11 @@ function App(){
       const playRide = isResponse && (groove==='jazzSwing'||groove==='bossaNova') && beat%4===0 && Math.random()<0.4;
 
       if(playK){
+        const kT = time;
         // Velocity from the groove template (already shaped by the archetype).
         // Accent vs ghost comes straight from the template value, not random.
         const kickVel = Math.max(0.35, Math.min(1, kVel*0.65 + ie*0.35));
-        synthKick(ctx,time,warpMultiplier,bus.getInput('drum'),kickVel);
+        synthKick(ctx,kT,warpMultiplier,bus.getInput('drum'),kickVel);
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{k:true});
         if(hapticModeRef.current==='bass'||deafModeRef.current)hap.kick();else hap.tap();
@@ -7169,8 +7204,9 @@ function App(){
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
       }
       if(playS){
+        const sT = time;
         const snVel = Math.max(0.35, Math.min(1, sVel*0.7 + 0.15));
-        synthSnare(ctx,time,chaos,warpMultiplier,bus.getInput('drum'),snVel);
+        synthSnare(ctx,sT,chaos,warpMultiplier,bus.getInput('drum'),snVel);
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{s:true});
         if(hapticModeRef.current==='rhythm')hap.snare();
