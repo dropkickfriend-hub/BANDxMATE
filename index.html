@@ -321,42 +321,96 @@ const structureEngine = {
     return Math.max(1, base + jitter);
   },
 
-  // Pick a musically sensible next chord given the current one and taste
+  // Pick a next chord. Expanded from the old 4-5-1 default into a full
+  // harmonic vocabulary: functional cadences + modal interchange + chromatic
+  // mediants + deceptive cadences + tritone subs. The choice is weighted by
+  // complexity (prefers less obvious moves when enough chords have been
+  // played) and by novelty (avoids repeating the same local pattern).
   nextChord(current, chaos, taste_darkness, brain){
-    const PROGRESSIONS = {
-      // Common functional progressions -- each array is [next chords]
-      maj:   ['dom7','min7','maj7','min','quar','dom9'],
-      min:   ['min7','dom7','maj','quar','min11','dim'],
-      dom7:  ['maj','min','maj7','quar','dom9'],
-      maj7:  ['dom9','min7','min','quar','lydian'],
-      min7:  ['dom7','maj','min','dim','min11'],
-      quar:  ['maj','min','dom7','min7','maj7'],
-      dom9:  ['maj','min7','maj7','min','quar'],
-      min11: ['dom7','maj','min7','quar','dim'],
-      dim:   ['min','dom7','aug','min7'],
-      aug:   ['maj','min','dom7','maj7'],
-      lydian:['maj7','dom9','min7','quar'],
+    // Wider options table. Each destination is a {type, weight, tag} so we
+    // can bias by complexity/novelty later. Weight 1.0 = obvious move,
+    // 0.3 = unusual but musical (chromatic, deceptive, modal).
+    const VOCAB = {
+      maj: [
+        {c:'dom7', w:1.0, tag:'V'},      {c:'min7', w:1.0, tag:'ii'},
+        {c:'maj7', w:0.9, tag:'IΔ'},     {c:'min',  w:0.8, tag:'vi'},
+        {c:'quar', w:0.5, tag:'quartal'},{c:'dom9', w:0.7, tag:'V9'},
+        {c:'lydian',w:0.4,tag:'#IV'},    {c:'dim',  w:0.3, tag:'#V°'},
+        {c:'aug',  w:0.3, tag:'I+'},     {c:'min11',w:0.5, tag:'vi11'},
+      ],
+      min: [
+        {c:'min7', w:1.0, tag:'i'},      {c:'dom7', w:1.0, tag:'V'},
+        {c:'maj',  w:0.8, tag:'III'},    {c:'quar', w:0.5, tag:'quartal'},
+        {c:'min11',w:0.6, tag:'i11'},    {c:'dim',  w:0.4, tag:'vii°'},
+        {c:'maj7', w:0.4, tag:'VI'},     {c:'aug',  w:0.3, tag:'III+'},
+        {c:'lydian',w:0.3,tag:'bII lyd'},
+      ],
+      dom7:  [{c:'maj',w:1.0},{c:'min',w:0.8},{c:'maj7',w:0.7},{c:'quar',w:0.5},{c:'dom9',w:0.6},{c:'min7',w:0.5},{c:'lydian',w:0.3},{c:'dim',w:0.3}],
+      maj7:  [{c:'dom9',w:0.9},{c:'min7',w:1.0},{c:'min',w:0.6},{c:'quar',w:0.5},{c:'lydian',w:0.5},{c:'maj',w:0.4},{c:'dom7',w:0.4}],
+      min7:  [{c:'dom7',w:1.0},{c:'maj',w:0.8},{c:'min',w:0.8},{c:'dim',w:0.3},{c:'min11',w:0.7},{c:'quar',w:0.5},{c:'maj7',w:0.4}],
+      quar:  [{c:'maj',w:0.8},{c:'min',w:0.8},{c:'dom7',w:0.7},{c:'min7',w:0.7},{c:'maj7',w:0.6},{c:'dom9',w:0.4},{c:'lydian',w:0.4}],
+      dom9:  [{c:'maj',w:1.0},{c:'min7',w:0.7},{c:'maj7',w:0.7},{c:'min',w:0.5},{c:'quar',w:0.5},{c:'lydian',w:0.3}],
+      min11: [{c:'dom7',w:1.0},{c:'maj',w:0.6},{c:'min7',w:0.9},{c:'quar',w:0.5},{c:'dim',w:0.3}],
+      dim:   [{c:'min',w:1.0},{c:'dom7',w:0.8},{c:'aug',w:0.4},{c:'min7',w:0.6},{c:'maj7',w:0.3}],
+      aug:   [{c:'maj',w:0.9},{c:'min',w:0.7},{c:'dom7',w:0.7},{c:'maj7',w:0.5}],
+      lydian:[{c:'maj7',w:1.0},{c:'dom9',w:0.6},{c:'min7',w:0.5},{c:'quar',w:0.5},{c:'maj',w:0.3}],
     };
-    const options = (PROGRESSIONS[current] || PROGRESSIONS.maj);
-    // Bias toward dark chords if taste says so
-    const dark = taste_darkness > 0.55;
-    const darkChords = ['min','min7','min11','dim'];
-    const brightChords = ['maj','maj7','lydian','dom9'];
-    const biased = options.filter(c => dark
-      ? darkChords.includes(c) || Math.random()<0.4
-      : brightChords.includes(c) || Math.random()<0.4
-    );
-    const pool = biased.length ? biased : options;
-    // Use brain suggestion if available
+    let options = (VOCAB[current] || VOCAB.maj).slice();
+
+    // 1) Cloud-discovered progressions: if progressionMemory has a high-
+    //    score suggestion that follows the recent window, prefer it 60%.
+    //    The cloud worker writes its discoveries into this library.
     const brainSugg = progressionMemory.suggest(current);
-    if(brainSugg && CHORDS[brainSugg] && Math.random()<0.5) return brainSugg;
-    return pool[Math.floor(Math.random()*pool.length)] || options[0];
+    if(brainSugg && CHORDS[brainSugg] && Math.random()<0.6){
+      return brainSugg;
+    }
+
+    // 2) Complexity score per candidate. Favors:
+    //    - non-obvious moves (low w)     = tritone/deceptive/modal
+    //    - chord quality not in recent window (novelty)
+    //    - harmonically distant root when chaos is high
+    const window = progressionMemory.window || [];
+    const recentSet = new Set(window.slice(-4));
+    const complexityWeight = Math.min(1, 0.35 + chaos*0.70);
+
+    const scored = options.map(opt=>{
+      const common = opt.w;                           // 1.0 = obvious
+      const unusual = 1 - opt.w;                      // high for complex moves
+      const novelty = recentSet.has(opt.c) ? 0 : 1;   // 1 if not heard recently
+      // Dark/bright preference (unchanged intent)
+      const dark = taste_darkness > 0.55;
+      const darkChords = ['min','min7','min11','dim'];
+      const brightChords = ['maj','maj7','lydian','dom9'];
+      const tasteBias = dark
+        ? (darkChords.includes(opt.c) ? 1.2 : 0.75)
+        : (brightChords.includes(opt.c) ? 1.2 : 0.85);
+      // Final score: complexity blended with simplicity by complexityWeight
+      const score = (complexityWeight * (0.4*unusual + 0.5*novelty + 0.1)
+                  + (1-complexityWeight) * common)
+                  * tasteBias;
+      return {c:opt.c, score};
+    });
+    // Roulette-wheel pick
+    const total = scored.reduce((s,o)=>s+Math.max(0.01,o.score),0);
+    let r = Math.random()*total;
+    for(const o of scored){
+      r -= Math.max(0.01,o.score);
+      if(r<=0) return o.c;
+    }
+    return scored[0].c;
   },
 
-  // Build a 4-chord phrase sequence
+  // Build a phrase. Length 4 on average but can be 3 or 6 to escape the
+  // relentless 4-bar boxed feel. Adds occasional non-tonic openings so
+  // the band sometimes starts on a ii or IV rather than always I.
   buildPhrase(currentChord, chaos, taste_darkness, brain){
+    const lenRoll = Math.random();
+    const len = lenRoll < 0.55 ? 4
+              : lenRoll < 0.80 ? 3
+              : lenRoll < 0.92 ? 6
+              : 8;
     const seq = [currentChord];
-    for(let i=0;i<3;i++){
+    for(let i=0;i<len-1;i++){
       seq.push(this.nextChord(seq[seq.length-1], chaos, taste_darkness, brain));
     }
     return seq;
@@ -479,6 +533,56 @@ if(typeof document!=='undefined'){
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Cloud-discovered progressions. A background Python worker running on the
+// user's GCP VM (see /cloud/chord_worker.py) evolves chord progressions by
+// complexity + novelty fitness and writes the top-scoring set to
+// /cloud/progressions.json either served from the VM via nginx or uploaded
+// to a public GCS bucket.
+//
+// The URL is configurable in localStorage ('bandx.cloudUrl'); if absent, we
+// try /progressions.json relative to the page. Missing/CORS/bad JSON all
+// fail silently and the built-in library keeps working.
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchCloudProgressions(){
+  try{
+    const override = (typeof localStorage!=='undefined') ? localStorage.getItem('bandx.cloudUrl') : null;
+    const url = override || 'progressions.json';
+    const res = await fetch(url, { cache: 'no-store' });
+    if(!res.ok) return;
+    const data = await res.json();
+    if(!data || !Array.isArray(data.library)) return;
+    let added = 0;
+    data.library.forEach(entry=>{
+      if(!entry || typeof entry.seq !== 'string' || !isFinite(entry.score)) return;
+      const parts = entry.seq.split('-');
+      if(parts.length < 3) return;
+      // Only accept progressions whose chord types exist in our CHORDS table
+      if(!parts.every(p => CHORDS[p])) return;
+      const ex = progressionMemory.library.find(p => p.seq === entry.seq);
+      if(ex){
+        ex.score = Math.min(1, ex.score*0.4 + entry.score*0.6);
+        ex.uses += entry.uses || 1;
+      } else {
+        progressionMemory.library.push({
+          seq: entry.seq,
+          score: Math.min(1, entry.score),
+          uses: entry.uses || 1,
+        });
+        added++;
+      }
+    });
+    // Keep the library bounded but prefer high-score entries
+    progressionMemory.library.sort((a,b)=>b.score-a.score);
+    if(progressionMemory.library.length > 64){
+      progressionMemory.library.length = 64;
+    }
+    if(added) console.log('[Cloud] Merged ' + added + ' discovered progressions. Library: ' + progressionMemory.library.length);
+  }catch(e){
+    // Silent — offline / CORS / no worker configured all end here
+  }
+}
+
 const collectiveBrainLoad=async()=>{
   try{
     // Load the per-install soundbank bias in parallel with the brain snapshot.
@@ -518,6 +622,10 @@ const collectiveBrainLoad=async()=>{
       });
     }
     if(p.progression) progressionMemory.load(p.progression);
+    // Also merge any cloud-discovered progressions the background worker
+    // has written out. Fire-and-forget so a slow/missing cloud doesn't
+    // hold up local boot.
+    fetchCloudProgressions().catch(()=>{});
     if(p.rhythmMem) rhythmMemory.load(p.rhythmMem);
     if(p.convergence) convergenceTracker.load(p.convergence);
   if(p.taste) bandTaste.load(p.taste);
@@ -2116,7 +2224,7 @@ const STYLE_PROFILES = {
     soloistStyle:'auto',   // Django for pluck leads, Ruben for rhodes/piano
     chromaRate:2,          // 1 chromatic approach every ~2 bars
     midBank:['grand-piano','rhodes-mk2','vibraphone','nylon-guitar'],
-    leadBank:['bell','pluck','fm','moog','saw'],
+    leadBank:['bell','pluck','moog'],
     label:'Jazz',
   },
   pop: {
@@ -2127,8 +2235,8 @@ const STYLE_PROFILES = {
     leadMode:'saw',      // classic poly-saw lead
     hatMode:'metallic',  // standard physical cymbal model -- clean, bright
     hatGrooveOffset:0,   // on the grid
-    midBank:['grand-piano','rhodes-mk2','string-ensemble','clavinet-d6'],
-    leadBank:['saw','moog','pluck','fm','bell'],
+    midBank:['grand-piano','rhodes-mk2','string-ensemble','nylon-guitar'],
+    leadBank:['bell','pluck','moog'],
     label:'Pop',
   },
   edm: {
@@ -2143,8 +2251,8 @@ const STYLE_PROFILES = {
     arpBias:0.75,           // 75% chance extra-instrument auto-picks arp
     arpContinuous:true,     // arp loops a scale pattern across bars
     doubleTimeBias:0.5,     // 50% chance a fresh session locks to double-time grid
-    midBank:['analog-brass','prophet-pad','string-ensemble'],
-    leadBank:['fm','saw','moog','pluck'],
+    midBank:['rhodes-mk2','string-ensemble','grand-piano','vibraphone'],
+    leadBank:['bell','pluck','moog'],
     label:'Hip-Hop/EDM',
   },
   hiphop: {
@@ -2158,8 +2266,8 @@ const STYLE_PROFILES = {
     halftimeBias:true,     // snare only on step 12 (beat 4) — J-Dilla halftime
     snareDensity:0.5,      // drop 50% of non-backbeat snare candidates
     tempoBias:{range:[78,92], prob:0.33}, // 33% chance BPM snaps to Dilla pocket
-    midBank:['rhodes-mk2','wurlitzer-200','clavinet-d6','mellotron-tape'],
-    leadBank:['moog','pluck','fm','bell'],
+    midBank:['rhodes-mk2','grand-piano','vibraphone','nylon-guitar'],
+    leadBank:['bell','pluck','moog'],
     label:'Hip-Hop',
   },
   westcoast: {
@@ -2170,8 +2278,8 @@ const STYLE_PROFILES = {
     leadMode:'moog',     // warm analog lead (dropped the dogwhistle)
     hatMode:'tape',      // same tape-sat vibe as hip-hop
     hatGrooveOffset:0.010, // deep pocket -- G-Funk drags hard
-    midBank:['rhodes-mk2','wurlitzer-200','clavinet-d6'],
-    leadBank:['moog','saw','fm','bell'],
+    midBank:['rhodes-mk2','grand-piano','string-ensemble'],
+    leadBank:['bell','pluck','moog'],
     label:'West Coast',
   },
   eastcoast: {
@@ -2182,8 +2290,8 @@ const STYLE_PROFILES = {
     leadMode:'pluck',    // Karplus-Strong pluck -- sample-like
     hatMode:'vinyl',     // dusty vinyl -- high-passed crackle, filtered noise
     hatGrooveOffset:0.004,
-    midBank:['rhodes-mk2','wurlitzer-200','clavinet-d6','grand-piano'],
-    leadBank:['pluck','saw','moog'],
+    midBank:['rhodes-mk2','grand-piano','nylon-guitar','vibraphone'],
+    leadBank:['pluck','bell','moog'],
     label:'East Coast',
   },
   african: {
@@ -2197,8 +2305,8 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.005,
-    midBank:['vibraphone','nylon-guitar','mellotron-tape'],
-    leadBank:['fm','moog','pluck','saw'],
+    midBank:['vibraphone','nylon-guitar','grand-piano'],
+    leadBank:['bell','pluck','moog'],
     label:'African',
   },
   indian: {
@@ -2212,8 +2320,8 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.007,
-    midBank:['mellotron-tape','prophet-pad','nylon-guitar'],
-    leadBank:['bell','fm','pluck','moog'],
+    midBank:['nylon-guitar','grand-piano','string-ensemble','vibraphone'],
+    leadBank:['bell','pluck','moog'],
     label:'Indian',
   },
 };

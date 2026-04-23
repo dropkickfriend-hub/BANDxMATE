@@ -3,3 +3,5 @@ www/vendor/*.js
 android/
 ios/
 .DS_Store
+cloud/progressions.json
+cloud/venv/
