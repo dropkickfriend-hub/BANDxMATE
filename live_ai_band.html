@@ -1331,6 +1331,187 @@ function drumSeed(){return{
   color:   Math.random(),             // spectral character (used differently per drum)
 };}
 
+// Locked drum kit: timbre stays identical across every hit within one session / reseed.
+// Reseed a single drum via reseedDrum('kick'|'snare'|'hat'). Velocity + timing still vary per hit.
+const _drumKit={kick:drumSeed(),snare:drumSeed(),hat:drumSeed()};
+function drumSeedFor(name){return _drumKit[name]||drumSeed();}
+function reseedDrum(name){if(_drumKit[name]!==undefined){_drumKit[name]=drumSeed();}}
+if(typeof window!=='undefined'){window._drumKit=_drumKit;window.reseedDrum=reseedDrum;}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DRUM-RULES PATTERN ENGINE
+// Drums don't follow the same free-improv system as the melodic voices.
+// Hat grid is built first (groove anchor). Snare locks to 2 & 4 (or step 12 only
+// for halftime hip-hop). Kick responds to hard-accent hat steps, pruned by genre.
+// Pattern is locked per reseed — NOT regenerated every measure.
+// Reseed a single drum row via reseedDrumPattern('kick'|'snare'|'hat'|'all').
+// Each step stores: on/off, velocity class (hard/soft), duration multiplier, time wobble.
+// ═══════════════════════════════════════════════════════════════════════════════
+function buildDrumKitPattern(style){
+  const sp = STYLE_PROFILES[style] || STYLE_PROFILES.pop;
+  const dp = {
+    k:new Array(16).fill(false),
+    s:new Array(16).fill(false),
+    h:new Array(16).fill(false),
+    hOpen:new Array(16).fill(false),
+    hVel:new Array(16).fill('soft'),
+    hDur:new Array(16).fill(1.0),
+    hWobble:new Array(16).fill(0),
+    sWobble:new Array(16).fill(0),
+    kWobble:new Array(16).fill(0),
+    style:style,
+  };
+
+  // Pick the hat grid flavor per genre
+  const hatGrid = sp.hatGrid || (
+    style==='edm' ? 'sixteenths' :
+    style==='hiphop'||style==='westcoast'||style==='eastcoast' ? 'jDillaEighths' :
+    style==='jazz' ? 'tripletShuffle' :
+    style==='african' ? 'africanShaker' :
+    style==='indian' ? 'indianTabla' :
+    'straightEighths'
+  );
+
+  // --- HAT GRID (the groove the rest of the kit answers to) -------------
+  if(hatGrid==='sixteenths'){
+    // Straight 16ths, alternating hard on beats / soft on offbeats
+    for(let st=0; st<16; st++){
+      dp.h[st]=true;
+      dp.hVel[st]=(st%4===0)?'hard':'soft';
+      dp.hDur[st]=0.92+Math.random()*0.16;
+    }
+    dp.hOpen[14]=true;
+  } else if(hatGrid==='jDillaEighths'){
+    // 8ths with J-Dilla micro-timing wobble and uneven durations
+    for(let st=0; st<16; st+=2){
+      dp.h[st]=true;
+      dp.hVel[st]=(st%4===0)?'hard':'soft';
+      dp.hDur[st]=0.82+Math.random()*0.30;
+      dp.hWobble[st]=(Math.random()*0.018 - 0.006); // slightly behind-biased drift
+    }
+    // Occasional ghost 16th between 8ths for that drunken feel
+    for(let st=1; st<16; st+=2){
+      if(Math.random()<0.22){
+        dp.h[st]=true;
+        dp.hVel[st]='soft';
+        dp.hDur[st]=0.75+Math.random()*0.20;
+        dp.hWobble[st]=(Math.random()*0.016 - 0.004);
+      }
+    }
+  } else if(hatGrid==='tripletShuffle'){
+    // Jazz ride feel. Positions based on swung 8th-note triplets mapped to 16 grid:
+    // main beats 0/4/8/12, triplet tails at 3/7/11/15 (shuffled second eighth)
+    [0,3,4,7,8,11,12,15].forEach(st=>{
+      dp.h[st]=true;
+      dp.hVel[st]=(st%4===0)?'hard':'soft';
+      dp.hDur[st]=0.95+(Math.random()-0.5)*0.18;
+    });
+  } else if(hatGrid==='africanShaker'){
+    // Shaker on every offbeat 16th, heavier on &-of-2 and &-of-4
+    for(let st=1; st<16; st+=2){
+      dp.h[st]=true;
+      dp.hVel[st]=(st===5||st===13)?'hard':'soft';
+      dp.hDur[st]=0.90+Math.random()*0.18;
+    }
+    // Downbeat shaker too for definition
+    dp.h[0]=true; dp.hVel[0]='hard'; dp.hDur[0]=1.0;
+  } else if(hatGrid==='indianTabla'){
+    // Alternating na (hard) / tin (soft) on 8ths, tabla speaks
+    for(let st=0; st<16; st+=2){
+      dp.h[st]=true;
+      dp.hVel[st]=(st%4===0)?'hard':'soft';
+      dp.hDur[st]=1.0+(Math.random()-0.5)*0.14;
+    }
+  } else {
+    // pop / default: straight 8ths with hard/soft alternation
+    for(let st=0; st<16; st+=2){
+      dp.h[st]=true;
+      dp.hVel[st]=(st%4===0)?'hard':'soft';
+      dp.hDur[st]=0.92+Math.random()*0.14;
+    }
+    if(Math.random()<0.5) dp.hOpen[14]=true;
+  }
+
+  // --- SNARE: locked backbeat ------------------------------------------
+  // Beats 2 & 4 = steps 4 and 12. Hip-hop halftime = step 12 only.
+  const halftime = !!sp.halftimeBias;
+  const snareDensity = (sp.snareDensity==null?1:sp.snareDensity);
+  if(halftime){
+    dp.s[12]=true;
+    dp.sWobble[12]=0.006+Math.random()*0.008; // J-Dilla lag on the snare
+    // Sparse ghost snare (no longer backbeat), density-gated
+    if(snareDensity>=0.5 && Math.random()<0.20) dp.s[10]=true;
+  } else {
+    dp.s[4]=true;
+    dp.s[12]=true;
+    if(style==='jazz'){
+      // brush on 2 & 4 already set; soft rim roll on 3 optional
+    }
+  }
+
+  // --- KICK: responds to hard-accent hat steps --------------------------
+  let kickSet;
+  if(style==='edm'){
+    kickSet=[0,4,8,12]; // four-on-floor
+  } else if(style==='hiphop'||style==='westcoast'||style==='eastcoast'){
+    // Downbeat + one syncopated push
+    kickSet=[0, (Math.random()<0.5?10:11)];
+    dp.kWobble[kickSet[1]]=0.004+Math.random()*0.008;
+  } else if(style==='jazz'){
+    // Feathered four: light kick on 1 & 3
+    kickSet=[0,8];
+  } else if(style==='african'){
+    // Call-response: 0, 6, 10 (bongo low/high alternation handled by synth)
+    kickSet=[0,6,10];
+  } else if(style==='indian'){
+    // Bayan (bass tabla) speaks on 1 & 3
+    kickSet=[0,8];
+  } else {
+    // pop: 1, 3, optional pickup
+    kickSet=[0,8];
+    if(Math.random()<0.45) kickSet.push(6);
+  }
+  kickSet.forEach(st=>{ if(st>=0 && st<16 && !dp.s[st]) dp.k[st]=true; });
+
+  return dp;
+}
+
+// Locked patterns keyed by style. Reseeding a row rebuilds just that row.
+let _drumKitPattern = null;
+let _drumKitPatternStyle = null;
+function ensureDrumKitPattern(style){
+  if(!_drumKitPattern || _drumKitPatternStyle!==style){
+    _drumKitPattern = buildDrumKitPattern(style);
+    _drumKitPatternStyle = style;
+  }
+  return _drumKitPattern;
+}
+function reseedDrumPattern(which){
+  const style = (typeof kickStyle!=='undefined' ? kickStyle : 'pop');
+  const fresh = buildDrumKitPattern(style);
+  if(!_drumKitPattern || which==='all' || !which){
+    _drumKitPattern = fresh;
+  } else if(which==='kick'){
+    _drumKitPattern.k = fresh.k;
+    _drumKitPattern.kWobble = fresh.kWobble;
+  } else if(which==='snare'){
+    _drumKitPattern.s = fresh.s;
+    _drumKitPattern.sWobble = fresh.sWobble;
+  } else if(which==='hat'){
+    _drumKitPattern.h = fresh.h;
+    _drumKitPattern.hOpen = fresh.hOpen;
+    _drumKitPattern.hVel = fresh.hVel;
+    _drumKitPattern.hDur = fresh.hDur;
+    _drumKitPattern.hWobble = fresh.hWobble;
+  }
+  _drumKitPatternStyle = style;
+  return _drumKitPattern;
+}
+if(typeof window!=='undefined'){
+  window.reseedDrumPattern = reseedDrumPattern;
+  window.ensureDrumKitPattern = ensureDrumKitPattern;
+}
+
 // Anti-click: schedule a micro fade-in/out on any gain node
 // This ensures waveform returns to zero before node stops -- eliminates pops
 function safeStart(gainNode, ctx, t, vol, holdTime, attackMs=0.003, releaseMs=0.006){
@@ -1356,6 +1537,9 @@ const STYLE_PROFILES = {
     leadMode:'bell',     // bell-like FM lead -- floats over jazz chords
     hatMode:'brush',     // brush swish -- soft, airy, warm (jazz brushes on cymbal)
     hatGrooveOffset:0.008, // triplet push -- laid-back behind swing 8th
+    shuffleFeel:true,      // 16th grid swung 2:1 (triplet eighths)
+    soloistStyle:'auto',   // Django for pluck leads, Ruben for rhodes/piano
+    chromaRate:2,          // 1 chromatic approach every ~2 bars
     label:'Jazz',
   },
   pop: {
@@ -1376,6 +1560,10 @@ const STYLE_PROFILES = {
     leadMode:'fm',       // bright FM stab lead
     hatMode:'digital',   // sharp digital clicks, FM noise, bit-crushed textures
     hatGrooveOffset:-0.003, // slightly rushed -- driving
+    padSustain:true,        // pads/chords can hold across bar lines
+    arpBias:0.75,           // 75% chance extra-instrument auto-picks arp
+    arpContinuous:true,     // arp loops a scale pattern across bars
+    doubleTimeBias:0.5,     // 50% chance a fresh session locks to double-time grid
     label:'Hip-Hop/EDM',
   },
   hiphop: {
@@ -1386,6 +1574,9 @@ const STYLE_PROFILES = {
     leadMode:'whistle',  // sine-whistle lead -- classic hip-hop vocal lead
     hatMode:'tape',      // tape-saturated hats -- warm, compressed, lo-fi crunch
     hatGrooveOffset:0.006, // behind the beat -- boom-bap pocket
+    halftimeBias:true,     // snare only on step 12 (beat 4) — J-Dilla halftime
+    snareDensity:0.5,      // drop 50% of non-backbeat snare candidates
+    tempoBias:{range:[78,92], prob:0.33}, // 33% chance BPM snaps to Dilla pocket
     label:'Hip-Hop',
   },
   westcoast: {
@@ -1415,7 +1606,9 @@ const STYLE_PROFILES = {
     midMode:'keys',
     leadMode:'fm',       // bright FM stabs for highlife
     hatMode:'shaker',    // shaker/cabasa -- granular burst, organic texture
+    kickMode:'bongo',    // call-response bongo (low/high) instead of 909-style kick
     woodPerc:true,
+    padSustain:true,
     hatGrooveOffset:0.005,
     label:'African',
   },
@@ -1426,7 +1619,9 @@ const STYLE_PROFILES = {
     midMode:'keys',
     leadMode:'bell',     // bell/sitar-like FM for Indian feel
     hatMode:'tabla',     // tabla-inspired high percussion -- pitched, resonant
+    kickMode:'bayan',    // bass tabla with pitch bend down (dhol/bayan)
     woodPerc:true,
+    padSustain:true,
     hatGrooveOffset:0.007,
     label:'Indian',
   },
@@ -1438,9 +1633,75 @@ function styleP(){ return STYLE_PROFILES[kickStyle]||STYLE_PROFILES.pop; }
 // Lerp between profile range values using a seed float [0-1]
 function styleLerp(range, seed){ return range[0] + seed*(range[1]-range[0]); }
 
+// ── ETHNIC KICK MODES ─────────────────────────────────────────────────────
+// bongo: call/response between low (macho ~150Hz) and high (hembra ~250Hz) bongo
+//        membranes. Locked kit pattern puts kicks on 0, 6, 10 so we alternate
+//        low/high by hit index for the classic bongo conversation.
+// bayan: low Indian tabla (bayan/dhol) — tuned membrane ~80-140Hz with a
+//        pitch bend down that gives it the talking drum vowel.
+let _bongoToggle=0;
+function synthEthnicKick(ctx,t,warp,dest,inputEnergy,mode,s){
+  const atk=0.002;
+  if(mode==='bongo'){
+    _bongoToggle=1-_bongoToggle;
+    const hi = _bongoToggle===1;
+    const baseHz = (hi ? 260 : 155) * (0.92+s.pitch*0.16);
+    const decay = (0.16+s.decay*0.10)/warp;
+    const osc=ctx.createOscillator(); osc.type='sine';
+    osc.frequency.setValueAtTime(baseHz*warp, t);
+    osc.frequency.exponentialRampToValueAtTime(baseHz*0.62*warp, t+decay);
+    const g=ctx.createGain();
+    g.gain.setValueAtTime(0,t);
+    g.gain.linearRampToValueAtTime(0.55*(0.8+inputEnergy*0.3), t+atk);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+decay);
+    // Membrane slap: short noise burst high-passed for the skin
+    const nLen=Math.floor(ctx.sampleRate*0.018);
+    const nBuf=ctx.createBuffer(1,nLen,ctx.sampleRate);
+    const nD=nBuf.getChannelData(0);
+    for(let i=0;i<nLen;i++) nD[i]=(Math.random()*2-1)*Math.pow(1-i/nLen,1.4);
+    const ns=ctx.createBufferSource(); ns.buffer=nBuf;
+    const hpf=ctx.createBiquadFilter(); hpf.type='highpass'; hpf.frequency.value=(hi?1600:1100);
+    const ng=ctx.createGain(); ng.gain.setValueAtTime(0.30,t); ng.gain.linearRampToValueAtTime(0.0001,t+0.03);
+    osc.connect(g); g.connect(dest);
+    ns.connect(hpf); hpf.connect(ng); ng.connect(dest);
+    osc.start(t); osc.stop(t+decay+0.02); ns.start(t);
+    autoClean(osc,g,ns,hpf,ng);
+  } else {
+    // bayan / dhol — low tabla bass, strong pitch bend for the "talking" feel
+    const baseHz = 135*(0.90+s.pitch*0.18);
+    const targetHz = 72*(0.92+s.pitch*0.12);
+    const decay = (0.28+s.decay*0.16)/warp;
+    const osc=ctx.createOscillator(); osc.type='sine';
+    osc.frequency.setValueAtTime(baseHz*warp, t);
+    osc.frequency.exponentialRampToValueAtTime(targetHz*warp, t+decay*0.45);
+    // Second partial for resonance body
+    const osc2=ctx.createOscillator(); osc2.type='triangle';
+    osc2.frequency.setValueAtTime(baseHz*2*warp, t);
+    osc2.frequency.exponentialRampToValueAtTime(targetHz*1.8*warp, t+decay*0.35);
+    const g=ctx.createGain();
+    g.gain.setValueAtTime(0,t);
+    g.gain.linearRampToValueAtTime(0.62*(0.8+inputEnergy*0.25), t+atk);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+decay);
+    const g2=ctx.createGain();
+    g2.gain.setValueAtTime(0.14, t);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t+decay*0.5);
+    osc.connect(g); g.connect(dest);
+    osc2.connect(g2); g2.connect(dest);
+    osc.start(t); osc.stop(t+decay+0.03);
+    osc2.start(t); osc2.stop(t+decay*0.55);
+    autoClean(osc,g,osc2,g2);
+  }
+}
+
 function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
-  const s=drumSeed();
+  const s=drumSeedFor('kick');
   const sp=styleP(); // current style profile
+
+  // ── Ethnic kick modes: bongo (African call/response) and bayan (Indian bass tabla)
+  if(sp.kickMode==='bongo' || sp.kickMode==='bayan'){
+    synthEthnicKick(ctx,t,warp,dest,inputEnergy,sp.kickMode,s);
+    return;
+  }
 
   // ── Style-shaped parameters ────────────────────────────────────────────
   const f0 = styleLerp(sp.kickF0, s.pitch+inputEnergy*0.3) * warp;
@@ -1535,7 +1796,7 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
 }
 
 function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5){
-  const s=drumSeed();
+  const s=drumSeedFor('snare');
   const bodyFreq=(155+s.pitch*90+inputTight*50)*warp;
   const tightness=s.tone*(0.5+inputTight*0.5);
 
@@ -1596,13 +1857,13 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5){
   autoClean(tail,hpf,lpf,tg);
 }
 
-function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7){
-  const s=drumSeed();
+function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7,durMult=1.0){
+  const s=drumSeedFor('hat');
   const isCrash = open && chaos > 0.68 && Math.random()<0.22;
   const isRide  = open && !isCrash && s.tone > 0.65;
   const cymType = isCrash?'crash':isRide?'ride':open?'open':'closed';
   const hatMode = styleP().hatMode || 'metallic';
-  synthCymbal(ctx, t, cymType, s, warp, dest, inputBright, velocity, hatMode);
+  synthCymbal(ctx, t, cymType, s, warp, dest, inputBright, velocity, hatMode, durMult);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1616,8 +1877,9 @@ function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7){
 //   shaker   - granular burst: organic micro-grains, like a cabasa/shekere
 //   tabla    - pitched membrane + buzz: resonant, tuned, tabla-inspired
 // ═══════════════════════════════════════════════════════════════════════════════
-function synthCymbal(ctx, t, type, s, warp, dest, brightness=0.5, velocity=0.7, hatMode='metallic'){
+function synthCymbal(ctx, t, type, s, warp, dest, brightness=0.5, velocity=0.7, hatMode='metallic', durMult=1.0){
   if(!dest) return;
+  const _dm=Math.max(0.6, Math.min(1.4, durMult||1.0));
   const SR = ctx.sampleRate;
   const vel = Math.max(0.05, Math.min(1, velocity));
 
@@ -1628,7 +1890,8 @@ function synthCymbal(ctx, t, type, s, warp, dest, brightness=0.5, velocity=0.7, 
     crash:  0.45+s.decay*0.45,
     ride:   0.20+s.decay*0.24,
   };
-  const dur = (baseDur[type]||baseDur.closed) / warp;
+  // durMult stretches the tail (hat "ergonomic" groove breath) without changing pitch
+  const dur = ((baseDur[type]||baseDur.closed) / warp) * _dm;
   const atk = type==='closed' ? 0.0003+(1-vel)*0.002 : 0.001+(1-vel)*0.004;
 
   // ── ROUTE BY HAT MODE ─────────────────────────────────────────────────────
@@ -2399,12 +2662,13 @@ function synthWoodPerc(ctx, t, velocity=0.7, pitch=1.0, warp=1.0, dest){
 }
 
 // Rhodes electric piano: FM tine model (operator pair + tremolo)
-function synthRhodes(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0){
+function synthRhodes(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0){
   if(!dest)return;
   const s=drumSeed();
   const dark=bandTaste.darkness;
-  const _ms=styleP(); 
-  const sustain=(0.9+s.tone*0.5+windBoost*0.2)*_ms.noteLenMult/warp;
+  const _ms=styleP();
+  const _dscl=Math.max(0.25, Math.min(8.0, durScale||1.0));
+  const sustain=(0.9+s.tone*0.5+windBoost*0.2)*_ms.noteLenMult*_dscl/warp;
   const atk=0.008*_ms.attackMult;
 
   for(const semis of (notes||[0])){
@@ -2543,7 +2807,7 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   autoClean(body,flt,g);
 }
 
-function synthMid(ctx,t,notes,chordType,chaos,warp,dest,windBoost=0){
+function synthMid(ctx,t,notes,chordType,chaos,warp,dest,windBoost=0,durScale=1.0){
   const ct=CHORDS[chordType]||CHORDS.maj;
   const s=drumSeed();
   const dark=bandTaste.darkness;
@@ -2553,8 +2817,9 @@ function synthMid(ctx,t,notes,chordType,chaos,warp,dest,windBoost=0){
 
   // Envelope
   const _mStyle=styleP();
+  const _dscl=Math.max(0.25, Math.min(8.0, durScale||1.0));
   const atkT=(0.02+s.decay*0.035)*_mStyle.attackMult/warp;
-  const susT=(1.1+s.tone*0.5+windBoost*0.35)*_mStyle.noteLenMult/warp;
+  const susT=(1.1+s.tone*0.5+windBoost*0.35)*_mStyle.noteLenMult*_dscl/warp;
   const maxVoices=DeviceComp.score<0.45?2:3;
   const voiceNotes=notes.slice(0,maxVoices);
 
@@ -2619,12 +2884,13 @@ function synthMid(ctx,t,notes,chordType,chaos,warp,dest,windBoost=0){
 // -- LEAD: multi-mode synth engine --------------------------------------------
 // leadMode is set per style profile and evolves via brain reinforcement.
 // Modes: 'saw' (poly detuned), 'fm' (FM stab), 'bell' (FM bell), 'pluck' (KS pluck), 'whistle' (sine+vib)
-function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0){
+function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
   const s=drumSeed();
   const _lStyle=styleP();
   const mode = _lStyle.leadMode || 'saw';
   const freq=440*Math.pow(2,(note-69)/12)*warp;
-  const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult/warp;
+  const _dscl=Math.max(0.25, Math.min(6.0, durScale||1.0));
+  const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult*_dscl/warp;
   const atk = _lStyle.attackMult * 0.006;
   const vol = 0.09+windBoost*0.04+s.punch*0.03;
 
@@ -2816,9 +3082,10 @@ const flipEngine={
 // -- SYNTH: ARP (arpeggiated plucked synth) -----------------------------------
 // Physical model: Karplus-Strong style pluck + resonator
 // Each arp note is uniquely generated
-function synthArp(ctx, t, note, chaos, warp, dest, windBoost=0){
+function synthArp(ctx, t, note, chaos, warp, dest, windBoost=0, durScale=1.0){
   const s=drumSeed();
   const freq=440*Math.pow(2,(note-69)/12)*warp;
+  const _dscl=Math.max(0.25, Math.min(8.0, durScale||1.0));
   // Exciter: short noise burst (the "pluck")
   const excLen=Math.floor(ctx.sampleRate*(0.008+s.punch*0.012));
   const excBuf=ctx.createBuffer(1,excLen,ctx.sampleRate);
@@ -2837,7 +3104,7 @@ function synthArp(ctx, t, note, chaos, warp, dest, windBoost=0){
   const g1=ctx.createGain();g1.gain.value=0.7+s.tone*0.2;
   const g2=ctx.createGain();g2.gain.value=0.3+chaos*0.2;
   // Envelope
-  const durT=(0.18+s.decay*0.45+windBoost*0.2+chaos*0.15)/warp;
+  const durT=(0.18+s.decay*0.45+windBoost*0.2+chaos*0.15)*_dscl/warp;
   const env=ctx.createGain();
   env.gain.setValueAtTime(0.6+windBoost*0.15,t);
   env.gain.linearRampToValueAtTime(0.0001,t+durT);
@@ -3110,7 +3377,27 @@ function App(){
     }, 500);
     return ()=>clearInterval(iv);
   },[bpm]);
-  useEffect(()=>{kickStyle=kickStyleState||'pop';},[kickStyleState]);
+  useEffect(()=>{
+    kickStyle=kickStyleState||'pop';
+    // Fresh drum kit timbre + pattern on style change
+    reseedDrum('kick'); reseedDrum('snare'); reseedDrum('hat');
+    reseedDrumPattern('all');
+    const sp = STYLE_PROFILES[kickStyle]||STYLE_PROFILES.pop;
+    // Hip-hop tempo bias: 33% chance lock into the Dilla pocket (78-92 BPM)
+    if(sp.tempoBias && Math.random() < sp.tempoBias.prob){
+      const [lo,hi] = sp.tempoBias.range;
+      const nb = Math.round(lo + Math.random()*(hi-lo));
+      setBpm(nb); AR.current.bpm=nb;
+      addLog(`[STYLE] ${sp.label} → ${nb} BPM (Dilla pocket)`);
+    }
+    // EDM double-time: 50% of sessions use a 2× grid (16ths become 32nds)
+    if(sp.doubleTimeBias && Math.random() < sp.doubleTimeBias){
+      AR.current._gridMul = 2;
+      addLog(`[STYLE] ${sp.label} → double-time grid`);
+    } else {
+      AR.current._gridMul = 1;
+    }
+  },[kickStyleState]);
   useEffect(()=>{AR.current.userRole=userRole;},[userRole]);
   useEffect(()=>{isPlayRef.current=isPlaying;},[isPlaying]);
   useEffect(()=>{lockedRef.current=lockedIn;},[lockedIn]);
@@ -3198,6 +3485,40 @@ function App(){
       hap.mute();
       return next;
     });
+  };
+
+  // -- PER-INSTRUMENT RESEED -----------------------------------------------
+  // Each instrument can be reseeded independently in case one voice is
+  // ruining the groove. Drums split further into kick/snare/hat so a bad
+  // kick tone or snare placement can be rerolled without touching the hat.
+  const reseedInstrument=(which)=>{
+    if(which==='kick'||which==='snare'||which==='hat'){
+      reseedDrum(which);
+      reseedDrumPattern(which);
+      addLog(`[RESEED] ${which.toUpperCase()} reshuffled.`);
+    } else if(which==='drum'){
+      reseedDrum('kick'); reseedDrum('snare'); reseedDrum('hat');
+      reseedDrumPattern('all');
+      addLog('[RESEED] Drum kit reshuffled.');
+    } else if(which==='bass'||which==='mid'||which==='lead'){
+      const v=voicesRef.current[which];
+      if(v){ v.lastNote=null; v.glow=0; v.winding=Math.max(0, v.winding*0.4); }
+      // Soft-reset brain weights for that role -- clears recent phrase memory
+      // without wiping learned voicings.
+      try{
+        if(brain&&brain.q){
+          const prefix=which+'_';
+          Object.keys(brain.q).forEach(k=>{ if(k.indexOf(prefix)===0) brain.q[k]=brain.q[k]*0.25; });
+        }
+      }catch(_){}
+      addLog(`[RESEED] ${which.toUpperCase()} vocabulary shuffled.`);
+    } else if(which==='all'){
+      reseedDrum('kick'); reseedDrum('snare'); reseedDrum('hat');
+      reseedDrumPattern('all');
+      ['bass','mid','lead'].forEach(r=>reseedInstrument(r));
+      addLog('[RESEED] Full band reshuffled.');
+    }
+    hap.tap();
   };
 
   // -- REHARM ----------------------------------------------------------------
@@ -4558,80 +4879,31 @@ function App(){
     const bb=Math.floor(stepsPerMeasure/2);
     const sup={drum:userRole==='drum',bass:userRole==='bass',mid:userRole==='mid',lead:userRole==='lead'};
 
-    // -- DRUMS (groove-archetype driven) ------------------------------------
+    // -- DRUMS (rules-based, hat-anchor, locked per reseed) -----------------
     if(!sup.drum&&!mutes.drum){
-      // Pick archetype once per measure (beat 0), carry it forward
+      // Keep the groove archetype around for reward/learn, but no longer used to
+      // re-roll the grid per measure -- drums follow drummer-rules now.
       if(beat===0){ ar._groove=bandTaste.pickArchetype(); }
       const groove=ar._groove||'fourOnFloor';
       const b16=beat%16;
 
-      // -- RATIONAL GRID: build full 16-step pattern once at measure start --
-      // No per-step randomness. Pattern is committed for the whole measure.
-      // Snare is ~4x less frequent than kick by design (backbeat only + rare fills).
-      if(beat===0){
-        const kMod0 = isCall?1.2 : isResponse?0.65 : isTurnaround?1.4 : 1;
-        const sMod0 = isCall?0.7 : isResponse?0.50 : isTurnaround?1.0 : 0.7; // snare much less
-        const hMod0 = isCall?0.9 : isResponse?1.30 : isTurnaround?0.7 : 1;
-        // Rationality: 1.0 = strict archetype adherence, 0.0 = chaotic variation
-        // High rationality locks in the archetype template; low rationality introduces noise.
-        const rat = Math.max(0, Math.min(1, ar.drumRationality ?? 0.75));
-        const dp = {k:new Array(16).fill(false), s:new Array(16).fill(false),
-                    h:new Array(16).fill(false), hOpen:new Array(16).fill(false)};
-        let kickCount = 0;
-        for(let st=0;st<16;st++){
-          // KICK: step 0 always fires at high rationality; low rat may skip it (rare but possible)
-          if(st===0){
-            if(rat > 0.2 || Math.random() < 0.85) { dp.k[st]=true; kickCount++; }
-            continue;
-          }
-          const kP0=bandTaste.stepProb('k',st,groove,chaos)*(rSug.k?1.4:1.0)*(hist.k?0.12:1.0);
-          // Blend: at rat=1 use pure archetype prob; at rat=0 mix in chaotic noise
-          const kNoise = chaos * (Math.random() < 0.45 ? 1.3 : 0.3);
-          const kEff = kP0 * rat + kNoise * (1 - rat);
-          if(Math.random()<kEff*kMod0){ dp.k[st]=true; kickCount++; }
-        }
-        for(let st=0;st<16;st++){
-          // SNARE: backbeat (bb) probabilistic at 55%, extra hits very rare
-          // Constraint: snare can't fire on same step as kick
-          if(dp.k[st]) continue;
-          if(st===bb){
-            // High rationality = reliable backbeat; low rat = backbeat probability drops
-            const bbProb = 0.55 * rat + (0.3 * chaos * Math.random()) * (1 - rat);
-            dp.s[st]=Math.random()<bbProb*sMod0; continue;
-          }
-          const sP0=bandTaste.stepProb('s',st,groove,chaos)*(rSug.s?1.3:1.0)*(hist.s?0.12:1.0);
-          const sNoise = chaos * Math.random() * 0.5;
-          const sEff = sP0 * rat + sNoise * (1 - rat);
-          // Extra snare hits capped so total snare <= kickCount/4
-          const snareCount=dp.s.filter(Boolean).length;
-          if(snareCount < Math.max(1, Math.floor(kickCount/4))){
-            if(Math.random()<sEff*sMod0*0.25) dp.s[st]=true; // 0.25 = extra rarity
-          }
-        }
-        for(let st=0;st<16;st++){
-          // HAT: archetype probability, groove offset baked in, skip kick-dominant beats
-          const hP0=bandTaste.stepProb('h',st,groove,chaos)*(rSug.h?1.2:1.0)*(hist.h?0.55:1.0)*0.85*hMod0;
-          if(Math.random()<hP0*motifShape.densityMod) dp.h[st]=true;
-          const isDesignatedOpen0=bandTaste.isOpenStep(st,groove);
-          const openBase0 = isDesignatedOpen0 ? 0.55+chaos*0.25 : chaos*(isResponse?0.22:0.09);
-          dp.hOpen[st] = Math.random()<openBase0*(groove==='jazzSwing'?1.8:groove==='bossaNova'?1.3:1);
-        }
-        ar._drumPattern=dp;
-      }
-      const dp=ar._drumPattern||{k:[],s:[],h:[],hOpen:[]};
+      // Ensure the locked kit pattern matches the active style.
+      const dp = ensureDrumKitPattern(kickStyle||'pop');
+
       const playK  = !!dp.k[b16];
       const playS  = !!dp.s[b16];
       const playH  = !!dp.h[b16];
       const openH  = !!dp.hOpen[b16];
-      // Ghost snare: response phase only, quiet, between main snares (not in grid -- these are fills)
-      const playGhostSnare = isResponse && !dp.s[b16] && !dp.k[b16] && beat%4===2 && Math.random()<chaos*0.35;
+      // Turnaround fill: last measure of a section can add a snare ghost on 14
+      const playGhostSnare = isTurnaround && beat===14 && !dp.s[b16] && Math.random()<0.45;
       // Crash on turnaround downbeat
       const playCrash = isTurnaround && beat===0 && ar.measuresThisChord===1 && Math.random()<0.55;
       // Ride on response phase during jazz/bossa
       const playRide = isResponse && (groove==='jazzSwing'||groove==='bossaNova') && beat%4===0 && Math.random()<0.4;
 
       if(playK){
-        synthKick(ctx,time,warpMultiplier,bus.getInput('drum'),ie);
+        const kT = time + (dp.kWobble[b16]||0);
+        synthKick(ctx,kT,warpMultiplier,bus.getInput('drum'),ie);
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{k:true});
         if(hapticModeRef.current==='bass'||deafModeRef.current)hap.kick();else hap.tap();
@@ -4640,7 +4912,8 @@ function App(){
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
       }
       if(playS){
-        synthSnare(ctx,time+(Math.random()-0.5)*styleP().microJitter,chaos,warpMultiplier,bus.getInput('drum'),1-ie);
+        const sT = time + (dp.sWobble[b16]||0) + (Math.random()-0.5)*styleP().microJitter;
+        synthSnare(ctx,sT,chaos,warpMultiplier,bus.getInput('drum'),1-ie);
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{s:true});
         if(hapticModeRef.current==='rhythm')hap.snare();
@@ -4649,12 +4922,14 @@ function App(){
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
       }
       if(playH){
-        // Velocity: accented steps (high hP base from archetype) hit harder
-        const hatVel = Math.max(0.2, Math.min(1.0, bandTaste.stepProb('h',b16,groove,0)*0.6 + 0.35 + (Math.random()-0.5)*0.15));
-        // Groove timing offset: style-aware push/pull beyond microJitter
+        // Velocity comes from the pattern's hard/soft accent class (the groove anchor)
+        const hard = dp.hVel[b16]==='hard';
+        const hatVel = Math.max(0.20, Math.min(1.0, (hard?0.88:0.38) + (Math.random()-0.5)*0.10));
+        // Groove timing offset: style-aware push/pull + pattern wobble (J-Dilla etc)
         const grooveOff = (styleP().hatGrooveOffset||0) * (0.7 + Math.random()*0.6);
-        const hatT = time + (Math.random()-0.5)*styleP().microJitter*1.5 + grooveOff;
-        synthHat(ctx,hatT,openH,chaos,warpMultiplier,bus.getInput('drum'),ie,hatVel);
+        const hatT = time + (dp.hWobble[b16]||0) + (Math.random()-0.5)*styleP().microJitter*1.2 + grooveOff;
+        const durMult = dp.hDur[b16]||1.0;
+        synthHat(ctx,hatT,openH,chaos,warpMultiplier,bus.getInput('drum'),ie,hatVel,durMult);
         rhythmMemory.mark(beat,stepsPerMeasure,{h:true});
       }
 
@@ -4761,10 +5036,22 @@ function App(){
         const notes=chaos>0.72?[midBase,midBase+5,midBase+10]:chosenIvs.map(v=>midBase+v);
         const _mm=styleP().midMode||'keys';
         const _midWind = voices.mid.winding*0.07*(ar._breathMid||1.0);
+        // Duration menu: on-beat = long chord, off-beat = stab. padSustain styles
+        // (EDM/African/Indian) can hold across bar lines.
+        const _padSust = !!styleP().padSustain;
+        const _bm16 = beat%16;
+        const onBeat = (_bm16%4===0);
+        const offBeat = (_bm16%2===0);
+        let _midScale = onBeat ? 1.6 : (offBeat ? 1.0 : 0.55);
+        if(_padSust && onBeat){
+          // Weighted pick from [2, 4, 8] beats — longer near tonic/downbeat
+          const padMenu=[2.0, 3.2, 4.8, 6.4];
+          _midScale = padMenu[Math.floor(Math.random()*padMenu.length)];
+        }
         if(_mm==='rhodes')
-          synthRhodes(ctx,time,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind);
+          synthRhodes(ctx,time,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind,_midScale);
         else
-          synthMid(ctx,time,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind);
+          synthMid(ctx,time,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind,_midScale);
         // Wood percussion layer (African + Indian)
         if(styleP().woodPerc && Math.random()<0.65){
           const _wd=bus.getInput('drum');
@@ -4801,11 +5088,60 @@ function App(){
           const darkIvs=leadOpts.filter(function(v){return v%12===10||v%12===3||v%12===7;});
           if(darkIvs.length) iv=darkIvs[Math.floor(Math.random()*darkIvs.length)];
         }
+
+        // -- WRONG-NOTE IMPROV (~1 per 4 bars, 1 per 2 bars in jazz) ------
+        // Play a chromatic neighbor now, then force the next lead hit in this
+        // bar back onto the brain's chord-tone target. Makes "wrong" notes
+        // resolve, so it sounds like bebop/Django improv, not a mistake.
+        const _lp = styleP();
+        const chromaEvery = _lp.chromaRate || 4;
+        if(beat===0){ voices.lead._barsSince = (voices.lead._barsSince||0) + 1; }
+        const _doChroma = (voices.lead._barsSince||0) >= chromaEvery
+                          && !voices.lead._chromaPending
+                          && Math.random() < 0.55;
+        if(_doChroma){
+          voices.lead._chromaTarget = iv;        // remember where to resolve
+          voices.lead._chromaPending = true;
+          voices.lead._barsSince = 0;
+          iv = iv + (Math.random()<0.5 ? -1 : +1); // chromatic neighbor
+        } else if(voices.lead._chromaPending){
+          // Force the resolution: snap back to the saved chord-tone target
+          iv = voices.lead._chromaTarget;
+          voices.lead._chromaPending = false;
+        }
+
         const leadNote=rootMidi+iv;
         let ln=leadNote;
         while(ln<60)ln+=12; while(ln>84)ln-=12;
-        synthLead(ctx,time,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0));
+        // Lead duration menu by beat position — real musicians phrase short on
+        // offbeats, long on downbeats. ~15% of the time, swap for human variation.
+        const _lB=beat%16, _lOn = (_lB%4===0), _lOff = (_lB%2===0);
+        let _leadScale = _lOn ? 1.4 : (_lOff ? 0.75 : 0.45);
+        // Chromatic passing tone is always short so it resolves fast
+        if(_doChroma) _leadScale = 0.35;
+        if(Math.random()<0.15) _leadScale *= (Math.random()<0.5?0.6:1.7);
+        synthLead(ctx,time,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0),_leadScale);
         voices.lead.play();voices.lead.lastNote=ln;
+
+        // -- JAZZ SOLOIST FLOURISH (Django on pluck leads, Ruben on rhodes) -
+        // After a downbeat note at moderate intensity, tack on a quick run.
+        if(_lp.soloistStyle && _lB%4===0 && !_doChroma && voices.lead.winding>0.6 && Math.random()<0.35){
+          const stepSec = 60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25;
+          const isDjango = (_lp.leadMode==='pluck') || _lp.soloistStyle==='django';
+          if(isDjango){
+            // Django: three-note chromatic approach up into the target
+            const run=[ iv-2, iv-1, iv ];
+            run.forEach((rv,idx)=>{
+              let rn=rootMidi+rv; while(rn<60)rn+=12; while(rn>84)rn-=12;
+              synthLead(ctx,time+(idx+1)*stepSec*0.33,rn,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.05,0.35);
+            });
+          } else {
+            // Ruben Gonzalez: syncopated montuno octave ping on &-of-beat
+            let rn=ln+12; while(rn>92)rn-=12;
+            synthLead(ctx,time+stepSec*0.5,rn,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.05,0.55);
+          }
+        }
+
         brain.reward('lead',iv,0.6+voices.lead.glow*0.2+bandTaste.darkness*(iv%12===10||iv%12===3?0.2:-0.1),chordType);
       }
     }
@@ -4820,12 +5156,32 @@ function App(){
       }
     }
     // -- ARP layer ---------------------------------------------------------
-    if(extraInstRef.current==='arp'&&!mutes.lead){
-      const arpProb=density*0.7*(DeviceComp.score<0.4?0.5:1.0);
-      if(Math.random()<arpProb){
-        const arpIv=brain.choose(userRole,leadOpts.concat(ct.iv.map(v=>v+7)),chaos,chordType);
-        synthArp(ctx,time,rootMidi+arpIv,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.06);
+    // EDM (and other padSustain styles with arpContinuous) can force-enable
+    // the arp even when the user hasn't selected it — arpBias weights how
+    // often this auto-pick fires.
+    const _arpForced = (styleP().arpBias||0) > Math.random() && !mutes.lead;
+    const _arpOn = extraInstRef.current==='arp' || _arpForced;
+    if(_arpOn && !mutes.lead){
+      const continuous = !!styleP().arpContinuous;
+      if(continuous){
+        // Iterate a pre-chosen scale pattern across bars — do not re-roll per beat.
+        // Pattern = chord tones stacked: [0, iv[1], iv[2], iv[1]+12, ...] looped 16-step.
+        if(!ar._arpPattern || ar._arpChord!==effectiveChord){
+          const ivs = ct.iv.concat(ct.iv.map(v=>v+12));
+          ar._arpPattern = ivs;
+          ar._arpChord = effectiveChord;
+        }
+        const step = beat % 16;
+        const arpIv = ar._arpPattern[step % ar._arpPattern.length];
+        synthArp(ctx,time,rootMidi+arpIv+12,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.06,0.9);
         voices.lead.play();
+      } else {
+        const arpProb=density*0.7*(DeviceComp.score<0.4?0.5:1.0);
+        if(Math.random()<arpProb){
+          const arpIv=brain.choose(userRole,leadOpts.concat(ct.iv.map(v=>v+7)),chaos,chordType);
+          synthArp(ctx,time,rootMidi+arpIv,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.06);
+          voices.lead.play();
+        }
       }
     }
     ar.rhythmHistory[bk]={k:!sup.drum,s:!sup.drum,h:!sup.drum,b:!sup.bass,m:!sup.mid,l:!sup.lead};
@@ -4848,10 +5204,16 @@ function App(){
       const beat=ar.current16thNote;
       const spb=60.0/((ar.lockedBpm||ar.bpm)*ar.warpMultiplier);
       let time=ar.nextNoteTime;
-      const sw=ar.lockedSwing??ar.swing;
+      // Jazz shuffleFeel forces a 2:1 triplet swing (~66%) regardless of the
+      // user knob — that's what makes jazz sound like jazz.
+      const _spSwing = (STYLE_PROFILES[kickStyle]||STYLE_PROFILES.pop).shuffleFeel ? 66 : (ar.lockedSwing??ar.swing);
+      const sw=_spSwing;
       if(beat%2===1)time+=(sw/100)*(0.25*spb)*0.5;
       scheduleNote(beat,time);
-      ar.nextNoteTime+=0.25*spb;ar.current16thNote=(beat+1)%ar.stepsPerMeasure;
+      // Grid multiplier: EDM double-time halves the step length without
+      // changing pitch or displayed BPM. Default 1.0.
+      const _grid=ar._gridMul||1;
+      ar.nextNoteTime+=(0.25/_grid)*spb;ar.current16thNote=(beat+1)%ar.stepsPerMeasure;
     }
     // MessageChannel fires at near-audio priority, not throttled by mobile browser
     // This is the standard trick used by Tone.js and other audio libs
@@ -5891,8 +6253,13 @@ function App(){
         {Object.entries(voicesRef.current).map(([role,v])=>{
           const isU=userRole===role;const hex=roleColors[role];const pct=Math.min(100,v.winding*5);
           return(
-            <div key={role} className={"p-2.5 rounded-lg border text-center transition-all cursor-pointer "+(isU?'opacity-30 border-white/10':'border-slate-800')+" "+(mutes[role]?'grayscale opacity-40':'')}
+            <div key={role} className={"relative p-2.5 rounded-lg border text-center transition-all cursor-pointer "+(isU?'opacity-30 border-white/10':'border-slate-800')+" "+(mutes[role]?'grayscale opacity-40':'')}
               style={{background:hex+'0d'}} onClick={()=>toggleMute(role)}>
+              <button title={`Reseed ${role}`}
+                onClick={(e)=>{e.stopPropagation();reseedInstrument(role);}}
+                className="absolute top-1 right-1 text-[9px] leading-none px-1 py-0.5 rounded bg-slate-800/60 hover:bg-slate-700/80 text-slate-300">
+                {'\u{1F3B2}'}
+              </button>
               <div className="text-[7px] uppercase tracking-widest mb-1" style={{color:hex}}>{isU?'YOU':mutes[role]?'[M]':role}</div>
               <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden mb-1">
                 <div className="h-full rounded-full transition-all duration-700" style={{width:pct+'%',background:hex,boxShadow:'0 0 5px '+hex}}/>
@@ -5901,6 +6268,21 @@ function App(){
             </div>
           );
         })}
+      </div>
+
+      {/* DRUM KIT RESEED -- per-drum so a bad kick/snare/hat can be rerolled */}
+      <div className="bg-[#0b1120] border border-slate-800/60 rounded-xl p-2 flex items-center gap-2 text-[9px] text-slate-400">
+        <span className="uppercase tracking-widest font-bold text-rose-400">Kit</span>
+        {['kick','snare','hat'].map(k=>(
+          <button key={k} onClick={()=>reseedInstrument(k)}
+            className="flex-1 px-2 py-1 bg-slate-800/60 hover:bg-rose-500/20 border border-slate-700 hover:border-rose-500/40 rounded text-slate-300 hover:text-rose-200 uppercase tracking-widest">
+            {'\u{1F3B2} '}{k}
+          </button>
+        ))}
+        <button onClick={()=>reseedInstrument('all')}
+          className="px-2 py-1 bg-slate-800/60 hover:bg-amber-500/20 border border-slate-700 hover:border-amber-500/40 rounded text-slate-300 hover:text-amber-200 uppercase tracking-widest">
+          {'\u{1F3B2}'} Band
+        </button>
       </div>
 
     </div>)}
