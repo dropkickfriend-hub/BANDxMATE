@@ -886,7 +886,29 @@ class AudioBus{
     this.subBus.connect(subLPF);
 
     // -- HARMONIC SEND BUS: mid + lead + reverb/delay/chorus --------------
+    // Mid and lead each get their own highpass + voice gain before feeding
+    // the send. Stops sub-bass leakage (FM modulators can push low notes
+    // into the chord voice) and keeps each voice in its own frequency slot
+    // so the mix doesn't mud up.
     this.send=ctx.createGain();this.send.gain.value=1.0;
+
+    // MID bus: 140 Hz highpass (chords don't live below the bass register)
+    //          + 5 kHz lowpass (no harsh highs out of the Rhodes/clav FM)
+    const midHPF=ctx.createBiquadFilter();midHPF.type='highpass';
+    midHPF.frequency.value=140;midHPF.Q.value=0.7;
+    const midLPF=ctx.createBiquadFilter();midLPF.type='lowpass';
+    midLPF.frequency.value=5200;midLPF.Q.value=0.5;
+    this.midBus=ctx.createGain();this.midBus.gain.value=0.95;
+    this.midBus.connect(midHPF);midHPF.connect(midLPF);midLPF.connect(this.send);
+
+    // LEAD bus: 220 Hz highpass (lead sits above chord, never under it)
+    //           + 8 kHz lowpass (kills the screech, keeps sparkle)
+    const leadHPF=ctx.createBiquadFilter();leadHPF.type='highpass';
+    leadHPF.frequency.value=220;leadHPF.Q.value=0.7;
+    const leadLPF=ctx.createBiquadFilter();leadLPF.type='lowpass';
+    leadLPF.frequency.value=8000;leadLPF.Q.value=0.5;
+    this.leadBus=ctx.createGain();this.leadBus.gain.value=0.85;
+    this.leadBus.connect(leadHPF);leadHPF.connect(leadLPF);leadLPF.connect(this.send);
 
     // REVERB -- plate IR (skip in lean/offline mode)
     if(!lean){const irLen=Math.floor(ctx.sampleRate*2.8);
@@ -955,7 +977,9 @@ class AudioBus{
     if(type==='drum')return this.drumBus;
     if(type==='sub') return this.subBus;
     if(type==='bass')return this.bassBus;
-    return this.send;  // mid, lead, echo
+    if(type==='mid') return this.midBus;
+    if(type==='lead')return this.leadBus;
+    return this.send;  // echo and anything else
   }
 
   toggleFx(name){
@@ -1588,7 +1612,7 @@ const STYLE_PROFILES = {
     shuffleFeel:true,      // 16th grid swung 2:1 (triplet eighths)
     soloistStyle:'auto',   // Django for pluck leads, Ruben for rhodes/piano
     chromaRate:2,          // 1 chromatic approach every ~2 bars
-    midBank:['rhodes','wurli','vibes','guitar','clav','marimba'],
+    midBank:['piano','rhodes','wurli','vibes','guitar','clav','marimba'],
     leadBank:['bell','pluck','fm','moog','saw'],
     label:'Jazz',
   },
@@ -1600,7 +1624,7 @@ const STYLE_PROFILES = {
     leadMode:'saw',      // classic poly-saw lead
     hatMode:'metallic',  // standard physical cymbal model -- clean, bright
     hatGrooveOffset:0,   // on the grid
-    midBank:['rhodes','guitar','xylo','clav','wurli','mid'],
+    midBank:['piano','rhodes','guitar','xylo','clav','wurli','mid'],
     leadBank:['saw','moog','pluck','fm','bell'],
     label:'Pop',
   },
@@ -1616,7 +1640,7 @@ const STYLE_PROFILES = {
     arpBias:0.75,           // 75% chance extra-instrument auto-picks arp
     arpContinuous:true,     // arp loops a scale pattern across bars
     doubleTimeBias:0.5,     // 50% chance a fresh session locks to double-time grid
-    midBank:['mid','rhodes','clav','xylo','vibes'],
+    midBank:['piano','rhodes','clav','xylo','vibes','mid'],
     leadBank:['fm','saw','moog','pluck'],
     label:'Hip-Hop/EDM',
   },
@@ -1625,14 +1649,14 @@ const STYLE_PROFILES = {
     noteLenMult:0.70, microJitter:0.003, microSubdiv:0.08, swingBoost:8, attackMult:0.65,
     bassMode:'808',
     midMode:'rhodes',
-    leadMode:'whistle',  // sine-whistle lead -- classic hip-hop vocal lead
+    leadMode:'moog',     // warm analog lead fallback (no more dogwhistle)
     hatMode:'tape',      // tape-saturated hats -- warm, compressed, lo-fi crunch
     hatGrooveOffset:0.006, // behind the beat -- boom-bap pocket
     halftimeBias:true,     // snare only on step 12 (beat 4) — J-Dilla halftime
     snareDensity:0.5,      // drop 50% of non-backbeat snare candidates
     tempoBias:{range:[78,92], prob:0.33}, // 33% chance BPM snaps to Dilla pocket
-    midBank:['rhodes','wurli','clav','guitar','mid'],
-    leadBank:['whistle','moog','pluck','fm'],
+    midBank:['piano','rhodes','wurli','clav','guitar','mid'],
+    leadBank:['moog','pluck','fm','bell'],
     label:'Hip-Hop',
   },
   westcoast: {
@@ -1640,11 +1664,11 @@ const STYLE_PROFILES = {
     noteLenMult:1.30, microJitter:0.008, microSubdiv:0.18, swingBoost:18, attackMult:1.10,
     bassMode:'gfunk',
     midMode:'rhodes',
-    leadMode:'whistle',  // G-Funk dog whistle / Talkbox synth
+    leadMode:'moog',     // warm analog lead (dropped the dogwhistle)
     hatMode:'tape',      // same tape-sat vibe as hip-hop
     hatGrooveOffset:0.010, // deep pocket -- G-Funk drags hard
-    midBank:['rhodes','wurli','clav','guitar'],
-    leadBank:['whistle','moog','saw','fm'],
+    midBank:['piano','rhodes','wurli','clav','guitar'],
+    leadBank:['moog','saw','fm','bell'],
     label:'West Coast',
   },
   eastcoast: {
@@ -1655,7 +1679,7 @@ const STYLE_PROFILES = {
     leadMode:'pluck',    // Karplus-Strong pluck -- sample-like
     hatMode:'vinyl',     // dusty vinyl -- high-passed crackle, filtered noise
     hatGrooveOffset:0.004,
-    midBank:['rhodes','clav','wurli','guitar','mid'],
+    midBank:['piano','rhodes','clav','wurli','guitar','mid'],
     leadBank:['pluck','saw','moog'],
     label:'East Coast',
   },
@@ -1670,7 +1694,7 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.005,
-    midBank:['marimba','xylo','vibes','guitar','mid'],
+    midBank:['piano','marimba','xylo','vibes','guitar','mid'],
     leadBank:['fm','moog','pluck','saw'],
     label:'African',
   },
@@ -1685,7 +1709,7 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.007,
-    midBank:['mid','marimba','vibes','guitar','rhodes'],
+    midBank:['piano','marimba','vibes','guitar','rhodes','mid'],
     leadBank:['bell','fm','pluck','moog'],
     label:'Indian',
   },
@@ -3342,6 +3366,74 @@ function synthGuitar(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, d
   });
 }
 
+// Acoustic piano (best-effort additive). Real piano strings are stiff so
+// their partials stretch — the nth partial lands at n*f * sqrt(1+B*n²)
+// where B is the inharmonicity coefficient (typically 0.0003-0.001 for a
+// grand). Each partial decays at its own rate (higher = faster) which
+// gives the piano its characteristic "bloom then darken" envelope. A
+// short wide-band noise burst simulates the hammer strike, and a gentle
+// soundboard resonance sits at 80 Hz.
+// Honest note: this will not fool a pianist. A convincing sampled piano
+// uses 30+ velocity layers per note. But it's clearly "piano" and sits
+// miles away from Rhodes/Wurli/Clav.
+function synthPiano(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0){
+  if(!dest)return;
+  const _dscl=Math.max(0.25, Math.min(8.0, durScale||1.0));
+  const sustain=(1.6+0.5*_dscl)/warp;
+  const atk=0.004;
+  // Soundboard resonance — gentle peak at 80 Hz shared across all voices
+  const board=ctx.createBiquadFilter(); board.type='peaking';
+  board.frequency.value=82; board.gain.value=2.5; board.Q.value=1.1;
+  board.connect(dest);
+
+  for(const semis of (notes||[0])){
+    const freq=440*Math.pow(2,(semis-69)/12)*warp;
+    if(freq<=0)continue;
+    // Inharmonicity: higher strings are relatively stiffer → B grows in
+    // upper register. Rough approximation for a grand.
+    const B = 0.0004 + Math.max(0, (semis-60))*0.00002;
+    // 6 partials with Fletcher-style stretched frequencies + decay curves
+    // tuned so the tone gets darker as it sustains (lower partials
+    // outlive upper partials).
+    const partials=[
+      {n:1, g:0.36, dec:sustain*1.00},
+      {n:2, g:0.18, dec:sustain*0.75},
+      {n:3, g:0.11, dec:sustain*0.55},
+      {n:4, g:0.07, dec:sustain*0.40},
+      {n:5, g:0.04, dec:sustain*0.30},
+      {n:6, g:0.025,dec:sustain*0.22},
+    ];
+    partials.forEach(function(p){
+      const pf = freq * p.n * Math.sqrt(1 + B*p.n*p.n);
+      if(pf > 16000) return; // above the lowpass anyway, save a voice
+      const osc=ctx.createOscillator(); osc.type='sine'; osc.frequency.value=pf;
+      const g=ctx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(p.g*(0.85+windBoost*0.20), t+atk);
+      g.gain.exponentialRampToValueAtTime(0.0001, t+p.dec);
+      osc.connect(g); g.connect(board);
+      osc.start(t); osc.stop(t+p.dec+0.02);
+      autoClean(osc, g);
+    });
+    // Hammer strike: short wide-band noise burst, filtered so it sounds
+    // like wool hitting metal string (not a snare slap).
+    const hLen=Math.floor(ctx.sampleRate*0.014);
+    const hBuf=ctx.createBuffer(1,hLen,ctx.sampleRate);
+    const hD=hBuf.getChannelData(0);
+    for(let i=0;i<hLen;i++) hD[i]=(Math.random()*2-1)*Math.pow(1-i/hLen, 0.8);
+    const hNs=ctx.createBufferSource(); hNs.buffer=hBuf;
+    const hBp=ctx.createBiquadFilter(); hBp.type='bandpass';
+    hBp.frequency.value = Math.min(3500, freq*4 + 800); hBp.Q.value=1.2;
+    const hG=ctx.createGain();
+    hG.gain.setValueAtTime(0.08+windBoost*0.04, t);
+    hG.gain.exponentialRampToValueAtTime(0.0001, t+0.025);
+    hNs.connect(hBp); hBp.connect(hG); hG.connect(dest);
+    hNs.start(t);
+    autoClean(hNs, hBp, hG);
+  }
+  autoClean(board);
+}
+
 // Vibraphone: like marimba but with metallic inharmonic partials (3.0x,
 // 5.4x, 9.6x) and a motor-driven tremolo (vanes spinning in the resonator
 // tubes at ~6-9 Hz) that cycles amplitude of the sustain. Very long decay
@@ -3499,6 +3591,7 @@ function pickMidSynthName(ar){
 }
 function runMidSynth(name, ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale){
   switch(name){
+    case 'piano':   return synthPiano  (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
     case 'rhodes':  return synthRhodes (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
     case 'wurli':   return synthWurli  (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
     case 'clav':    return synthClav   (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
@@ -5837,6 +5930,20 @@ function App(){
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{k:true});
         if(hapticModeRef.current==='bass'||deafModeRef.current)hap.kick();else hap.tap();
+        // EDM SIDECHAIN: when the kick hits, yank the bass + sub bus gain
+        // down to ~0.28 then ramp back up over ~180 ms. Classic pumping.
+        // Only for EDM / house styles — other genres keep steady bass.
+        if(kickStyle==='edm' && bus.bassBus && bus.subBus){
+          const duck=0.28, recover=0.180;
+          bus.bassBus.gain.cancelScheduledValues(kT);
+          bus.bassBus.gain.setValueAtTime(0.88, kT);
+          bus.bassBus.gain.linearRampToValueAtTime(0.88*duck, kT+0.006);
+          bus.bassBus.gain.exponentialRampToValueAtTime(0.88, kT+recover);
+          bus.subBus.gain.cancelScheduledValues(kT);
+          bus.subBus.gain.setValueAtTime(1.0, kT);
+          bus.subBus.gain.linearRampToValueAtTime(duck, kT+0.006);
+          bus.subBus.gain.exponentialRampToValueAtTime(1.0, kT+recover);
+        }
         // Band-onset log so mic analysis can reject speaker-bleed from
         // being counted as user input.
         if(!ar._bandOnsets) ar._bandOnsets=[];
@@ -6017,6 +6124,11 @@ function App(){
         if(!_silentMid){
           const _midName = pickMidSynthName(ar);
           runMidSynth(_midName, ctx, time, notes, chordType, chaos, warpMultiplier, bus.getInput('mid'), _midWind, _midScale);
+          // Anti-mud flag: the lead block reads this and ducks hard when
+          // set, so a chord stab and a lead note don't land on the same
+          // beat and smear. Window is roughly one 16th note.
+          window._midIsHitting=true; clearTimeout(window._midIsHittingTimer);
+          window._midIsHittingTimer=setTimeout(()=>{ window._midIsHitting=false; }, 120);
         }
         // Wood percussion layer (African + Indian)
         if(styleP().woodPerc && Math.random()<0.65){
@@ -6043,7 +6155,11 @@ function App(){
       // is active), then answers back with a ~2× boost on the response bar.
       const _leadDuck = ar._userIsActive ? 0.35 : 1.0;
       const _leadResp = ar._callResponseDue ? 2.0 : 1.0;
-      const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp;
+      // Anti-mud: when the mid just hit a chord, the lead is far more likely
+      // to rest for this beat so the two voices don't pile on top of each
+      // other. window._midIsHitting is flagged below in the MID block.
+      const _leadMidDuck = window._midIsHitting ? 0.35 : 1.0;
+      const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck;
       if(Math.random()<prob){
         // Expanded note pool: full diatonic scale + chord tones + chromatic
         // approaches + octave jumps + blue notes. Prevents the 6-note menu
