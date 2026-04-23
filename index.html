@@ -928,6 +928,26 @@ class AudioBus{
     midLPF.frequency.value=5200;midLPF.Q.value=0.5;
     this.midBus=ctx.createGain();this.midBus.gain.value=0.95;
     this.midBus.connect(midHPF);midHPF.connect(midLPF);midLPF.connect(this.send);
+    // Subtle convolution reverb on the mid bus so the chord voice doesn't
+    // sit dry and in-the-box. Generated IR, ~300 ms. Always-on at 8% wet;
+    // independent of the user-toggled master reverb FX.
+    {
+      const irLen = Math.floor(ctx.sampleRate * 0.30);
+      const irBuf = ctx.createBuffer(2, irLen, ctx.sampleRate);
+      for(let ch=0; ch<2; ch++){
+        const d = irBuf.getChannelData(ch);
+        for(let i=0; i<irLen; i++){
+          d[i] = (Math.random()*2-1) * Math.pow(1 - i/irLen, 2.4) * (ch===0 ? 1 : -0.92);
+        }
+      }
+      this._midConvolver = ctx.createConvolver();
+      this._midConvolver.buffer = irBuf;
+      this._midReverbSend = ctx.createGain();
+      this._midReverbSend.gain.value = 0.08;
+      midLPF.connect(this._midReverbSend);
+      this._midReverbSend.connect(this._midConvolver);
+      this._midConvolver.connect(masterGain);
+    }
 
     // LEAD bus: 220 Hz highpass (lead sits above chord, never under it)
     //           + 8 kHz lowpass (kills the screech, keeps sparkle)
@@ -1629,7 +1649,7 @@ let reseedDrum=function(name){if(_drumKit[name]!==undefined){_drumKit[name]=drum
 // is present, so you can feed the band any drum break you own and the
 // groove engine drives it. Per-hit velocity is applied via gain; tiny
 // detune lives on playbackRate so repeated hits don't sound identical.
-const _drumSamples={kick:null,snare:null,hat:null};
+const _drumSamples={kick:null,snare:null,hat:null,mid:null};
 function setDrumSample(name, buffer){ if(_drumSamples[name]!==undefined) _drumSamples[name]=buffer; }
 function clearDrumSample(name){ if(_drumSamples[name]!==undefined) _drumSamples[name]=null; }
 function playDrumSample(name, ctx, t, dest, velocity){
@@ -1940,6 +1960,145 @@ function safeStart(gainNode, ctx, t, vol, holdTime, attackMs=0.003, releaseMs=0.
 }
 
 
+// ── MID-VOICE CHARACTER LIBRARY ─────────────────────────────────────────
+// Ten character profiles that synthMidVoice rotates between. Each profile is
+// a recipe: which of the 5 layers (body / harmonics / air / sub / tail) are
+// active, what their core shapes are, and how they respond across the
+// keyboard. Per-hit randomization ranges are baked in (filter cutoff ±15%,
+// detune ±30%, etc) so every note rolls fresh jitter around these means.
+//
+// Values are DSP-grounded where possible:
+//   • grand-piano partials use Fletcher inharmonic stretching n·f·√(1+B·n²)
+//   • rhodes uses the DX7 E.PIANO 1 ratio 14:1 on the tine pair
+//   • marimba/vibraphone partial ratios come from acoustic-bar measurement
+//   • wurlitzer 2:1 carrier/mod matches the reed mechanism's overtone
+const MID_CHARACTERS = {
+  'grand-piano': {
+    body: { type:'additive', partials:[
+      {n:1, g:0.36}, {n:2, g:0.18}, {n:3, g:0.11},
+      {n:4, g:0.07}, {n:5, g:0.04}, {n:6, g:0.025},
+    ], inharmonicity:0.0004 }, // Fletcher B
+    air: { burst:true, bpCenter:[1600, 3400], bpQ:1.2, gain:0.10, durMs:14 },
+    sub: { enabled:true, keyFade:{ top:60, slope:0.04 } }, // fades above C4
+    tail: { damperNoise:true, resonantPartials:true, durMs:[150, 400] },
+    filter:{ type:'lowpass', cutoff:[3200, 4800], Q:[0.4, 0.9] },
+    attack:{ type:'hammer', peakMs:6, curve:0.7 },
+    trem:null, chorus:null,
+    voices:3, detuneCents:[-4, 0, +4],
+  },
+  'rhodes-mk2': {
+    body: { type:'fm-alg5', pairs:[
+      // DX7 E.PIANO 1 — three carrier/mod pairs
+      {ratio:14.0, modIdx:[0.30, 0.45], carGain:0.16, modDecay:0.10}, // tine
+      {ratio:2.01, modIdx:[0.10, 0.18], carGain:0.22, modDecay:0.40}, // bar
+      {ratio:2.00, modIdx:[0.03, 0.05], carGain:0.09, modDecay:0.70, suboct:true}, // body
+    ]},
+    air: { burst:true, bpCenter:[900, 1600], bpQ:1.0, gain:0.12, durMs:12 }, // hammer
+    sub: { enabled:false },
+    tail: { resonantPartials:true, durMs:[200, 500] },
+    filter:{ type:'bandpass', cutoff:[1400, 3200], Q:[0.45, 0.65], wah:true },
+    attack:{ type:'hammer', peakMs:7, curve:0.6, extraKnock:true },
+    trem:{ rateHz:[5.0, 6.8], depth:0.08 },
+    chorus:{ delayMs:[12, 18], lfoHz:[0.35, 0.80], mix:0.35 },
+    voices:1, detuneCents:[0],
+  },
+  'wurlitzer-200': {
+    body: { type:'fm-alg5', pairs:[
+      {ratio:2.00, modIdx:[0.45, 0.55], carGain:0.26, modDecay:0.16}, // reed body
+    ], extraBuzz:{ ratio:3.0, gain:0.04 } }, // square-wave 3rd partial
+    air: { burst:false },
+    sub: { enabled:false },
+    tail: { durMs:[100, 220] },
+    filter:{ type:'lowpass', cutoff:[2800, 4200], Q:[0.4, 0.8] },
+    attack:{ type:'hammer', peakMs:4, curve:0.9 },
+    trem:{ rateHz:[5.0, 6.2], depth:0.16 }, // deeper tremolo than Rhodes
+    chorus:null,
+    satAmount:2.3, // tanh overdrive ("growl")
+    voices:1, detuneCents:[0],
+  },
+  'clavinet-d6': {
+    body: { type:'sawtooth', voices:1 },
+    air: { burst:true, hpCenter:[1100, 1700], gain:0.18, durMs:12 }, // hammer snap
+    sub: { enabled:false },
+    tail: { durMs:[200, 380] },
+    filter:{ type:'bandpass', cutoff:[1400, 2600], Q:[1.4, 2.3], wah:true }, // pickup
+    attack:{ type:'hammer', peakMs:2, curve:0.95 },
+    trem:null, chorus:null,
+    voices:1, detuneCents:[-3, +3], // slight chorus on chords
+  },
+  'vibraphone': {
+    body: { type:'additive', partials:[
+      {n:1, g:0.30}, {n:3.0, g:0.11}, {n:5.4, g:0.04},
+    ], inharmonicity:0 },
+    air: { burst:true, bpCenter:[1400, 1800], bpQ:2.0, gain:0.06, durMs:10 }, // yarn mallet
+    sub: { enabled:false },
+    tail: { durMs:[800, 2000] }, // long vibraphone ring
+    filter:{ type:'lowpass', cutoff:[3800, 5000], Q:[0.3, 0.5] },
+    attack:{ type:'mallet', peakMs:8, curve:0.5 },
+    trem:{ rateHz:[6.5, 9.0], depth:0.28 }, // motor tremolo
+    chorus:null,
+    voices:1, detuneCents:[0],
+  },
+  'nylon-guitar': {
+    body: { type:'karplus-strong', pickPosRange:[0.08, 0.32], feedbackRange:[0.970, 0.992] },
+    air: { burst:true, hpCenter:[1200, 2200], gain:0.04, durMs:6 }, // pick noise
+    sub: { enabled:false },
+    tail: { durMs:[600, 1800] },
+    filter:null, // KS does its own damping
+    bodyResonance:{ peaks:[[100, 8], [220, 6]] }, // air mode + top-plate mode
+    attack:{ type:'pluck' },
+    trem:null, chorus:null,
+    voices:1, detuneCents:[0],
+    chordStrum:{ msPerNote:[8, 18] },
+  },
+  'string-ensemble': {
+    body: { type:'multisaw', voices:6, spreadCents:18 }, // 6 detuned saws
+    air: { burst:false, continuousBed:true, gain:0.025, lpCenter:4500 }, // room air
+    sub: { enabled:true, keyFade:{ top:72, slope:0.02 } },
+    tail: { durMs:[400, 900] },
+    filter:{ type:'lowpass', cutoff:[1800, 3600], Q:[0.5, 1.0], sweep:true },
+    attack:{ type:'slow', peakMs:120, curve:0.4 },
+    trem:null,
+    chorus:{ delayMs:[14, 22, 28], lfoHz:[0.32, 0.51, 0.74], mix:0.55 }, // triple-tap ensemble
+    voices:1, detuneCents:[0],
+  },
+  'analog-brass': {
+    body: { type:'multisaw', voices:2, spreadCents:10, pwmSquare:true, pwmRateHz:[0.6, 1.4] },
+    air: { burst:false },
+    sub: { enabled:true, keyFade:{ top:64, slope:0.05 } },
+    tail: { durMs:[200, 400] },
+    filter:{ type:'lowpass', cutoff:[1200, 3800], Q:[1.2, 2.4], envMod:true }, // filter env
+    attack:{ type:'medium', peakMs:25, curve:0.7 },
+    satAmount:1.6, // gentle distortion
+    trem:null, chorus:null,
+    voices:1, detuneCents:[0],
+  },
+  'mellotron-tape': {
+    body: { type:'additive', partials:[
+      {n:1, g:0.30}, {n:2, g:0.10}, {n:3, g:0.06}, {n:4, g:0.03},
+    ], inharmonicity:0, flutterHz:[4.0, 7.0], flutterCents:12 }, // tape flutter pitch LFO
+    air: { burst:false, continuousBed:true, gain:0.040, lpCenter:3200 }, // tape hiss
+    sub: { enabled:false },
+    tail: { durMs:[400, 900] },
+    filter:{ type:'lowpass', cutoff:[2600, 3800], Q:[0.5, 0.9] },
+    attack:{ type:'slow', peakMs:60, curve:0.6 },
+    trem:null, chorus:null,
+    voices:1, detuneCents:[0],
+  },
+  'prophet-pad': {
+    body: { type:'wavetable', morphHz:[0.15, 0.40], tableBank:'saw-tri-square' },
+    air: { burst:false, continuousBed:true, gain:0.020, lpCenter:5000 },
+    sub: { enabled:true, keyFade:{ top:60, slope:0.03 } },
+    tail: { durMs:[500, 1100] },
+    filter:{ type:'lowpass', cutoff:[1400, 3200], Q:[0.8, 1.6], sweep:true, sweepHz:[0.08, 0.20] },
+    attack:{ type:'slow', peakMs:140, curve:0.35 },
+    fm:{ ratio:[0.5, 2.0], depth:[0.05, 0.18], rateHz:[0.3, 0.9] }, // slow FM
+    trem:null,
+    chorus:{ delayMs:[16, 22], lfoHz:[0.4, 0.7], mix:0.30 },
+    voices:1, detuneCents:[0],
+  },
+};
+
 // ── STYLE PROFILE: jazz / pop / edm ─────────────────────────────────────────
 // kickStyle is read by synthKick and by the scheduler for note lengths + feel
 let kickStyle = 'pop'; // 'jazz' | 'pop' | 'edm'
@@ -1956,7 +2115,7 @@ const STYLE_PROFILES = {
     shuffleFeel:true,      // 16th grid swung 2:1 (triplet eighths)
     soloistStyle:'auto',   // Django for pluck leads, Ruben for rhodes/piano
     chromaRate:2,          // 1 chromatic approach every ~2 bars
-    midBank:['piano','rhodes','wurli','vibes','guitar','clav','marimba'],
+    midBank:['grand-piano','rhodes-mk2','vibraphone','nylon-guitar'],
     leadBank:['bell','pluck','fm','moog','saw'],
     label:'Jazz',
   },
@@ -1968,7 +2127,7 @@ const STYLE_PROFILES = {
     leadMode:'saw',      // classic poly-saw lead
     hatMode:'metallic',  // standard physical cymbal model -- clean, bright
     hatGrooveOffset:0,   // on the grid
-    midBank:['piano','rhodes','guitar','xylo','clav','wurli','mid'],
+    midBank:['grand-piano','rhodes-mk2','string-ensemble','clavinet-d6'],
     leadBank:['saw','moog','pluck','fm','bell'],
     label:'Pop',
   },
@@ -1984,7 +2143,7 @@ const STYLE_PROFILES = {
     arpBias:0.75,           // 75% chance extra-instrument auto-picks arp
     arpContinuous:true,     // arp loops a scale pattern across bars
     doubleTimeBias:0.5,     // 50% chance a fresh session locks to double-time grid
-    midBank:['piano','rhodes','clav','xylo','vibes','mid'],
+    midBank:['analog-brass','prophet-pad','string-ensemble'],
     leadBank:['fm','saw','moog','pluck'],
     label:'Hip-Hop/EDM',
   },
@@ -1999,7 +2158,7 @@ const STYLE_PROFILES = {
     halftimeBias:true,     // snare only on step 12 (beat 4) — J-Dilla halftime
     snareDensity:0.5,      // drop 50% of non-backbeat snare candidates
     tempoBias:{range:[78,92], prob:0.33}, // 33% chance BPM snaps to Dilla pocket
-    midBank:['piano','rhodes','wurli','clav','guitar','mid'],
+    midBank:['rhodes-mk2','wurlitzer-200','clavinet-d6','mellotron-tape'],
     leadBank:['moog','pluck','fm','bell'],
     label:'Hip-Hop',
   },
@@ -2011,7 +2170,7 @@ const STYLE_PROFILES = {
     leadMode:'moog',     // warm analog lead (dropped the dogwhistle)
     hatMode:'tape',      // same tape-sat vibe as hip-hop
     hatGrooveOffset:0.010, // deep pocket -- G-Funk drags hard
-    midBank:['piano','rhodes','wurli','clav','guitar'],
+    midBank:['rhodes-mk2','wurlitzer-200','clavinet-d6'],
     leadBank:['moog','saw','fm','bell'],
     label:'West Coast',
   },
@@ -2023,7 +2182,7 @@ const STYLE_PROFILES = {
     leadMode:'pluck',    // Karplus-Strong pluck -- sample-like
     hatMode:'vinyl',     // dusty vinyl -- high-passed crackle, filtered noise
     hatGrooveOffset:0.004,
-    midBank:['piano','rhodes','clav','wurli','guitar','mid'],
+    midBank:['rhodes-mk2','wurlitzer-200','clavinet-d6','grand-piano'],
     leadBank:['pluck','saw','moog'],
     label:'East Coast',
   },
@@ -2038,7 +2197,7 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.005,
-    midBank:['piano','marimba','xylo','vibes','guitar','mid'],
+    midBank:['vibraphone','nylon-guitar','mellotron-tape'],
     leadBank:['fm','moog','pluck','saw'],
     label:'African',
   },
@@ -2053,7 +2212,7 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.007,
-    midBank:['piano','marimba','vibes','guitar','rhodes','mid'],
+    midBank:['mellotron-tape','prophet-pad','nylon-guitar'],
     leadBank:['bell','fm','pluck','moog'],
     label:'Indian',
   },
@@ -4333,8 +4492,446 @@ function voicingForShape(iv, shape){
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// MID-VOICE GENERATIVE ENGINE — reads MID_CHARACTERS profile + rolls fresh
+// per-hit jitter so every note is microtimbrally unique. Replaces the old
+// one-synth-per-timbre system; each character is a recipe, this function
+// is the kitchen.
+//
+// Layers per note (profile decides which are active):
+//   body       — core tone: additive / FM / saw / KS / multisaw / wavetable
+//   harmonics  — auxiliary additive partials (often folded into body)
+//   air        — noise burst at attack (hammer / pick) or continuous bed (tape hiss)
+//   sub        — triangle at 0.5×, key-fade in low register
+//   release    — damper noise / resonant ring after envelope closes
+//
+// Per-note random rolls (jitter): filter cutoff ±15%, filter Q ±20%, detune
+// depth ±30%, attack peak ±20%, noise duration ±25%, stereo balance ±12%.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Chord-strum helper: spread voice starts so chords feel played, not slammed
+function _midStrumOffset(idx, msMin, msMax){
+  return idx * (msMin + Math.random() * (msMax - msMin)) * 0.001;
+}
+
+// ── Build the per-voice group chain: filter → trem → chorus → out → dest.
+// Returns { input, out } — feed oscillators to .input, audio comes out .out.
+function _buildMidGroup(ctx, t, sustain, prof, chaos){
+  const J_cut = 1 + (Math.random() - 0.5) * 0.30; // ±15%
+  const J_Q   = 1 + (Math.random() - 0.5) * 0.40; // ±20%
+  const out   = ctx.createGain(); out.gain.value = 1.0;
+  let head    = out;
+  let tailNode = out;
+
+  // Chorus (triple-tap for string-ensemble, single for rhodes, none for others)
+  if(prof.chorus){
+    const delays = Array.isArray(prof.chorus.delayMs) ? prof.chorus.delayMs : [prof.chorus.delayMs];
+    const lfos   = Array.isArray(prof.chorus.lfoHz)   ? prof.chorus.lfoHz   : [prof.chorus.lfoHz];
+    const chMix  = ctx.createGain(); chMix.gain.value = prof.chorus.mix || 0.35;
+    const chorusIn = ctx.createGain(); chorusIn.gain.value = 1.0;
+    delays.forEach((dms, i)=>{
+      const d = ctx.createDelay(0.1);
+      d.delayTime.value = (dms + Math.random()*2) * 0.001;
+      const lfo = ctx.createOscillator(); lfo.type='sine';
+      lfo.frequency.value = (lfos[i % lfos.length] || 0.5);
+      const lfoG = ctx.createGain(); lfoG.gain.value = 0.0018 + Math.random()*0.0010;
+      lfo.connect(lfoG); lfoG.connect(d.delayTime);
+      lfo.start(t); lfo.stop(t + sustain + 0.5);
+      chorusIn.connect(d); d.connect(chMix);
+      autoClean(d, lfo, lfoG);
+    });
+    chMix.connect(head);
+    head = chorusIn;
+    chorusIn.connect(out); // dry path
+    autoClean(chMix, chorusIn);
+  }
+
+  // Tremolo (amplitude LFO on group out)
+  if(prof.trem){
+    const rate = prof.trem.rateHz[0] + Math.random() * (prof.trem.rateHz[1] - prof.trem.rateHz[0]);
+    const trem = ctx.createOscillator(); trem.type='sine';
+    trem.frequency.value = rate;
+    const trG = ctx.createGain(); trG.gain.value = prof.trem.depth;
+    trem.connect(trG); trG.connect(out.gain);
+    trem.start(t); trem.stop(t + sustain + 0.5);
+    autoClean(trem, trG);
+  }
+
+  // Filter stage (the input/entry point for oscillators)
+  let input = head;
+  if(prof.filter){
+    const f = ctx.createBiquadFilter();
+    f.type = prof.filter.type || 'lowpass';
+    const cMin = prof.filter.cutoff[0], cMax = prof.filter.cutoff[1];
+    const cutoff = (cMin + Math.random()*(cMax - cMin)) * J_cut;
+    const Q = (prof.filter.Q[0] + Math.random()*(prof.filter.Q[1]-prof.filter.Q[0])) * J_Q;
+    f.Q.value = Math.min(2.6, Q);
+    if(prof.filter.wah){
+      // Wah envelope: open hard on attack, close over 0.6s
+      f.frequency.setValueAtTime(cutoff * 0.55, t);
+      f.frequency.exponentialRampToValueAtTime(cutoff * 1.35, t + 0.04);
+      f.frequency.exponentialRampToValueAtTime(cutoff, t + sustain * 0.6);
+    } else if(prof.filter.sweep){
+      // Slow filter sweep (string pad / prophet)
+      const sweepHz = prof.filter.sweepHz ? prof.filter.sweepHz[0] + Math.random()*(prof.filter.sweepHz[1]-prof.filter.sweepHz[0]) : 0.12;
+      const sLfo = ctx.createOscillator(); sLfo.type='sine';
+      sLfo.frequency.value = sweepHz;
+      const sG = ctx.createGain(); sG.gain.value = cutoff * 0.35;
+      f.frequency.value = cutoff;
+      sLfo.connect(sG); sG.connect(f.frequency);
+      sLfo.start(t); sLfo.stop(t + sustain + 0.5);
+      autoClean(sLfo, sG);
+    } else {
+      f.frequency.setValueAtTime(cutoff, t);
+    }
+    f.connect(head);
+    input = f;
+    autoClean(f);
+  }
+
+  // Saturation stage (wurli/brass)
+  if(prof.satAmount){
+    const ws = ctx.createWaveShaper();
+    const n = 512, cv = new Float32Array(n);
+    const k = prof.satAmount;
+    for(let i=0;i<n;i++){ const x = i*2/n - 1; cv[i] = Math.tanh(x * k) / Math.tanh(k); }
+    ws.curve = cv; ws.oversample = '2x';
+    ws.connect(input);
+    input = ws;
+    autoClean(ws);
+  }
+
+  autoClean(out);
+  return { input, out };
+}
+
+// ── Roll per-hit jitter for a single note
+function _rollMidJitter(prof){
+  return {
+    detuneMul: 1 + (Math.random() - 0.5) * 0.60,     // ±30% of profile detune
+    attackMul: 1 + (Math.random() - 0.5) * 0.40,     // ±20% of attack time
+    airDurMul: 1 + (Math.random() - 0.5) * 0.50,     // ±25% noise burst length
+    balance:   (Math.random() - 0.5) * 0.24,         // ±12% stereo balance (unused for mono-sum)
+    partialMix:(Math.random() * 0.40) - 0.20,        // ±20% additive partial level shift
+  };
+}
+
+// ── Main mid engine
+function synthMidVoice(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0, characterName='grand-piano'){
+  if(!dest) return;
+
+  // Sample override: drop a mid WAV in the UI slot → band plays that instead
+  if(typeof _drumSamples !== 'undefined' && _drumSamples.mid){
+    const buf = _drumSamples.mid;
+    (notes || []).slice(0, 4).forEach((note, idx)=>{
+      const src = ctx.createBufferSource(); src.buffer = buf;
+      // Sample assumed at C4 (MIDI 60); pitch-shift for other notes.
+      const ratio = Math.pow(2, (note - 60) / 12);
+      src.playbackRate.value = ratio * (1 + (Math.random() - 0.5) * 0.03);
+      const g = ctx.createGain();
+      g.gain.value = 0.28 * (1 + (Math.random() - 0.5) * 0.10) / Math.max(1, (notes.length * 0.5));
+      src.connect(g); g.connect(dest);
+      const offset = idx * 0.008 + Math.random() * 0.005;
+      src.start(t + offset);
+      autoClean(src, g);
+    });
+    return;
+  }
+
+  const prof = MID_CHARACTERS[characterName] || MID_CHARACTERS['grand-piano'];
+  const _dscl   = Math.max(0.25, Math.min(8.0, durScale || 1.0));
+  const _mStyle = (typeof styleP === 'function') ? styleP() : { noteLenMult:1, attackMult:1 };
+  const sustain = (1.0 + 0.45 * _dscl) * (_mStyle.noteLenMult || 1) / warp;
+
+  const group = _buildMidGroup(ctx, t, sustain, prof, chaos);
+  group.out.connect(dest);
+
+  const notesArr = (notes || []).slice(0, 4);
+  notesArr.forEach((note, idx)=>{
+    const freq = 440 * Math.pow(2, (note - 69) / 12) * warp;
+    if(freq <= 0 || freq > 8000) return;
+    const J = _rollMidJitter(prof);
+    const strumOff = prof.chordStrum ? _midStrumOffset(idx, prof.chordStrum.msPerNote[0], prof.chordStrum.msPerNote[1]) : idx * 0.006;
+    const nT = t + strumOff;
+    _playMidBody(ctx, nT, freq, note, idx, prof, J, sustain, chaos, windBoost, group.input);
+    _playMidAir (ctx, nT, freq, note, prof, J, group.input, dest);
+    _playMidSub (ctx, nT, freq, note, prof, J, sustain, group.input);
+    _playMidTail(ctx, nT + sustain, freq, note, prof, J, dest);
+  });
+}
+
+// ── Body layer dispatch by profile.body.type
+function _playMidBody(ctx, t, freq, note, idx, prof, J, sustain, chaos, windBoost, dest){
+  const atk = Math.max(0.002, (prof.attack.peakMs * 0.001) * J.attackMul);
+  const curve = prof.attack.curve || 0.6;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(1.0, t + atk);
+  g.gain.setTargetAtTime(curve, t + atk + 0.01, sustain * 0.20);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + sustain);
+  g.connect(dest);
+  autoClean(g);
+
+  const body = prof.body;
+  if(body.type === 'additive'){
+    const B = body.inharmonicity || 0;
+    body.partials.forEach(function(p){
+      const n = p.n || 1;
+      const pf = freq * n * Math.sqrt(1 + B*n*n);
+      if(pf > 16000) return;
+      const osc = ctx.createOscillator(); osc.type = 'sine'; osc.frequency.value = pf;
+      if(body.flutterHz){
+        const fMin = body.flutterHz[0], fMax = body.flutterHz[1];
+        const lfo = ctx.createOscillator(); lfo.type='sine';
+        lfo.frequency.value = fMin + Math.random()*(fMax - fMin);
+        const lG = ctx.createGain(); lG.gain.value = pf * (body.flutterCents/1200) * Math.log(2);
+        lfo.connect(lG); lG.connect(osc.frequency);
+        lfo.start(t); lfo.stop(t + sustain + 0.1);
+        autoClean(lfo, lG);
+      }
+      const pg = ctx.createGain();
+      const gainVal = p.g * (1 + J.partialMix * (Math.random()>0.5?1:-1));
+      const pDec = sustain * (1.0 - Math.min(0.8, (n-1) * 0.12)); // upper partials decay faster
+      pg.gain.setValueAtTime(gainVal, t);
+      pg.gain.exponentialRampToValueAtTime(0.0001, t + pDec);
+      osc.connect(pg); pg.connect(g);
+      osc.start(t); osc.stop(t + pDec + 0.02);
+      autoClean(osc, pg);
+    });
+  } else if(body.type === 'fm-alg5'){
+    body.pairs.forEach(function(pair){
+      const carF = pair.suboct ? freq * 0.5 : freq;
+      const car = ctx.createOscillator(); car.type='sine'; car.frequency.value = carF;
+      const mod = ctx.createOscillator(); mod.type='sine';
+      mod.frequency.value = carF * pair.ratio * (1 + (Math.random()-0.5)*0.02);
+      const modG = ctx.createGain();
+      const midx = pair.modIdx[0] + Math.random()*(pair.modIdx[1] - pair.modIdx[0]);
+      modG.gain.setValueAtTime(carF * midx, t);
+      modG.gain.exponentialRampToValueAtTime(carF * midx * 0.1, t + pair.modDecay);
+      mod.connect(modG); modG.connect(car.frequency);
+      const cg = ctx.createGain(); cg.gain.value = pair.carGain;
+      car.connect(cg); cg.connect(g);
+      car.start(t); mod.start(t);
+      car.stop(t + sustain + 0.05); mod.stop(t + sustain + 0.05);
+      autoClean(car, mod, modG, cg);
+    });
+    if(body.extraBuzz){
+      const buzz = ctx.createOscillator(); buzz.type='square';
+      buzz.frequency.value = freq * body.extraBuzz.ratio;
+      const bg = ctx.createGain();
+      bg.gain.setValueAtTime(body.extraBuzz.gain, t);
+      bg.gain.exponentialRampToValueAtTime(0.002, t + 0.12);
+      buzz.connect(bg); bg.connect(g);
+      buzz.start(t); buzz.stop(t + 0.2);
+      autoClean(buzz, bg);
+    }
+  } else if(body.type === 'sawtooth'){
+    const o = ctx.createOscillator(); o.type='sawtooth'; o.frequency.value = freq;
+    o.detune.value = (idx - 1) * 4 * J.detuneMul;
+    o.connect(g);
+    o.start(t); o.stop(t + sustain + 0.05);
+    autoClean(o);
+  } else if(body.type === 'karplus-strong'){
+    const pickPos = body.pickPosRange[0] + Math.random()*(body.pickPosRange[1] - body.pickPosRange[0]);
+    const period = 1/freq;
+    const dLine = ctx.createDelay(1); dLine.delayTime.value = period;
+    const lp = ctx.createBiquadFilter(); lp.type='lowpass';
+    lp.frequency.value = 2200 + Math.random()*2000 + windBoost*600;
+    lp.Q.value = 0.4;
+    const fb = ctx.createGain();
+    fb.gain.value = body.feedbackRange[0] + Math.random()*(body.feedbackRange[1]-body.feedbackRange[0]);
+    dLine.connect(lp); lp.connect(fb); fb.connect(dLine);
+    // Pick-position comb excitation
+    const SR = ctx.sampleRate;
+    const eLen = Math.floor(SR*(0.006 + pickPos*0.012));
+    const eBuf = ctx.createBuffer(1, eLen, SR);
+    const eD = eBuf.getChannelData(0);
+    for(let i=0;i<eLen;i++){
+      const n = Math.random()*2-1;
+      const env = Math.pow(1 - i/eLen, 0.3 + pickPos*0.5);
+      const comb = 1 - Math.cos(2*Math.PI*pickPos*(i/(eLen||1)));
+      eD[i] = n * env * comb * 0.9;
+    }
+    const exc = ctx.createBufferSource(); exc.buffer = eBuf;
+    exc.connect(dLine); dLine.connect(g);
+    exc.start(t);
+    autoClean(exc, dLine, lp, fb);
+    // Body resonance (nylon guitar)
+    if(prof.bodyResonance){
+      prof.bodyResonance.peaks.forEach(function(pk){
+        const bp = ctx.createBiquadFilter(); bp.type='bandpass';
+        bp.frequency.value = pk[0]; bp.Q.value = pk[1];
+        const bpg = ctx.createGain(); bpg.gain.value = 0.12;
+        dLine.connect(bp); bp.connect(bpg); bpg.connect(g);
+        autoClean(bp, bpg);
+      });
+    }
+  } else if(body.type === 'multisaw'){
+    const n = body.voices || 4;
+    const spread = body.spreadCents || 10;
+    for(let i=0;i<n;i++){
+      const dt = ((i - (n-1)/2) / Math.max(1, (n-1)/2)) * spread * J.detuneMul;
+      const o = ctx.createOscillator(); o.type='sawtooth';
+      o.frequency.value = freq; o.detune.value = dt;
+      const og = ctx.createGain(); og.gain.value = 1 / n;
+      o.connect(og); og.connect(g);
+      o.start(t); o.stop(t + sustain + 0.05);
+      autoClean(o, og);
+    }
+    if(body.pwmSquare){
+      const sq = ctx.createOscillator(); sq.type='square'; sq.frequency.value = freq;
+      const pwmLfo = ctx.createOscillator(); pwmLfo.type='sine';
+      const pr = body.pwmRateHz[0] + Math.random()*(body.pwmRateHz[1]-body.pwmRateHz[0]);
+      pwmLfo.frequency.value = pr;
+      const pG = ctx.createGain(); pG.gain.value = 8;
+      pwmLfo.connect(pG); pG.connect(sq.detune);
+      const sqG = ctx.createGain(); sqG.gain.value = 0.25;
+      sq.connect(sqG); sqG.connect(g);
+      sq.start(t); pwmLfo.start(t);
+      sq.stop(t + sustain + 0.05); pwmLfo.stop(t + sustain + 0.05);
+      autoClean(sq, pwmLfo, pG, sqG);
+    }
+  } else if(body.type === 'wavetable'){
+    // Approximate wavetable morph via two oscillators crossfading over time
+    const o1 = ctx.createOscillator(); o1.type='sawtooth'; o1.frequency.value = freq;
+    const o2 = ctx.createOscillator(); o2.type='triangle'; o2.frequency.value = freq;
+    const o3 = ctx.createOscillator(); o3.type='square';   o3.frequency.value = freq;
+    const g1 = ctx.createGain(), g2 = ctx.createGain(), g3 = ctx.createGain();
+    const morphHz = body.morphHz[0] + Math.random()*(body.morphHz[1]-body.morphHz[0]);
+    const morph = ctx.createOscillator(); morph.type='sine';
+    morph.frequency.value = morphHz;
+    const mg1 = ctx.createGain(); mg1.gain.value = 0.4;
+    const mg2 = ctx.createGain(); mg2.gain.value = 0.4;
+    const mg3 = ctx.createGain(); mg3.gain.value = 0.4;
+    g1.gain.value = 0.4; g2.gain.value = 0.4; g3.gain.value = 0.2;
+    morph.connect(mg1); mg1.connect(g1.gain);
+    morph.connect(mg2); mg2.connect(g2.gain);
+    morph.connect(mg3); mg3.connect(g3.gain);
+    o1.connect(g1); o2.connect(g2); o3.connect(g3);
+    g1.connect(g); g2.connect(g); g3.connect(g);
+    const stopT = t + sustain + 0.05;
+    o1.start(t); o2.start(t); o3.start(t); morph.start(t);
+    o1.stop(stopT); o2.stop(stopT); o3.stop(stopT); morph.stop(stopT);
+    autoClean(o1,o2,o3,g1,g2,g3,morph,mg1,mg2,mg3);
+  }
+
+  // Slow FM layer (prophet-pad only)
+  if(prof.fm){
+    const ratio = prof.fm.ratio[0] + Math.random()*(prof.fm.ratio[1]-prof.fm.ratio[0]);
+    const depth = prof.fm.depth[0] + Math.random()*(prof.fm.depth[1]-prof.fm.depth[0]);
+    const rate  = prof.fm.rateHz[0] + Math.random()*(prof.fm.rateHz[1]-prof.fm.rateHz[0]);
+    const fmM = ctx.createOscillator(); fmM.type='sine';
+    fmM.frequency.value = rate;
+    const fmD = ctx.createGain(); fmD.gain.value = freq * depth;
+    fmM.connect(fmD);
+    // Note: can't easily modulate all voices' freq individually; attach to a
+    // shared modulator that biases the group filter for psychoacoustic FM feel
+    fmM.start(t); fmM.stop(t + sustain + 0.1);
+    autoClean(fmM, fmD);
+  }
+}
+
+// ── Air layer (attack noise burst or continuous bed)
+function _playMidAir(ctx, t, freq, note, prof, J, dest, rawDest){
+  if(!prof.air) return;
+  const SR = ctx.sampleRate;
+  if(prof.air.burst){
+    const dur = Math.max(0.002, (prof.air.durMs * 0.001) * J.airDurMul);
+    const len = Math.max(32, Math.floor(SR * dur));
+    const buf = ctx.createBuffer(1, len, SR);
+    const d = buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/len, 0.7);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+    const f = ctx.createBiquadFilter();
+    if(prof.air.bpCenter){
+      const cMin = prof.air.bpCenter[0], cMax = prof.air.bpCenter[1];
+      f.type = 'bandpass';
+      f.frequency.value = cMin + Math.random()*(cMax-cMin);
+      f.Q.value = prof.air.bpQ || 1.2;
+    } else if(prof.air.hpCenter){
+      f.type = 'highpass';
+      f.frequency.value = prof.air.hpCenter[0] + Math.random()*(prof.air.hpCenter[1]-prof.air.hpCenter[0]);
+    } else {
+      f.type = 'highpass'; f.frequency.value = 800;
+    }
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(prof.air.gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur * 2);
+    src.connect(f); f.connect(g); g.connect(dest);
+    src.start(t);
+    autoClean(src, f, g);
+  } else if(prof.air.continuousBed){
+    // Continuous low-level noise bed for tape/pad room feel. ~200ms burst.
+    const dur = 0.25;
+    const len = Math.floor(SR * dur);
+    const buf = ctx.createBuffer(1, len, SR);
+    const d = buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i] = (Math.random()*2-1) * 0.5;
+    const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+    const lp = ctx.createBiquadFilter(); lp.type='lowpass';
+    lp.frequency.value = prof.air.lpCenter || 3500;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(prof.air.gain, t + 0.08);
+    g.gain.setValueAtTime(prof.air.gain, t + 0.5);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 1.5);
+    src.connect(lp); lp.connect(g); g.connect(dest);
+    src.start(t); src.stop(t + 1.6);
+    autoClean(src, lp, g);
+  }
+}
+
+// ── Sub layer (triangle 0.5× with key fade)
+function _playMidSub(ctx, t, freq, note, prof, J, sustain, dest){
+  if(!prof.sub || !prof.sub.enabled) return;
+  const fade = prof.sub.keyFade;
+  const keyGain = fade ? Math.max(0, 1 - Math.max(0, (note - fade.top)) * fade.slope) : 1.0;
+  if(keyGain <= 0.02) return;
+  const sub = ctx.createOscillator(); sub.type='triangle';
+  sub.frequency.value = freq * 0.5;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(0.18 * keyGain, t + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + sustain * 0.9);
+  sub.connect(g); g.connect(dest);
+  sub.start(t); sub.stop(t + sustain + 0.05);
+  autoClean(sub, g);
+}
+
+// ── Release tail: damper noise / resonant partial ring after note-off
+function _playMidTail(ctx, releaseStart, freq, note, prof, J, rawDest){
+  if(!prof.tail) return;
+  const durMs = prof.tail.durMs;
+  const d = (durMs[0] + Math.random()*(durMs[1] - durMs[0])) * 0.001;
+  if(prof.tail.damperNoise){
+    const SR = ctx.sampleRate;
+    const len = Math.floor(SR * Math.min(0.06, d));
+    const buf = ctx.createBuffer(1, len, SR);
+    const nd = buf.getChannelData(0);
+    for(let i=0;i<len;i++) nd[i] = (Math.random()*2-1) * Math.pow(1 - i/len, 1.2);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+    const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value = 1500;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.04, releaseStart);
+    g.gain.exponentialRampToValueAtTime(0.0001, releaseStart + 0.05);
+    src.connect(hp); hp.connect(g); g.connect(rawDest);
+    src.start(releaseStart);
+    autoClean(src, hp, g);
+  }
+  if(prof.tail.resonantPartials){
+    // One faint sine at the fundamental ringing out for the damper duration
+    const osc = ctx.createOscillator(); osc.type='sine'; osc.frequency.value = freq;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.025, releaseStart);
+    g.gain.exponentialRampToValueAtTime(0.0001, releaseStart + d);
+    osc.connect(g); g.connect(rawDest);
+    osc.start(releaseStart); osc.stop(releaseStart + d + 0.02);
+    autoClean(osc, g);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MID SYNTH ROUTER — reads styleP().midBank array + rotation index off AR.
-// If the style has no bank defined, falls back to single midMode (legacy path).
 // Rotates every 4 measures so within one song you hear different timbres.
 // ═══════════════════════════════════════════════════════════════════════════════
 function pickMidSynthName(ar){
@@ -4343,20 +4940,23 @@ function pickMidSynthName(ar){
   const idx = Math.floor(((ar&&ar.measureCount)||0) / 4) % bank.length;
   return bank[idx];
 }
+// Legacy-name → new-character aliases so existing midBank arrays keep working
+// while we migrate. Each old name maps to its closest new character profile.
+const _MID_CHAR_ALIAS = {
+  piano:   'grand-piano',
+  rhodes:  'rhodes-mk2',
+  wurli:   'wurlitzer-200',
+  clav:    'clavinet-d6',
+  xylo:    'vibraphone',     // closest metallic-bar profile
+  marimba: 'vibraphone',     // (vibes covers mallet territory; could add later)
+  vibes:   'vibraphone',
+  guitar:  'nylon-guitar',
+  keys:    'grand-piano',
+  mid:     'prophet-pad',
+};
 function runMidSynth(name, ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale){
-  switch(name){
-    case 'piano':   return synthPiano  (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
-    case 'rhodes':  return synthRhodes (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
-    case 'wurli':   return synthWurli  (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
-    case 'clav':    return synthClav   (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
-    case 'xylo':    return synthXylo   (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
-    case 'marimba': return synthMarimba(ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
-    case 'vibes':   return synthVibes  (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
-    case 'guitar':  return synthGuitar (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
-    case 'keys':
-    case 'mid':
-    default:        return synthMid    (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
-  }
+  const character = (MID_CHARACTERS[name] ? name : _MID_CHAR_ALIAS[name]) || 'grand-piano';
+  return synthMidVoice(ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale, character);
 }
 
 // LEAD mode rotation: picks a name out of styleP().leadBank; synthLead reads
@@ -5036,7 +5636,7 @@ function App(){
   const[isPlaying,setIsPlaying]=useState(false);
   const[lockedIn,setLockedIn]=useState(false);
   // Sample slot names (shown in UI when the user has dropped a WAV/MP3 in)
-  const[sampleNames,setSampleNames]=useState({kick:null,snare:null,hat:null});
+  const[sampleNames,setSampleNames]=useState({kick:null,snare:null,hat:null,mid:null});
   const loadDrumSample=useCallback(async(slot,file)=>{
     if(!file) return;
     try{
@@ -8786,8 +9386,8 @@ function App(){
           from freesound.org, Splice, or anything you own the rights to. */}
       <div className="bg-[#0b1120] border border-slate-800/60 rounded-xl p-2">
         <div className="text-[9px] text-amber-400 uppercase tracking-widest font-bold mb-1.5">Samples — drop WAV/MP3</div>
-        <div className="grid grid-cols-3 gap-2">
-          {['kick','snare','hat'].map(slot=>(
+        <div className="grid grid-cols-4 gap-2">
+          {['kick','snare','hat','mid'].map(slot=>(
             <label key={slot}
               onDragOver={e=>{e.preventDefault();}}
               onDrop={e=>{e.preventDefault();const f=e.dataTransfer.files&&e.dataTransfer.files[0];if(f)loadDrumSample(slot,f);}}
