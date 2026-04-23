@@ -8188,7 +8188,8 @@ function App(){
               dp.s[14] = 0.85;
               if(Math.random()<0.85) dp.s[15] = 0.80;
               dp.hOpen[14] = true;
-              dp.hVel[14] = 'hard';
+              // Note: no dp.hVel here — this scheduler's dp only has
+              // {k,s,h,hOpen}, not the richer hVel/hDur arrays.
               // Style-specific flavour on the big fill
               if(kickStyle==='jazz'){
                 dp.s[13] = 0; // softer — ride-based, drop busiest snare
