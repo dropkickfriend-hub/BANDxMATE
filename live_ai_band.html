@@ -1540,6 +1540,8 @@ const STYLE_PROFILES = {
     shuffleFeel:true,      // 16th grid swung 2:1 (triplet eighths)
     soloistStyle:'auto',   // Django for pluck leads, Ruben for rhodes/piano
     chromaRate:2,          // 1 chromatic approach every ~2 bars
+    midBank:['rhodes','wurli','marimba','clav','mid'],
+    leadBank:['bell','pluck','fm','moog'],
     label:'Jazz',
   },
   pop: {
@@ -1550,6 +1552,8 @@ const STYLE_PROFILES = {
     leadMode:'saw',      // classic poly-saw lead
     hatMode:'metallic',  // standard physical cymbal model -- clean, bright
     hatGrooveOffset:0,   // on the grid
+    midBank:['mid','rhodes','xylo','clav','wurli'],
+    leadBank:['saw','moog','pluck','fm'],
     label:'Pop',
   },
   edm: {
@@ -1564,6 +1568,8 @@ const STYLE_PROFILES = {
     arpBias:0.75,           // 75% chance extra-instrument auto-picks arp
     arpContinuous:true,     // arp loops a scale pattern across bars
     doubleTimeBias:0.5,     // 50% chance a fresh session locks to double-time grid
+    midBank:['mid','rhodes','clav'],
+    leadBank:['fm','saw','moog','pluck'],
     label:'Hip-Hop/EDM',
   },
   hiphop: {
@@ -1577,6 +1583,8 @@ const STYLE_PROFILES = {
     halftimeBias:true,     // snare only on step 12 (beat 4) — J-Dilla halftime
     snareDensity:0.5,      // drop 50% of non-backbeat snare candidates
     tempoBias:{range:[78,92], prob:0.33}, // 33% chance BPM snaps to Dilla pocket
+    midBank:['rhodes','wurli','clav','mid'],
+    leadBank:['whistle','moog','pluck','fm'],
     label:'Hip-Hop',
   },
   westcoast: {
@@ -1587,6 +1595,8 @@ const STYLE_PROFILES = {
     leadMode:'whistle',  // G-Funk dog whistle / Talkbox synth
     hatMode:'tape',      // same tape-sat vibe as hip-hop
     hatGrooveOffset:0.010, // deep pocket -- G-Funk drags hard
+    midBank:['rhodes','wurli','clav'],
+    leadBank:['whistle','moog','saw','fm'],
     label:'West Coast',
   },
   eastcoast: {
@@ -1597,6 +1607,8 @@ const STYLE_PROFILES = {
     leadMode:'pluck',    // Karplus-Strong pluck -- sample-like
     hatMode:'vinyl',     // dusty vinyl -- high-passed crackle, filtered noise
     hatGrooveOffset:0.004,
+    midBank:['rhodes','clav','wurli','mid'],
+    leadBank:['pluck','saw','moog'],
     label:'East Coast',
   },
   african: {
@@ -1610,6 +1622,8 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.005,
+    midBank:['marimba','xylo','mid','clav'],
+    leadBank:['fm','moog','pluck','saw'],
     label:'African',
   },
   indian: {
@@ -1623,6 +1637,8 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.007,
+    midBank:['mid','marimba','rhodes'],
+    leadBank:['bell','fm','pluck','moog'],
     label:'Indian',
   },
 };
@@ -2661,7 +2677,11 @@ function synthWoodPerc(ctx, t, velocity=0.7, pitch=1.0, warp=1.0, dest){
   autoClean(body,g); autoClean(ns,nbp,ng);
 }
 
-// Rhodes electric piano: FM tine model (operator pair + tremolo)
+// Funky Rhodes electric piano: DX7 E.PIANO 1 algorithm 5 — three carrier/mod
+// pairs where one pair creates the bell tine via a 14:1 ratio, one pair does
+// the bar/body at 1:1 with light modulation, and the third adds a 2:1
+// detuned body layer. Classic 5-7 Hz tremolo + pickup EQ. Every note rolls
+// fresh jitter so repeated pitches don't sound identical.
 function synthRhodes(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0){
   if(!dest)return;
   const s=drumSeed();
@@ -2671,44 +2691,436 @@ function synthRhodes(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, d
   const sustain=(0.9+s.tone*0.5+windBoost*0.2)*_ms.noteLenMult*_dscl/warp;
   const atk=0.008*_ms.attackMult;
 
+  // Per-note jitter seed so the same pitch sounds different every repeat
+  const perNoteJitter = ()=>({
+    tine: 13.5 + Math.random()*1.0,    // 13.5-14.5 (centered on DX7 14:1)
+    bar:  1.98 + Math.random()*0.08,   // slight inharmonicity on bar layer
+    body: 2.00 + (Math.random()-0.5)*0.02,
+    modAtk: 0.35 + Math.random()*0.35, // tine brightness at attack
+    modTail: 0.04 + Math.random()*0.05,
+    hammerAmt: 0.30 + Math.random()*0.40,
+    tremHz: 5.0 + Math.random()*1.6,   // 5-6.6 Hz Rhodes tremolo
+    cutoff: 1400 + Math.random()*1800, // pickup bandpass center
+  });
+
+  // Shared tremolo LFO on the group gain (classic Rhodes stereo-ish swirl)
+  const trem=ctx.createOscillator(); trem.type='sine';
+  const groupJ = perNoteJitter();
+  trem.frequency.value = groupJ.tremHz;
+  const tremAmt=ctx.createGain(); tremAmt.gain.value = 0.08+chaos*0.06;
+  const tremOut=ctx.createGain(); tremOut.gain.value = 1.0;
+  trem.connect(tremAmt); tremAmt.connect(tremOut.gain);
+  trem.start(t); trem.stop(t+sustain+0.1);
+
+  // Pickup EQ: gentle bandpass that gives Rhodes its woody focus
+  const pickup=ctx.createBiquadFilter(); pickup.type='bandpass';
+  pickup.frequency.value = groupJ.cutoff;
+  pickup.Q.value = 0.45 + chaos*0.2;
+  const pickupOut=ctx.createGain(); pickupOut.gain.value=1.0;
+  pickup.connect(pickupOut); pickupOut.connect(tremOut); tremOut.connect(dest);
+  autoClean(trem,tremAmt,tremOut,pickup,pickupOut);
+
+  for(const semis of (notes||[0])){
+    const freq=440*Math.pow(2,(semis-69)/12)*warp;
+    if(freq<=0)continue;
+    const J = perNoteJitter();
+
+    // --- Pair 1: TINE (DX7 E.PIANO bell via 14:1 ratio) ---
+    const carT=ctx.createOscillator(); carT.type='sine'; carT.frequency.value=freq;
+    const modT=ctx.createOscillator(); modT.type='sine'; modT.frequency.value=freq*J.tine;
+    const modTG=ctx.createGain();
+    modTG.gain.setValueAtTime(freq*J.modAtk, t);
+    modTG.gain.exponentialRampToValueAtTime(freq*0.002, t+0.10+J.modTail);
+    const tineG=ctx.createGain();
+    tineG.gain.setValueAtTime(0,t);
+    tineG.gain.linearRampToValueAtTime(0.16+s.punch*0.06, t+atk);
+    tineG.gain.exponentialRampToValueAtTime(0.0001, t+sustain);
+    modT.connect(modTG); modTG.connect(carT.frequency);
+    carT.connect(tineG); tineG.connect(pickup);
+    carT.start(t); modT.start(t);
+    carT.stop(t+sustain+0.02); modT.stop(t+sustain+0.02);
+    autoClean(carT,modT,modTG,tineG);
+
+    // --- Pair 2: BAR (warm body with slight inharmonic detune) ---
+    const carB=ctx.createOscillator(); carB.type='sine'; carB.frequency.value=freq;
+    const modB=ctx.createOscillator(); modB.type='sine'; modB.frequency.value=freq*J.bar;
+    const modBG=ctx.createGain();
+    modBG.gain.setValueAtTime(freq*(0.12+dark*0.10), t);
+    modBG.gain.exponentialRampToValueAtTime(freq*0.015, t+sustain*0.7);
+    const barG=ctx.createGain();
+    barG.gain.setValueAtTime(0,t);
+    barG.gain.linearRampToValueAtTime(0.22+s.tone*0.05, t+atk+0.004);
+    barG.gain.exponentialRampToValueAtTime(0.0001, t+sustain+0.05);
+    modB.connect(modBG); modBG.connect(carB.frequency);
+    carB.connect(barG); barG.connect(pickup);
+    carB.start(t); modB.start(t);
+    carB.stop(t+sustain+0.04); modB.stop(t+sustain+0.04);
+    autoClean(carB,modB,modBG,barG);
+
+    // --- Pair 3: BODY (fifth partial — adds low fullness) ---
+    const carH=ctx.createOscillator(); carH.type='sine'; carH.frequency.value=freq*0.5;
+    const modH=ctx.createOscillator(); modH.type='sine'; modH.frequency.value=freq*J.body*0.5;
+    const modHG=ctx.createGain();
+    modHG.gain.setValueAtTime(freq*0.04, t);
+    modHG.gain.exponentialRampToValueAtTime(freq*0.005, t+sustain*0.8);
+    const bodyG=ctx.createGain();
+    bodyG.gain.setValueAtTime(0,t);
+    bodyG.gain.linearRampToValueAtTime(0.09, t+atk+0.008);
+    bodyG.gain.exponentialRampToValueAtTime(0.0001, t+sustain+0.10);
+    modH.connect(modHG); modHG.connect(carH.frequency);
+    carH.connect(bodyG); bodyG.connect(pickup);
+    carH.start(t); modH.start(t);
+    carH.stop(t+sustain+0.08); modH.stop(t+sustain+0.08);
+    autoClean(carH,modH,modHG,bodyG);
+
+    // --- HAMMER THUD: very short noise burst high-passed (mallet click) ---
+    const hLen=Math.floor(ctx.sampleRate*0.010);
+    const hBuf=ctx.createBuffer(1,hLen,ctx.sampleRate);
+    const hD=hBuf.getChannelData(0);
+    for(let i=0;i<hLen;i++) hD[i]=(Math.random()*2-1)*Math.pow(1-i/hLen,0.7);
+    const hNs=ctx.createBufferSource(); hNs.buffer=hBuf;
+    const hHpf=ctx.createBiquadFilter(); hHpf.type='highpass'; hHpf.frequency.value=900;
+    const hG=ctx.createGain();
+    hG.gain.setValueAtTime(J.hammerAmt*0.22, t);
+    hG.gain.exponentialRampToValueAtTime(0.0001, t+0.025);
+    hNs.connect(hHpf); hHpf.connect(hG); hG.connect(pickup);
+    hNs.start(t);
+    autoClean(hNs,hHpf,hG);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MID / LEAD SYNTH BANK
+// Each synth has a distinct character so rotating between them over the course
+// of a song keeps the chord + lead voice from going stale. All of them accept
+// the same (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale)
+// shape for mid voices (lead variants take a single note instead of notes[]).
+// Physical models are tuned from the DSP literature — not guessed ratios.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Wurlitzer 200A: reed struck by hammer, slight asymmetric waveform with
+// overdrive "growl" when played hard. Two operators (ratio ~2:1) plus a
+// small square-wave 3rd harmonic for the reed buzz.
+function synthWurli(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0){
+  if(!dest)return;
+  const s=drumSeed();
+  const _ms=styleP();
+  const _dscl=Math.max(0.25, Math.min(8.0, durScale||1.0));
+  const sustain=(0.75+s.tone*0.5+windBoost*0.25)*_ms.noteLenMult*_dscl/warp;
+  const atk=0.006*_ms.attackMult;
+
+  // Tremolo (Wurli has steeper amplitude tremolo than Rhodes)
+  const trem=ctx.createOscillator(); trem.type='sine';
+  trem.frequency.value = 5.2 + Math.random()*1.0;
+  const tremAmt=ctx.createGain(); tremAmt.gain.value = 0.16 + chaos*0.08;
+  const tremOut=ctx.createGain(); tremOut.gain.value = 1.0;
+  trem.connect(tremAmt); tremAmt.connect(tremOut.gain);
+  trem.start(t); trem.stop(t+sustain+0.1);
+  // Subtle overdrive on sustain — the Wurli growl
+  const od=ctx.createWaveShaper();
+  const cv=new Float32Array(256); for(let i=0;i<256;i++){const x=i*2/256-1; cv[i]=Math.tanh(x*2.3);}
+  od.curve=cv; od.oversample='2x';
+  od.connect(tremOut); tremOut.connect(dest);
+  autoClean(trem,tremAmt,tremOut,od);
+
+  for(const semis of (notes||[0])){
+    const freq=440*Math.pow(2,(semis-69)/12)*warp;
+    if(freq<=0)continue;
+    // Carrier + modulator at ~2:1 for reed body
+    const car=ctx.createOscillator(); car.type='sine'; car.frequency.value=freq;
+    const mod=ctx.createOscillator(); mod.type='sine';
+    mod.frequency.value=freq*(2.00 + (Math.random()-0.5)*0.02);
+    const modG=ctx.createGain();
+    modG.gain.setValueAtTime(freq*(0.50+windBoost*0.2), t);
+    modG.gain.exponentialRampToValueAtTime(freq*0.03, t+0.16);
+    // Small 3rd-harmonic square bite for the reed buzz
+    const buzz=ctx.createOscillator(); buzz.type='square'; buzz.frequency.value=freq*3;
+    const buzzG=ctx.createGain();
+    buzzG.gain.setValueAtTime(0.04+windBoost*0.03, t);
+    buzzG.gain.exponentialRampToValueAtTime(0.002, t+0.12);
+    const g=ctx.createGain();
+    g.gain.setValueAtTime(0,t);
+    g.gain.linearRampToValueAtTime(0.24+s.punch*0.06, t+atk);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+sustain+0.05);
+    mod.connect(modG); modG.connect(car.frequency);
+    car.connect(g); buzz.connect(buzzG); buzzG.connect(g); g.connect(od);
+    car.start(t); mod.start(t); buzz.start(t);
+    car.stop(t+sustain+0.05); mod.stop(t+sustain+0.05); buzz.stop(t+sustain+0.05);
+    autoClean(car,mod,modG,buzz,buzzG,g);
+  }
+}
+
+// Clavinet D6: struck string with pickup EQ. Rapid attack, short decay,
+// sharp bandpass around 1.5-2 kHz gives the classic Stevie "Superstition"
+// bite. Every hit rolls a fresh pickup cutoff for tonal variety.
+function synthClav(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0){
+  if(!dest)return;
+  const s=drumSeed();
+  const _dscl=Math.max(0.25, Math.min(8.0, durScale||1.0));
+  const decay=(0.28+s.decay*0.22+windBoost*0.15)*_dscl/warp;
+
+  // Pickup bandpass — randomized cutoff per voice for funky variety
+  const pickup=ctx.createBiquadFilter(); pickup.type='bandpass';
+  pickup.frequency.value = 1400 + Math.random()*1200;
+  pickup.Q.value = 2.2 + chaos*1.4;
+  // Gentle wah envelope on the filter (makes it talk)
+  pickup.frequency.setValueAtTime(pickup.frequency.value*0.6, t);
+  pickup.frequency.exponentialRampToValueAtTime(pickup.frequency.value, t+0.05);
+  pickup.connect(dest);
+  autoClean(pickup);
+
+  for(const semis of (notes||[0])){
+    const freq=440*Math.pow(2,(semis-69)/12)*warp;
+    if(freq<=0)continue;
+    // Sawtooth "picked string" through the pickup
+    const osc=ctx.createOscillator(); osc.type='sawtooth'; osc.frequency.value=freq;
+    // Slight detune so chords shimmer
+    osc.detune.value=(Math.random()-0.5)*8;
+    const g=ctx.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.16+s.punch*0.08, t+0.002);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+decay);
+    osc.connect(g); g.connect(pickup);
+    osc.start(t); osc.stop(t+decay+0.02);
+    autoClean(osc,g);
+    // Hammer snap: fast filtered noise burst
+    const hLen=Math.floor(ctx.sampleRate*0.012);
+    const hBuf=ctx.createBuffer(1,hLen,ctx.sampleRate);
+    const hD=hBuf.getChannelData(0);
+    for(let i=0;i<hLen;i++) hD[i]=(Math.random()*2-1)*Math.pow(1-i/hLen,1.2);
+    const hNs=ctx.createBufferSource(); hNs.buffer=hBuf;
+    const hHpf=ctx.createBiquadFilter(); hHpf.type='highpass'; hHpf.frequency.value=1200;
+    const hG=ctx.createGain();
+    hG.gain.setValueAtTime(0.18, t); hG.gain.exponentialRampToValueAtTime(0.0001, t+0.025);
+    hNs.connect(hHpf); hHpf.connect(hG); hG.connect(pickup);
+    hNs.start(t);
+    autoClean(hNs,hHpf,hG);
+  }
+}
+
+// Xylophone bar: fundamental + inharmonic partial at ~3.0x (traditional
+// rosewood xylophone mode ratio) + ~6.0x second partial. Very short decay,
+// bright mallet click at attack.
+function synthXylo(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0){
+  if(!dest)return;
+  const s=drumSeed();
+  const _dscl=Math.max(0.25, Math.min(4.0, durScale||1.0));
+  const decay=(0.12+s.decay*0.08)*_dscl/warp;
+
   for(const semis of (notes||[0])){
     const freq=440*Math.pow(2,(semis-69)/12)*warp;
     if(freq<=0)continue;
 
-    // Carrier + modulator FM pair (classic Rhodes tine simulation)
-    const carrier=ctx.createOscillator(); carrier.type='sine';
-    carrier.frequency.value=freq;
+    // Fundamental
+    const f0=ctx.createOscillator(); f0.type='sine'; f0.frequency.value=freq;
+    const g0=ctx.createGain();
+    g0.gain.setValueAtTime(0.28+s.punch*0.06, t);
+    g0.gain.exponentialRampToValueAtTime(0.0001, t+decay);
+    f0.connect(g0); g0.connect(dest);
+    f0.start(t); f0.stop(t+decay+0.02);
 
-    const modFreq=freq*(1.0+dark*0.1);  // slight inharmonicity = warmth
-    const mod=ctx.createOscillator(); mod.type='sine';
-    mod.frequency.value=modFreq;
-    const modIdx=ctx.createGain();
-    modIdx.gain.setValueAtTime(freq*(0.45+dark*0.3+s.punch*0.2),t);    // attack brightness
-    modIdx.gain.setTargetAtTime(freq*(0.06+dark*0.04),t+atk,0.18/warp); // decay to mellow
+    // 3x partial — characteristic xylophone "tink"
+    const f1=ctx.createOscillator(); f1.type='sine';
+    f1.frequency.value=freq*(3.00 + (Math.random()-0.5)*0.06);
+    const g1=ctx.createGain();
+    g1.gain.setValueAtTime(0.14, t);
+    g1.gain.exponentialRampToValueAtTime(0.0001, t+decay*0.55);
+    f1.connect(g1); g1.connect(dest);
+    f1.start(t); f1.stop(t+decay*0.6);
 
-    // Tremolo LFO (the classic Rhodes wobble)
-    const trem=ctx.createOscillator(); trem.type='sine';
-    trem.frequency.value=4.5+s.tone*2.5+chaos*1.5;
-    const tremAmt=ctx.createGain(); tremAmt.gain.value=0.06+dark*0.06+chaos*0.04;
-    const tremDC=ctx.createGain(); tremDC.gain.value=1;
+    // 6x partial — upper brightness, decays fastest
+    const f2=ctx.createOscillator(); f2.type='sine';
+    f2.frequency.value=freq*6.0;
+    const g2=ctx.createGain();
+    g2.gain.setValueAtTime(0.05, t);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t+decay*0.25);
+    f2.connect(g2); g2.connect(dest);
+    f2.start(t); f2.stop(t+decay*0.3);
 
-    // Envelope
-    const g=ctx.createGain();
-    g.gain.setValueAtTime(0,t);
-    g.gain.linearRampToValueAtTime(0.22+s.punch*0.06,t+atk);
-    g.gain.setTargetAtTime(0.12,t+atk+0.05,0.15/warp);        // sustain plateau
-    g.gain.linearRampToValueAtTime(0.0001,t+sustain);
-    g.gain.setValueAtTime(0,t+sustain+0.01);
+    // Mallet click
+    const nLen=Math.floor(ctx.sampleRate*0.004);
+    const nBuf=ctx.createBuffer(1,nLen,ctx.sampleRate);
+    const nD=nBuf.getChannelData(0);
+    for(let i=0;i<nLen;i++) nD[i]=(Math.random()*2-1)*Math.pow(1-i/nLen,0.3);
+    const ns=ctx.createBufferSource(); ns.buffer=nBuf;
+    const nHpf=ctx.createBiquadFilter(); nHpf.type='highpass'; nHpf.frequency.value=2500;
+    const nG=ctx.createGain();
+    nG.gain.setValueAtTime(0.10, t); nG.gain.exponentialRampToValueAtTime(0.0001, t+0.010);
+    ns.connect(nHpf); nHpf.connect(nG); nG.connect(dest);
+    ns.start(t);
 
-    mod.connect(modIdx); modIdx.connect(carrier.frequency);
-    trem.connect(tremAmt); tremAmt.connect(tremDC);
-    carrier.connect(g); g.connect(dest);  // tremolo on amplitude
-    trem.connect(tremAmt);
-
-    carrier.start(t); mod.start(t); trem.start(t);
-    carrier.stop(t+sustain+0.02); mod.stop(t+sustain+0.02); trem.stop(t+sustain+0.02);
-    autoClean(carrier,mod,modIdx,g,trem,tremAmt,tremDC);
+    autoClean(f0,g0,f1,g1,f2,g2,ns,nHpf,nG);
   }
+}
+
+// Marimba bar: like xylo but tuned to 4:1 fundamental-to-first-partial
+// (concert marimba standard from Yamaha bar tuning) with the 9.24x third
+// partial. Softer mallet, slightly longer ring.
+function synthMarimba(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0){
+  if(!dest)return;
+  const s=drumSeed();
+  const _dscl=Math.max(0.25, Math.min(6.0, durScale||1.0));
+  const decay=(0.32+s.decay*0.20)*_dscl/warp;
+
+  for(const semis of (notes||[0])){
+    const freq=440*Math.pow(2,(semis-69)/12)*warp;
+    if(freq<=0)continue;
+
+    const f0=ctx.createOscillator(); f0.type='sine'; f0.frequency.value=freq;
+    const g0=ctx.createGain();
+    g0.gain.setValueAtTime(0.30+s.punch*0.05, t);
+    g0.gain.exponentialRampToValueAtTime(0.0001, t+decay);
+    f0.connect(g0); g0.connect(dest);
+    f0.start(t); f0.stop(t+decay+0.02);
+
+    // 4x partial (marimba's defining harmonic per bar-tuning research)
+    const f1=ctx.createOscillator(); f1.type='sine';
+    f1.frequency.value=freq*(4.00 + (Math.random()-0.5)*0.04);
+    const g1=ctx.createGain();
+    g1.gain.setValueAtTime(0.11, t);
+    g1.gain.exponentialRampToValueAtTime(0.0001, t+decay*0.45);
+    f1.connect(g1); g1.connect(dest);
+    f1.start(t); f1.stop(t+decay*0.5);
+
+    // 9.24x partial (measured third mode of a well-tuned marimba)
+    const f2=ctx.createOscillator(); f2.type='sine';
+    f2.frequency.value=freq*9.24;
+    const g2=ctx.createGain();
+    g2.gain.setValueAtTime(0.04, t);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t+decay*0.20);
+    f2.connect(g2); g2.connect(dest);
+    f2.start(t); f2.stop(t+decay*0.25);
+
+    // Softer mallet — longer noise burst, lower highpass
+    const nLen=Math.floor(ctx.sampleRate*0.008);
+    const nBuf=ctx.createBuffer(1,nLen,ctx.sampleRate);
+    const nD=nBuf.getChannelData(0);
+    for(let i=0;i<nLen;i++) nD[i]=(Math.random()*2-1)*Math.pow(1-i/nLen,0.8);
+    const ns=ctx.createBufferSource(); ns.buffer=nBuf;
+    const nHpf=ctx.createBiquadFilter(); nHpf.type='highpass'; nHpf.frequency.value=1400;
+    const nG=ctx.createGain();
+    nG.gain.setValueAtTime(0.08, t); nG.gain.exponentialRampToValueAtTime(0.0001, t+0.018);
+    ns.connect(nHpf); nHpf.connect(nG); nG.connect(dest);
+    ns.start(t);
+
+    autoClean(f0,g0,f1,g1,f2,g2,ns,nHpf,nG);
+  }
+}
+
+// Moog-style analog lead: 3 detuned sawtooths through a resonant lowpass
+// with an envelope that opens fast then slowly closes. Subtle saturation
+// and a fresh cutoff per note so repeated pitches don't sound identical.
+function synthMoogLead(ctx, t, note, chaos, warp, dest, windBoost=0, durScale=1.0){
+  if(!dest)return;
+  const _dscl=Math.max(0.25, Math.min(6.0, durScale||1.0));
+  const s=drumSeed();
+  const _ls=styleP();
+  const durT=(0.35+s.tone*0.35+windBoost*0.2+chaos*0.20)*_ls.noteLenMult*_dscl/warp;
+  const freq=440*Math.pow(2,(note-69)/12)*warp;
+
+  // Resonant lowpass — this is what gives Moog its "singing" quality
+  const flt=ctx.createBiquadFilter(); flt.type='lowpass';
+  const openHz = 1200 + Math.random()*3200 + windBoost*600;
+  const closeHz = 300 + Math.random()*400;
+  flt.frequency.setValueAtTime(closeHz, t);
+  flt.frequency.exponentialRampToValueAtTime(openHz, t+0.02);       // fast open
+  flt.frequency.exponentialRampToValueAtTime(closeHz*1.3, t+durT*0.9); // slow close
+  flt.Q.value = 4 + chaos*5 + Math.random()*3;
+
+  // Soft saturation for warmth
+  const sat=ctx.createWaveShaper();
+  const cv=new Float32Array(256); for(let i=0;i<256;i++){const x=i*2/256-1; cv[i]=Math.tanh(x*1.8);}
+  sat.curve=cv; sat.oversample='2x';
+
+  const master=ctx.createGain();
+  master.gain.setValueAtTime(0, t);
+  master.gain.linearRampToValueAtTime(0.14+s.punch*0.04, t+0.006);
+  master.gain.setTargetAtTime(0.10, t+0.04, 0.2);
+  master.gain.linearRampToValueAtTime(0.0001, t+durT);
+
+  flt.connect(sat); sat.connect(master); master.connect(dest);
+  autoClean(flt,sat,master);
+
+  // 3 detuned saws = Moog stack-of-three feel
+  const detunes=[-9+Math.random()*4, 0, 9-Math.random()*4];
+  detunes.forEach(dt=>{
+    const o=ctx.createOscillator(); o.type='sawtooth';
+    o.frequency.value=freq; o.detune.value=dt;
+    o.connect(flt);
+    o.start(t); o.stop(t+durT+0.02);
+    autoClean(o);
+  });
+
+  // Sub osc for body (octave below, triangle)
+  const sub=ctx.createOscillator(); sub.type='triangle';
+  sub.frequency.value=freq*0.5;
+  const subG=ctx.createGain(); subG.gain.value=0.25;
+  sub.connect(subG); subG.connect(flt);
+  sub.start(t); sub.stop(t+durT+0.02);
+  autoClean(sub,subG);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VOICING LIBRARY — rotates chord shapes across measures so mid never plays
+// the same [root, 3rd, 5th] triad forever. Applies to any chord intervals.
+// ═══════════════════════════════════════════════════════════════════════════════
+function voicingForShape(iv, shape){
+  const v = (iv||[0,4,7]).slice().sort(function(a,b){return a-b;});
+  const n = v.length;
+  const s = ((shape%12)+12)%12;
+  switch(s){
+    case 0:  return v;                                                // root position
+    case 1:  return v.slice(1).concat([v[0]+12]);                     // 1st inversion
+    case 2:  return n>2 ? v.slice(2).concat([v[0]+12, v[1]+12]) : v;  // 2nd inversion
+    case 3:  return v.concat([14]);                                   // add 9
+    case 4:  return v.concat([9]);                                    // add 6
+    case 5: {                                                         // drop-2 (2nd-from-top down 12)
+      if(n<3) return v;
+      const r=v.slice(); r[r.length-2]-=12;
+      return r.sort(function(a,b){return a-b;});
+    }
+    case 6:  return [v[0], (v[2]||v[1]||7), (v[1]||4)+12];            // open voicing
+    case 7:  return v.concat([v[0]+12]);                              // octave-doubled root
+    case 8:  return [v[0], v[1]||4, v[2]||7, (v[0]||0)+19];           // spread
+    case 9:  return v.slice(1).concat([14, 17]);                      // rootless w/ 9 & 11
+    case 10: return [v[0], (v.length>3?v[3]:v[v.length-1])];          // shell (root + top)
+    case 11: return v.concat([(v[1]||4)+12]);                         // doubled 3rd up 8va
+    default: return v;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MID SYNTH ROUTER — reads styleP().midBank array + rotation index off AR.
+// If the style has no bank defined, falls back to single midMode (legacy path).
+// Rotates every 4 measures so within one song you hear different timbres.
+// ═══════════════════════════════════════════════════════════════════════════════
+function pickMidSynthName(ar){
+  const sp = (typeof styleP==='function')?styleP():null;
+  const bank = (sp && sp.midBank) || [sp && sp.midMode || 'keys'];
+  const idx = Math.floor(((ar&&ar.measureCount)||0) / 4) % bank.length;
+  return bank[idx];
+}
+function runMidSynth(name, ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale){
+  switch(name){
+    case 'rhodes':  return synthRhodes (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
+    case 'wurli':   return synthWurli  (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
+    case 'clav':    return synthClav   (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
+    case 'xylo':    return synthXylo   (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
+    case 'marimba': return synthMarimba(ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
+    case 'keys':
+    case 'mid':
+    default:        return synthMid    (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
+  }
+}
+
+// LEAD mode rotation: picks a name out of styleP().leadBank; synthLead reads
+// the mode via _overrideLeadMode if we set it, otherwise styleP().leadMode.
+let _overrideLeadMode = null;
+function pickLeadMode(ar){
+  const sp = (typeof styleP==='function')?styleP():null;
+  const bank = (sp && sp.leadBank) || [sp && sp.leadMode || 'saw'];
+  const idx = Math.floor(((ar&&ar.measureCount)||0) / 4) % bank.length;
+  return bank[idx];
 }
 
 function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0, destIn=null){
@@ -2887,7 +3299,11 @@ function synthMid(ctx,t,notes,chordType,chaos,warp,dest,windBoost=0,durScale=1.0
 function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
   const s=drumSeed();
   const _lStyle=styleP();
-  const mode = _lStyle.leadMode || 'saw';
+  // Scheduler can set _overrideLeadMode to rotate through the lead bank.
+  // 'moog' routes to the dedicated Moog-style function for a warmer, more
+  // varied timbre than the built-in saw mode.
+  const mode = _overrideLeadMode || _lStyle.leadMode || 'saw';
+  if(mode==='moog'){ return synthMoogLead(ctx,t,note,chaos,warp,dest,windBoost,durScale); }
   const freq=440*Math.pow(2,(note-69)/12)*warp;
   const _dscl=Math.max(0.25, Math.min(6.0, durScale||1.0));
   const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult*_dscl/warp;
@@ -5029,12 +5445,24 @@ function App(){
       const midExclusion = window._isDrumHitting ? 0.18 : 1.0;
       const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion;
       if(Math.random()<prob){
-        // Check if brain has a learned voicing for this chord -- use it 40% of the time
-        const learnedVoicing=brain.suggestVoicing(chordType);
-        const useLearnedVoicing=learnedVoicing&&Math.random()<0.40&&brain.n>50;
-        const chosenIvs=useLearnedVoicing?learnedVoicing:ct.iv;
-        const notes=chaos>0.72?[midBase,midBase+5,midBase+10]:chosenIvs.map(v=>midBase+v);
-        const _mm=styleP().midMode||'keys';
+        // Voicing rotation: chord shape shifts every 2 measures so the mid
+        // voice never plays the same spacing twice in a row.
+        const learnedVoicing = brain.suggestVoicing(chordType);
+        const useLearnedVoicing = learnedVoicing && Math.random()<0.30 && brain.n>50;
+        const baseIvs = useLearnedVoicing ? learnedVoicing : ct.iv;
+        const shapeIdx = Math.floor(((ar.measureCount||0) + (chordType.charCodeAt(0)||0))/2);
+        let chosenIvs = voicingForShape(baseIvs, shapeIdx);
+        // Rare chord-substitution spice: swap for a quartal stack on chaos
+        if(chaos>0.72 && Math.random()<0.5) chosenIvs=[0,5,10,15];
+        // 10% silent stab — rest is groove too. Set a flag to skip the synth
+        // call below while still letting the rest of scheduleNote run.
+        const _silentMid = Math.random()<0.10;
+        // Clamp notes into the mid register (C3-C6) so inversions don't fly away
+        const notes = chosenIvs.map(v=>{
+          let n = midBase+v;
+          while(n<48) n+=12; while(n>84) n-=12;
+          return n;
+        });
         const _midWind = voices.mid.winding*0.07*(ar._breathMid||1.0);
         // Duration menu: on-beat = long chord, off-beat = stab. padSustain styles
         // (EDM/African/Indian) can hold across bar lines.
@@ -5048,10 +5476,11 @@ function App(){
           const padMenu=[2.0, 3.2, 4.8, 6.4];
           _midScale = padMenu[Math.floor(Math.random()*padMenu.length)];
         }
-        if(_mm==='rhodes')
-          synthRhodes(ctx,time,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind,_midScale);
-        else
-          synthMid(ctx,time,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind,_midScale);
+        // Synth bank rotation — pick which voice speaks the chord this cycle
+        if(!_silentMid){
+          const _midName = pickMidSynthName(ar);
+          runMidSynth(_midName, ctx, time, notes, chordType, chaos, warpMultiplier, bus.getInput('mid'), _midWind, _midScale);
+        }
         // Wood percussion layer (African + Indian)
         if(styleP().woodPerc && Math.random()<0.65){
           const _wd=bus.getInput('drum');
@@ -5075,19 +5504,39 @@ function App(){
       const leadExclusion = window._isDrumHitting ? 0.10 : 1.0;
       const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion;
       if(Math.random()<prob){
-        let iv=brain.choose(userRole,leadOpts,chaos,effectiveChord);
+        // Expanded note pool: full diatonic scale + chord tones + chromatic
+        // approaches + octave jumps + blue notes. Prevents the 6-note menu
+        // from repeating into annoyance.
+        const scaleIvs = (ar.scale||SCALES.major);
+        const chordIvs = ct.iv;
+        // Mix: chord tones (weight 3x), scale tones (weight 1x), octave jumps
+        const expandedOpts = [];
+        chordIvs.forEach(v=>{ expandedOpts.push(v+12); expandedOpts.push(v+12); expandedOpts.push(v+12); });
+        scaleIvs.forEach(v=>{ expandedOpts.push(v+12); });
+        // Blue notes: flat 3, flat 5, flat 7
+        [3,6,10].forEach(v=>{ if(Math.random()<0.4) expandedOpts.push(v+12); });
+        // Octave jump up for drama
+        if(Math.random()<0.3) expandedOpts.push((chordIvs[0]||0)+24);
+        const finalOpts = expandedOpts.length ? expandedOpts : leadOpts;
+
+        let iv=brain.choose(userRole,finalOpts,chaos,effectiveChord);
         // Melodic direction: bias toward stepwise motion (like a real musician)
         // 60% of time, prefer notes close to the last note played
         if(voices.lead.lastNote!=null && Math.random()<0.6){
           const lastIv=(voices.lead.lastNote-rootMidi+144)%12;
-          const stepwise=leadOpts.filter(function(v){return Math.abs((v%12)-(lastIv%12))<=3;});
+          const stepwise=finalOpts.filter(function(v){return Math.abs((v%12)-(lastIv%12))<=3;});
           if(stepwise.length>0) iv=stepwise[Math.floor(Math.random()*stepwise.length)];
         }
         // Taste: darkness shapes note choice -- higher darkness favors flat 7/minor 3
         if(bandTaste.darkness>0.65 && Math.random()<0.4){
-          const darkIvs=leadOpts.filter(function(v){return v%12===10||v%12===3||v%12===7;});
+          const darkIvs=finalOpts.filter(function(v){return v%12===10||v%12===3||v%12===7;});
           if(darkIvs.length) iv=darkIvs[Math.floor(Math.random()*darkIvs.length)];
         }
+
+        // 15% rest: even great soloists leave space. Flag-based skip so the
+        // arp/history code after the lead block still runs.
+        const _restLead = Math.random()<0.15;
+        voices.lead._restedLastBeat = _restLead;
 
         // -- WRONG-NOTE IMPROV (~1 per 4 bars, 1 per 2 bars in jazz) ------
         // Play a chromatic neighbor now, then force the next lead hit in this
@@ -5120,12 +5569,17 @@ function App(){
         // Chromatic passing tone is always short so it resolves fast
         if(_doChroma) _leadScale = 0.35;
         if(Math.random()<0.15) _leadScale *= (Math.random()<0.5?0.6:1.7);
-        synthLead(ctx,time,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0),_leadScale);
-        voices.lead.play();voices.lead.lastNote=ln;
+        // Rotate lead timbre every 4 measures within the style's leadBank
+        _overrideLeadMode = pickLeadMode(ar);
+        if(!_restLead){
+          synthLead(ctx,time,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0),_leadScale);
+          voices.lead.play();voices.lead.lastNote=ln;
+        }
+        _overrideLeadMode = null;
 
         // -- JAZZ SOLOIST FLOURISH (Django on pluck leads, Ruben on rhodes) -
         // After a downbeat note at moderate intensity, tack on a quick run.
-        if(_lp.soloistStyle && _lB%4===0 && !_doChroma && voices.lead.winding>0.6 && Math.random()<0.35){
+        if(!_restLead && _lp.soloistStyle && _lB%4===0 && !_doChroma && voices.lead.winding>0.6 && Math.random()<0.35){
           const stepSec = 60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25;
           const isDjango = (_lp.leadMode==='pluck') || _lp.soloistStyle==='django';
           if(isDjango){
