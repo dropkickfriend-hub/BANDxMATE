@@ -2757,9 +2757,18 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   const s=drumSeed();
   s._wild = false;                 // drums never go wildcard
   const sp=styleP(); // current style profile
-  // Drums do NOT get LFO modulation. Deterministic groove only.
 
-  // ── Style-shaped parameters (no LFO / no randomness beyond seed) ──────
+  // Per-hit articulation (drummer behaviour, not randomness):
+  //   80% regular · 12% soft (ghost kick) · 8% accent (louder, longer).
+  // Scales input energy and decay so ghost hits are short thuds and
+  // accented downbeats are meaty booms.
+  const rArt = Math.random();
+  const art = rArt < 0.08 ? 'accent' : rArt < 0.20 ? 'soft' : 'regular';
+  if(art === 'soft')   inputEnergy = Math.max(0.08, inputEnergy * 0.55);
+  if(art === 'accent') inputEnergy = Math.min(1.00, inputEnergy * 1.30 + 0.10);
+  const decayMul = art === 'soft' ? 0.55 : art === 'accent' ? 1.35 : 1.0;
+
+  // ── Style-shaped parameters ───────────────────────────────────────────
   const f0 = styleLerp(sp.kickF0, s.pitch+inputEnergy*0.3) * warp;
   const f1 = styleLerp(sp.kickF1, s.pitch) * warp;
   const decay = styleLerp(sp.kickDecay, s.decay+inputEnergy*0.2) * decayMul / warp;
