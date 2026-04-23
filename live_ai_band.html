@@ -1850,6 +1850,103 @@ function pickSnareArticulation(inputTight){
   return 'regular';
 }
 
+// Snare preset: which machine's character this kit emulates. Re-picked
+// whenever the snare is reseeded. Classic choices:
+//   acoustic — dynamic multi-layer (body+ring+crack+wire)   — what we had
+//   808      — pure noise snare, very short, no body pitch
+//   909      — pitched noise sweep + bright crack, mid-body thump
+function pickSnareModel(){
+  const r=Math.random();
+  if(r<0.38) return '909';
+  if(r<0.70) return '808';
+  return 'acoustic';
+}
+let _snareModel = pickSnareModel();
+// Hook onto the existing reseedDrum so pressing the snare 🎲 rolls a new
+// preset as well as new timbre jitter.
+const _origReseedDrum = reseedDrum;
+reseedDrum = function(name){
+  _origReseedDrum(name);
+  if(name==='snare') _snareModel = pickSnareModel();
+};
+if(typeof window!=='undefined') window.reseedDrum = reseedDrum;
+
+// TR-808 snare: two short noise bursts through bandpass + hipass, no body
+// pitch. Iconic: a dry, toy-like snap.
+function synthSnare808(ctx, t, warp, dest, vel, s){
+  const SR=ctx.sampleRate;
+  // Layer 1: bandpassed noise (the "shoulder" of the snare)
+  const n1Len=Math.floor(SR*0.040);
+  const n1Buf=ctx.createBuffer(1,n1Len,SR);
+  const n1D=n1Buf.getChannelData(0);
+  for(let i=0;i<n1Len;i++) n1D[i]=(Math.random()*2-1)*Math.pow(1-i/n1Len, 1.8);
+  const n1=ctx.createBufferSource(); n1.buffer=n1Buf;
+  const bp=ctx.createBiquadFilter(); bp.type='bandpass';
+  bp.frequency.value=(1800 + s.tone*900)*warp; bp.Q.value=1.4;
+  const g1=ctx.createGain();
+  g1.gain.setValueAtTime(vel*0.42, t);
+  g1.gain.exponentialRampToValueAtTime(0.0001, t+(0.08+s.decay*0.04)/warp);
+  n1.connect(bp); bp.connect(g1); g1.connect(dest);
+  n1.start(t);
+  // Layer 2: hipassed crack (the top end)
+  const n2Len=Math.floor(SR*0.020);
+  const n2Buf=ctx.createBuffer(1,n2Len,SR);
+  const n2D=n2Buf.getChannelData(0);
+  for(let i=0;i<n2Len;i++) n2D[i]=(Math.random()*2-1)*Math.pow(1-i/n2Len, 0.6);
+  const n2=ctx.createBufferSource(); n2.buffer=n2Buf;
+  const hp=ctx.createBiquadFilter(); hp.type='highpass';
+  hp.frequency.value=(5500 + s.click*1500)*warp;
+  const g2=ctx.createGain();
+  g2.gain.setValueAtTime(vel*0.55, t);
+  g2.gain.exponentialRampToValueAtTime(0.0001, t+0.030/warp);
+  n2.connect(hp); hp.connect(g2); g2.connect(dest);
+  n2.start(t);
+  autoClean(n1,bp,g1,n2,hp,g2);
+}
+
+// TR-909 snare: tuned body tone (~200 Hz) with a short pitch sweep + a
+// dense noise layer + bright hipass crack. The classic house/techno snap.
+function synthSnare909(ctx, t, warp, dest, vel, s){
+  const SR=ctx.sampleRate;
+  // Body: tuned sine that sweeps down slightly
+  const bFreq=(180 + s.pitch*60)*warp;
+  const body=ctx.createOscillator(); body.type='triangle';
+  body.frequency.setValueAtTime(bFreq*1.25, t);
+  body.frequency.exponentialRampToValueAtTime(bFreq*0.82, t+0.060/warp);
+  const bg=ctx.createGain();
+  bg.gain.setValueAtTime(vel*0.38, t);
+  bg.gain.exponentialRampToValueAtTime(0.0001, t+(0.10+s.decay*0.05)/warp);
+  body.connect(bg); bg.connect(dest);
+  body.start(t); body.stop(t+(0.12+s.decay*0.06)/warp);
+  // Noise layer (tight, mid-band)
+  const nLen=Math.floor(SR*0.060);
+  const nBuf=ctx.createBuffer(1,nLen,SR);
+  const nD=nBuf.getChannelData(0);
+  for(let i=0;i<nLen;i++) nD[i]=(Math.random()*2-1)*Math.pow(1-i/nLen, 0.8);
+  const n=ctx.createBufferSource(); n.buffer=nBuf;
+  const bp=ctx.createBiquadFilter(); bp.type='bandpass';
+  bp.frequency.value=(2400 + s.tone*1400)*warp; bp.Q.value=0.8;
+  const ng=ctx.createGain();
+  ng.gain.setValueAtTime(vel*0.48, t);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t+0.08/warp);
+  n.connect(bp); bp.connect(ng); ng.connect(dest);
+  n.start(t);
+  // Crack: ultra-short hipass burst for the initial transient
+  const cLen=Math.floor(SR*0.008);
+  const cBuf=ctx.createBuffer(1,cLen,SR);
+  const cD=cBuf.getChannelData(0);
+  for(let i=0;i<cLen;i++) cD[i]=(Math.random()*2-1)*Math.pow(1-i/cLen, 0.25);
+  const c=ctx.createBufferSource(); c.buffer=cBuf;
+  const hp=ctx.createBiquadFilter(); hp.type='highpass';
+  hp.frequency.value=(6500 + s.click*2000)*warp;
+  const cg=ctx.createGain();
+  cg.gain.setValueAtTime(vel*0.6, t);
+  cg.gain.exponentialRampToValueAtTime(0.0001, t+0.018/warp);
+  c.connect(hp); hp.connect(cg); cg.connect(dest);
+  c.start(t);
+  autoClean(body,bg,n,bp,ng,c,hp,cg);
+}
+
 function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
   // Flam: schedule a quiet leading grace note and let the main hit continue
   if(articulation==='flam'){
@@ -1858,6 +1955,16 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
   }
   const art=articulation||pickSnareArticulation(inputTight);
   const s=humanizedSeed('snare', 0.22);
+
+  // Machine-preset routing: '808' and '909' are distinct synths; 'acoustic'
+  // uses the detailed multi-layer model below. Ghost/rim still fall through
+  // to the acoustic path so their articulation shaping applies.
+  if((_snareModel==='808'||_snareModel==='909') && art!=='ghost' && art!=='rim'){
+    const vel = Math.max(0.2, 0.75 + (Math.random()-0.5)*0.25 + inputTight*0.2);
+    if(_snareModel==='808') synthSnare808(ctx, t, warp, dest, vel*(art==='rimshot'?1.25:1.0), s);
+    else                    synthSnare909(ctx, t, warp, dest, vel*(art==='rimshot'?1.20:1.0), s);
+    return;
+  }
 
   // Articulation shaping
   let bodyVol=1.0, crackVol=1.0, ringVol=1.0, tailVol=1.0;
@@ -2438,16 +2545,19 @@ function synthSubBass(ctx, t, note, chaos, warp, windBoost=0, beat=0){
     osc3.connect(g3); g3.connect(mix);
     autoClean(osc3,g3);
 
-    // FM voice: use subFreqMod here where slight detuning adds character not beating
+    // FM voice: pitched up an octave so it doesn't fight the fundamental.
+    // Previously osc4 ran at f1 which phase-cancelled against osc1 — that
+    // was the "clashing / polarity" artifact.
     fmMod=ctx.createOscillator(); fmMod.type='sine';
-    osc4=ctx.createOscillator(); osc4.type='sine'; osc4.frequency.value=f1;
+    osc4=ctx.createOscillator(); osc4.type='sine'; osc4.frequency.value=f1*2;
     const fmRatio=1.0+pcMod*0.5+chaos*0.3+s.tone*0.2;
-    fmMod.frequency.value=f1*fmRatio*(1+(nn.subFreqMod||0)*0.5); // subFreqMod safe here
+    fmMod.frequency.value=f1*2*fmRatio*(1+(nn.subFreqMod||0)*0.5);
     const fmDepth=ctx.createGain();
     fmDepth.gain.value=f1*(0.12+windBoost*0.18+chaos*0.22+s.sub*0.15);
     fmMod.connect(fmDepth); fmDepth.connect(osc4.frequency);
     const g4=ctx.createGain();
-    g4.gain.setValueAtTime((nn.filterCutoff||0.3)*0.35+chaos*0.10,t+attackT*0.3);
+    // Lower level on FM layer (it was doubling the fundamental before)
+    g4.gain.setValueAtTime((nn.filterCutoff||0.3)*0.22+chaos*0.06,t+attackT*0.3);
     g4.gain.linearRampToValueAtTime(0.0001,t+holdTime*0.55);
     g4.gain.setValueAtTime(0,t+holdTime*0.57);
     osc4.connect(g4); g4.connect(mix);
@@ -2786,9 +2896,28 @@ function synthRhodes(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, d
   const pickup=ctx.createBiquadFilter(); pickup.type='bandpass';
   pickup.frequency.value = groupJ.cutoff;
   pickup.Q.value = 0.45 + chaos*0.2;
+  // Funky-Rhodes wah envelope: pickup filter opens hard on attack and
+  // slowly closes. This is the "bark" a Rhodes has in Stevie-Wonder funk.
+  pickup.frequency.setValueAtTime(groupJ.cutoff*0.55, t);
+  pickup.frequency.exponentialRampToValueAtTime(groupJ.cutoff*1.4, t+0.05);
+  pickup.frequency.exponentialRampToValueAtTime(groupJ.cutoff, t+sustain*0.6);
   const pickupOut=ctx.createGain(); pickupOut.gain.value=1.0;
-  pickup.connect(pickupOut); pickupOut.connect(tremOut); tremOut.connect(dest);
-  autoClean(trem,tremAmt,tremOut,pickup,pickupOut);
+
+  // Chorus: slightly detuned, delayed copy so the Rhodes sits wide instead
+  // of mono. 12-18 ms delay, gain 0.35, no feedback — the classic CE-1 feel.
+  const chorus=ctx.createDelay(0.05);
+  chorus.delayTime.value = 0.012 + Math.random()*0.006;
+  const chorusLFO=ctx.createOscillator(); chorusLFO.type='sine';
+  chorusLFO.frequency.value = 0.35 + Math.random()*0.45; // 0.35-0.8 Hz
+  const chorusLFOAmt=ctx.createGain(); chorusLFOAmt.gain.value=0.0025;
+  chorusLFO.connect(chorusLFOAmt); chorusLFOAmt.connect(chorus.delayTime);
+  chorusLFO.start(t); chorusLFO.stop(t+sustain+0.1);
+  const chorusMix=ctx.createGain(); chorusMix.gain.value=0.35;
+  chorus.connect(chorusMix); chorusMix.connect(tremOut);
+
+  pickup.connect(pickupOut); pickupOut.connect(tremOut); pickupOut.connect(chorus);
+  tremOut.connect(dest);
+  autoClean(trem,tremAmt,tremOut,pickup,pickupOut,chorus,chorusLFO,chorusLFOAmt,chorusMix);
 
   for(const semis of (notes||[0])){
     const freq=440*Math.pow(2,(semis-69)/12)*warp;
@@ -2843,19 +2972,31 @@ function synthRhodes(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, d
     carH.stop(t+sustain+0.08); modH.stop(t+sustain+0.08);
     autoClean(carH,modH,modHG,bodyG);
 
-    // --- HAMMER THUD: very short noise burst high-passed (mallet click) ---
-    const hLen=Math.floor(ctx.sampleRate*0.010);
+    // --- HAMMER THUD: real Rhodes hammer lands on a tonebar. Beefed up
+    // for funk: sharper noise burst + a short square-wave "knock" at the
+    // fundamental that gives the classic Stevie bark.
+    const hLen=Math.floor(ctx.sampleRate*0.014);
     const hBuf=ctx.createBuffer(1,hLen,ctx.sampleRate);
     const hD=hBuf.getChannelData(0);
-    for(let i=0;i<hLen;i++) hD[i]=(Math.random()*2-1)*Math.pow(1-i/hLen,0.7);
+    for(let i=0;i<hLen;i++) hD[i]=(Math.random()*2-1)*Math.pow(1-i/hLen,0.6);
     const hNs=ctx.createBufferSource(); hNs.buffer=hBuf;
-    const hHpf=ctx.createBiquadFilter(); hHpf.type='highpass'; hHpf.frequency.value=900;
+    const hHpf=ctx.createBiquadFilter(); hHpf.type='highpass'; hHpf.frequency.value=700;
     const hG=ctx.createGain();
-    hG.gain.setValueAtTime(J.hammerAmt*0.22, t);
-    hG.gain.exponentialRampToValueAtTime(0.0001, t+0.025);
+    hG.gain.setValueAtTime(J.hammerAmt*0.42, t);
+    hG.gain.exponentialRampToValueAtTime(0.0001, t+0.030);
     hNs.connect(hHpf); hHpf.connect(hG); hG.connect(pickup);
     hNs.start(t);
     autoClean(hNs,hHpf,hG);
+    // Funky knock: quick square-wave pulse at the fundamental
+    const knock=ctx.createOscillator(); knock.type='square';
+    knock.frequency.setValueAtTime(freq*2, t);
+    knock.frequency.exponentialRampToValueAtTime(freq*0.7, t+0.012);
+    const knockG=ctx.createGain();
+    knockG.gain.setValueAtTime(0.10+J.hammerAmt*0.05, t);
+    knockG.gain.exponentialRampToValueAtTime(0.0001, t+0.020);
+    knock.connect(knockG); knockG.connect(pickup);
+    knock.start(t); knock.stop(t+0.025);
+    autoClean(knock,knockG);
   }
 }
 
@@ -5366,6 +5507,10 @@ function App(){
       };
     }
     AR.current.nextNoteTime=AR.current.ctx.currentTime+0.08;
+    // Intro: first 2 bars are hat-only so the band establishes the groove
+    // before the kick/snare land. Scheduler decrements this per bar.
+    AR.current._introBars = 2;
+    AR.current._breakdownIn = 8 + Math.floor(Math.random()*4); // first breakdown at bar 8-11
     // Initialize structure fields
     if(!AR.current.measuresPerChord) AR.current.measuresPerChord=4;
     if(!AR.current.targetChordSeq||!AR.current.targetChordSeq.length){
@@ -5460,6 +5605,26 @@ function App(){
       if(ar._callResponseDue) addLog('[RESPOND] Band answering…');
       if(ar._vampMode && !ar._vampLogged){ ar._vampLogged=true; addLog('[VAMP] Locked in with you.'); }
       if(!ar._vampMode) ar._vampLogged=false;
+
+      // -- ARRANGEMENT: intro + breakdowns -------------------------------
+      // Intro: hat-only for the first ~2 bars. Gives the groove time to
+      // settle before the kick/snare announce.
+      if((ar._introBars||0) > 0){
+        ar._introBars -= 1;
+        ar._quietBar = true;
+        if(ar._introBars === 0) addLog('[INTRO] Band drops in.');
+      } else {
+        // Dynamic breakdowns: every ~8 bars, drop the kick/snare for 1 bar
+        // so the groove breathes. Randomize placement ±3 bars.
+        if(typeof ar._breakdownIn === 'number') ar._breakdownIn -= 1;
+        if(ar._breakdownIn != null && ar._breakdownIn <= 0){
+          ar._quietBar = true;
+          ar._breakdownIn = 7 + Math.floor(Math.random()*4); // next in 7-10 bars
+          addLog('[BREAKDOWN]');
+        } else {
+          ar._quietBar = false;
+        }
+      }
 
       ar.measuresThisChord=(ar.measuresThisChord||0)+1;
       // Motif phase: call(1-2) / response(3) / turnaround(4) within each phrase
@@ -5578,8 +5743,11 @@ function App(){
       // Ensure the locked kit pattern matches the active style.
       const dp = ensureDrumKitPattern(kickStyle||'pop');
 
-      const playK  = !!dp.k[b16];
-      const playS  = !!dp.s[b16];
+      // During an intro or breakdown bar we suppress kick/snare so the hat
+      // groove carries the tempo alone. Hats always play.
+      const _quiet = !!ar._quietBar;
+      const playK  = !!dp.k[b16] && !_quiet;
+      const playS  = !!dp.s[b16] && !_quiet;
       const playH  = !!dp.h[b16];
       const openH  = !!dp.hOpen[b16];
       // Turnaround fill: last measure of a section can add a snare ghost on 14
@@ -5689,7 +5857,12 @@ function App(){
       while(baseNote>52)baseNote-=12;
 
       // Sub bass: plays on beat 0 and beat bb (half note positions)
-      const isSubBeat=(beat===0||(beat===bb&&Math.random()<0.75));
+      // Sub+kick pocket: sub locks to kick steps so the low end punches
+      // WITH the kick instead of fighting it. Downbeat always fires;
+      // extra fires only where a kick is scheduled (hard-accent grid steps).
+      const _dp = (typeof _drumKitPattern!=='undefined' && _drumKitPattern) ? _drumKitPattern : null;
+      const _kickHere = _dp && _dp.k && !!_dp.k[beat%16];
+      const isSubBeat = !ar._quietBar && (beat===0 || _kickHere || (beat===bb && Math.random()<0.55));
       if(isSubBeat&&!mutes.sub){
         synthSubBass(ctx,time,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,beat);
         voices.bass.play();voices.bass.lastNote=baseNote;
@@ -5867,6 +6040,27 @@ function App(){
         }
         _overrideLeadMode = null;
 
+        // -- OFF-GRID IMPROV FILL: lead spontaneously drops a 3-5 note run
+        // between beats. The scheduler grid constrains placement; this
+        // forces notes at 32nd-note sub-steps so it feels off the bar grid.
+        // Only fires when the lead is "in the spotlight" (high winding) and
+        // outside drum hits, keeping it from stepping on the groove.
+        if(!_restLead && !_doChroma && voices.lead.winding>0.9 && Math.random()<0.12 && !window._isDrumHitting){
+          const stepSec = 60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25;
+          const runLen = 3 + Math.floor(Math.random()*3); // 3-5 notes
+          const scaleIvs = (ar.scale||SCALES.major);
+          const seed = iv;
+          // Random-walk stepwise on the scale for a spontaneous feel
+          let cur = seed;
+          for(let ri=0; ri<runLen; ri++){
+            const step = (Math.random()<0.6 ? 1 : -1) * (Math.random()<0.75 ? 1 : 2);
+            cur += step;
+            let rn=rootMidi+cur; while(rn<60)rn+=12; while(rn>90)rn-=12;
+            // Off-grid placement: subdivide into 32nds with wobble
+            const offT = time + (ri+1)*stepSec*0.5 + (Math.random()-0.5)*0.012;
+            synthLead(ctx,offT,rn,chaos*0.9,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.04,0.30);
+          }
+        }
         // -- JAZZ SOLOIST FLOURISH (Django on pluck leads, Ruben on rhodes) -
         // After a downbeat note at moderate intensity, tack on a quick run.
         if(!_restLead && _lp.soloistStyle && _lB%4===0 && !_doChroma && voices.lead.winding>0.6 && Math.random()<0.35){
@@ -6077,15 +6271,19 @@ function App(){
         const ctxNow = AR.current.ctx ? AR.current.ctx.currentTime : now2/1000;
 
         // Band-onset rejection: each scheduled kick/snare pushes its start
-        // time into ar._bandOnsets. Reject detected onsets that fall within
-        // 70 ms of any band hit (± speaker latency) — that's the band bleed.
+        // time into ar._bandOnsets. We only treat a detection as bleed when
+        // it's close to a band hit AND the mic level isn't dramatically
+        // louder than the noise floor — a user singing over the band still
+        // spikes far above floor, so we want to keep those onsets.
         const bandOnsets = AR.current._bandOnsets || [];
-        let bandBleed = false;
+        let nearBand = false;
         for(let i=bandOnsets.length-1; i>=0 && i>bandOnsets.length-12; i--){
-          if(Math.abs(ctxNow - bandOnsets[i]) < 0.070){ bandBleed=true; break; }
+          if(Math.abs(ctxNow - bandOnsets[i]) < 0.040){ nearBand=true; break; }
         }
+        const clearSpike = rms > micFloor*2.2 + 6;
+        const bandBleed = nearBand && !clearSpike;
 
-        const isOnset = rms>onsetThreshold && rms>AR.current.previousEnergy*1.32 && (now2-AR.current.lastOnset)>100 && !bandBleed;
+        const isOnset = rms>onsetThreshold && rms>AR.current.previousEnergy*1.25 && (now2-AR.current.lastOnset)>100 && !bandBleed;
         if(isOnset){
           const delta=now2-AR.current.lastOnset;AR.current.lastOnset=now2;onsetRate++;
           motifEng.addOnset(now2);
@@ -6916,6 +7114,12 @@ function App(){
               </span>
             </div>
           )}
+          {/* Tap-tempo fallback: reliable BPM set even when the mic can't
+              pick out onsets cleanly (noisy room, band bleed, etc.). */}
+          <button onClick={(e)=>handleTap(e,0.5,0.5)}
+            className="w-full py-1.5 rounded-lg text-[10px] font-bold tracking-widest uppercase border transition-all bg-emerald-500/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20">
+            Tap Tempo {tapCount>0 && tapCount<4 ? '('+tapCount+'/4)' : ''}
+          </button>
           <button onClick={handleLockIn}
             className={"w-full py-1.5 rounded-lg text-[10px] font-bold tracking-widest uppercase border transition-all "+(lockedIn?'bg-cyan-500/12 text-cyan-300 border-cyan-500/45 locked':'bg-slate-800/60 text-slate-400 border-slate-700 hover:border-cyan-500/30')}>
             {lockedIn?'[lock] Locked In':'[unlock] Lock In Groove'}
