@@ -1,0 +1,18 @@
+{
+  "name": "bandxmate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Offline Live AI Band — local brain, per-install soundbank, Capacitor-wrapped for phone.",
+  "scripts": {
+    "fetch-vendor": "bash scripts/fetch-vendor.sh",
+    "build": "bash scripts/build-www.sh",
+    "cap:add:android": "npx cap add android",
+    "cap:sync": "npx cap sync",
+    "cap:open:android": "npx cap open android"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.0",
+    "@capacitor/core": "^6.1.0",
+    "@capacitor/android": "^6.1.0"
+  }
+}
