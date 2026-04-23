@@ -8450,7 +8450,19 @@ function App(){
       const _leadMidDuck = window._midIsHitting ? 0.35 : 1.0;
       const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck;
       if(Math.random()<prob){
-        let iv=brain.choose(userRole,leadOpts,chaos,effectiveChord);
+        // Expanded note pool: chord tones (3× weighted) + full diatonic
+        // scale + flat-3/5/7 blues + optional octave jump for drama. Stops
+        // the lead from cycling through the same 6 chord-tone intervals.
+        const _leadScale = (ar.scale || SCALES.major);
+        const _leadChordIvs = ct.iv;
+        const finalOpts = [];
+        _leadChordIvs.forEach(v => { finalOpts.push(v+12); finalOpts.push(v+12); finalOpts.push(v+12); });
+        _leadScale.forEach(v => { finalOpts.push(v+12); });
+        [3, 6, 10].forEach(v => { if(Math.random() < 0.4) finalOpts.push(v+12); });
+        if(Math.random() < 0.3) finalOpts.push((_leadChordIvs[0] || 0) + 24);
+        if(finalOpts.length === 0) finalOpts.push.apply(finalOpts, leadOpts);
+
+        let iv=brain.choose(userRole,finalOpts,chaos,effectiveChord);
         (ar._recentPicks ||= []).push({role:'lead', iv, chord:effectiveChord});
         // Melodic direction: bias toward stepwise motion (like a real musician)
         // 60% of time, prefer notes close to the last note played
