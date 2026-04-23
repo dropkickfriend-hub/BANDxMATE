@@ -2612,7 +2612,7 @@ function snareClassic(ctx,t,bodyFreq,warp,dest,s){
     const ring=ctx.createOscillator();ring.type='sine';
     ring.frequency.value=bodyFreq*(1.4+s.color*0.8);
     const rg=ctx.createGain();
-    rg.gain.setValueAtTime(s.color*0.22*ringVol,t);
+    rg.gain.setValueAtTime(s.color*0.22,t);
     rg.gain.linearRampToValueAtTime(0.0001,t+(0.06+s.color*0.06)/warp);
     ring.connect(rg);rg.connect(dest);ring.start(t);ring.stop(t+0.16/warp);
     autoClean(ring,rg);
@@ -2673,63 +2673,209 @@ function pickSnareRecipe(s){
   return snareClap;
 }
 
-function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5){
-  const s=drumSeed();
-  s._wild = false;                 // drums never go wildcard
-  // Drums do NOT get LFO modulation or recipe rotation.
-  const bodyFreq=(155+s.pitch*90+inputTight*50)*warp;
-  const tightness=s.tone*(0.5+inputTight*0.5);
+// Snare kit model: which machine / drum the current kit emulates. Rolls a
+// fresh pick whenever the snare is reseeded. Articulations (ghost / rimshot
+// / rim / flam) still work across all three models.
+function pickSnareModel(){
+  const r=Math.random();
+  if(r<0.38) return '909';
+  if(r<0.70) return '808';
+  return 'acoustic';
+}
+let _snareModel = pickSnareModel();
 
-  // Always the classic body. Deterministic snare only.
-  snareClassic(ctx, t, bodyFreq, warp, dest, s);
+// TR-808 snare: two short noise bursts (bandpass body + hipass crack). No
+// pitched body. The dry toy-like snap.
+function synthSnare808(ctx, t, warp, dest, vel, s){
+  const SR=ctx.sampleRate;
+  const n1Len=Math.floor(SR*0.040);
+  const n1Buf=ctx.createBuffer(1,n1Len,SR);
+  const n1D=n1Buf.getChannelData(0);
+  for(let i=0;i<n1Len;i++) n1D[i]=(Math.random()*2-1)*Math.pow(1-i/n1Len, 1.8);
+  const n1=ctx.createBufferSource(); n1.buffer=n1Buf;
+  const bp=ctx.createBiquadFilter(); bp.type='bandpass';
+  bp.frequency.value=(1800+s.tone*900)*warp; bp.Q.value=1.4;
+  const g1=ctx.createGain();
+  g1.gain.setValueAtTime(vel*0.42, t);
+  g1.gain.exponentialRampToValueAtTime(0.0001, t+(0.08+s.decay*0.04)/warp);
+  n1.connect(bp); bp.connect(g1); g1.connect(dest);
+  n1.start(t);
+  const n2Len=Math.floor(SR*0.020);
+  const n2Buf=ctx.createBuffer(1,n2Len,SR);
+  const n2D=n2Buf.getChannelData(0);
+  for(let i=0;i<n2Len;i++) n2D[i]=(Math.random()*2-1)*Math.pow(1-i/n2Len, 0.6);
+  const n2=ctx.createBufferSource(); n2.buffer=n2Buf;
+  const hp=ctx.createBiquadFilter(); hp.type='highpass';
+  hp.frequency.value=(5500+s.click*1500)*warp;
+  const g2=ctx.createGain();
+  g2.gain.setValueAtTime(vel*0.55, t);
+  g2.gain.exponentialRampToValueAtTime(0.0001, t+0.030/warp);
+  n2.connect(hp); hp.connect(g2); g2.connect(dest);
+  n2.start(t);
+  autoClean(n1,bp,g1,n2,hp,g2);
+}
 
-  // -- CRACK: unique noise burst -- different spectral shape every hit ------
-  if(crackVol>0.04){
-    const crLen=Math.floor(ctx.sampleRate*(0.028+tightness*0.030)*decayMul);
-    const crBuf=ctx.createBuffer(1,crLen,ctx.sampleRate);
-    const crD=crBuf.getChannelData(0);
-    const seed1=s.click,seed2=s.color;
-    for(let i=0;i<crLen;i++){
-      const noiseVal=(Math.random()*2-1);
-      const shape=Math.pow(1-i/crLen,0.6+seed1);
-      crD[i]=noiseVal*shape*(1+seed2*Math.sin(i*0.08+seed1*10));
-    }
-    const crack=ctx.createBufferSource();crack.buffer=crBuf;
-    const ckHpf=ctx.createBiquadFilter();ckHpf.type='highpass';
-    ckHpf.frequency.value=(2200+s.click*2800)*crackHpfMul*warp;
-    const cg=ctx.createGain();
-    cg.gain.setValueAtTime(s.click*0.90*crackVol,t);
-    cg.gain.linearRampToValueAtTime(0.0001,t+0.045*decayMul/warp);
-    crack.connect(ckHpf);ckHpf.connect(cg);cg.connect(dest);crack.start(t);
-    autoClean(crack,ckHpf,cg);
+// TR-909 snare: tuned body tone (~180 Hz) sweeping down + dense mid noise
+// + bright hipass crack. Classic house/techno snap.
+function synthSnare909(ctx, t, warp, dest, vel, s){
+  const SR=ctx.sampleRate;
+  const bFreq=(180+s.pitch*60)*warp;
+  const body=ctx.createOscillator(); body.type='triangle';
+  body.frequency.setValueAtTime(bFreq*1.25, t);
+  body.frequency.exponentialRampToValueAtTime(bFreq*0.82, t+0.060/warp);
+  const bg=ctx.createGain();
+  bg.gain.setValueAtTime(vel*0.38, t);
+  bg.gain.exponentialRampToValueAtTime(0.0001, t+(0.10+s.decay*0.05)/warp);
+  body.connect(bg); bg.connect(dest);
+  body.start(t); body.stop(t+(0.12+s.decay*0.06)/warp);
+  const nLen=Math.floor(SR*0.060);
+  const nBuf=ctx.createBuffer(1,nLen,SR);
+  const nD=nBuf.getChannelData(0);
+  for(let i=0;i<nLen;i++) nD[i]=(Math.random()*2-1)*Math.pow(1-i/nLen, 0.8);
+  const n=ctx.createBufferSource(); n.buffer=nBuf;
+  const bp=ctx.createBiquadFilter(); bp.type='bandpass';
+  bp.frequency.value=(2400+s.tone*1400)*warp; bp.Q.value=0.8;
+  const ng=ctx.createGain();
+  ng.gain.setValueAtTime(vel*0.48, t);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t+0.08/warp);
+  n.connect(bp); bp.connect(ng); ng.connect(dest);
+  n.start(t);
+  const cLen=Math.floor(SR*0.008);
+  const cBuf=ctx.createBuffer(1,cLen,SR);
+  const cD=cBuf.getChannelData(0);
+  for(let i=0;i<cLen;i++) cD[i]=(Math.random()*2-1)*Math.pow(1-i/cLen, 0.25);
+  const c=ctx.createBufferSource(); c.buffer=cBuf;
+  const hp=ctx.createBiquadFilter(); hp.type='highpass';
+  hp.frequency.value=(6500+s.click*2000)*warp;
+  const cg=ctx.createGain();
+  cg.gain.setValueAtTime(vel*0.6, t);
+  cg.gain.exponentialRampToValueAtTime(0.0001, t+0.018/warp);
+  c.connect(hp); hp.connect(cg); cg.connect(dest);
+  c.start(t);
+  autoClean(body,bg,n,bp,ng,c,hp,cg);
+}
+
+// Snare articulation picker: most hits are regular backbeats, a few are
+// ghosts / rim-shots / rims / flams for expressive variation.
+function pickSnareArticulation(){
+  const r=Math.random();
+  if(r<0.08) return 'ghost';
+  if(r<0.14) return 'rimshot';
+  if(r<0.16) return 'rim';
+  if(r<0.19) return 'flam';
+  return 'regular';
+}
+
+function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
+  // User sample override first — if a WAV was dropped in the snare slot
+  // the band plays that. Ghost / rim / flam still fall through to synthesis
+  // so articulations stay expressive.
+  if(articulation!=='ghost' && articulation!=='rim' && articulation!=='flam'){
+    const vel = articulation==='rimshot' ? 1.1 : 0.90;
+    if(typeof playDrumSample==='function' && playDrumSample('snare', ctx, t, dest, vel)) return;
+  }
+  // Flam: schedule a quiet leading grace note, continue with the main hit.
+  if(articulation==='flam'){
+    synthSnare(ctx, t-0.028/warp, chaos, warp, dest, inputTight*0.55, 'ghost');
+    articulation='regular';
+  }
+  const art = articulation || pickSnareArticulation();
+  const s = humanizedSeed('snare', 0.08);
+
+  // Machine-preset routing: 808 / 909 / acoustic. Ghost + rim always use
+  // the acoustic path so the subtle articulations work.
+  if((_snareModel==='808'||_snareModel==='909') && art!=='ghost' && art!=='rim'){
+    const baseVel = Math.max(0.2, 0.75 + (Math.random()-0.5)*0.25 + inputTight*0.2);
+    const v = baseVel * (art==='rimshot' ? 1.22 : 1.0);
+    if(_snareModel==='808') synthSnare808(ctx, t, warp, dest, v, s);
+    else                    synthSnare909(ctx, t, warp, dest, v, s);
+    return;
   }
 
-  if(tailVol<0.04){ return; } // rim / ghost may skip the wire tail
+  // Acoustic path: classic sine/triangle body + snare-wire tail. Articulation
+  // shapes velocity; the kit character stays constant.
+  const vel = art==='ghost' ? 0.30 : art==='rimshot' ? 1.15 : art==='rim' ? 0.85 : 1.0;
+  const bodyFreq=(155+s.pitch*90+inputTight*50)*warp * (art==='rim'?1.45:1.0);
 
-  // -- TAIL: snare wire noise -- unique length, brightness, and texture ------
-  const tLen=Math.floor(ctx.sampleRate*(0.16+chaos*0.12+s.decay*0.08)*decayMul/warp);
-  const tBuf=ctx.createBuffer(2,tLen,ctx.sampleRate);  // stereo for width
+  // Body + ring (skip body for rim — that's a rim-shot on the edge only)
+  if(art!=='rim'){
+    const body=ctx.createOscillator();
+    body.type=s.color>0.5?'triangle':'sine';
+    body.frequency.setValueAtTime(bodyFreq,t);
+    body.frequency.exponentialRampToValueAtTime(bodyFreq*(0.55+s.tone*0.2),t+0.09/warp);
+    const bg=ctx.createGain();
+    bg.gain.setValueAtTime(s.punch*0.62*vel,t);
+    bg.gain.linearRampToValueAtTime(0.0001,t+(0.13+s.decay*0.08)/warp);
+    bg.gain.setValueAtTime(0,t+(0.14+s.decay*0.08)/warp);
+    body.connect(bg);bg.connect(dest);
+    body.start(t);body.stop(t+(0.15+s.decay*0.08)/warp);
+    autoClean(body,bg);
+  }
+  if(s.color>0.3){
+    const ring=ctx.createOscillator();ring.type='sine';
+    ring.frequency.value=bodyFreq*(1.4+s.color*0.8);
+    const rg=ctx.createGain();
+    rg.gain.setValueAtTime(s.color*0.22*vel,t);
+    rg.gain.linearRampToValueAtTime(0.0001,t+(0.06+s.color*0.06)/warp);
+    ring.connect(rg);rg.connect(dest);
+    ring.start(t);ring.stop(t+0.16/warp);
+    autoClean(ring,rg);
+  }
+
+  // Crack (brighter on rim-shot)
+  const crackHpfMul = art==='rimshot' ? 1.25 : 1.0;
+  const tightness=s.tone*(0.5+inputTight*0.5);
+  const crLen=Math.floor(ctx.sampleRate*(0.028+tightness*0.030));
+  const crBuf=ctx.createBuffer(1,crLen,ctx.sampleRate);
+  const crD=crBuf.getChannelData(0);
+  for(let i=0;i<crLen;i++){
+    crD[i]=(Math.random()*2-1)*Math.pow(1-i/crLen,0.6+s.click)*(1+s.color*Math.sin(i*0.08+s.click*10));
+  }
+  const crack=ctx.createBufferSource();crack.buffer=crBuf;
+  const ckHpf=ctx.createBiquadFilter();ckHpf.type='highpass';
+  ckHpf.frequency.value=(2200+s.click*2800)*crackHpfMul*warp;
+  const cg=ctx.createGain();
+  cg.gain.setValueAtTime(s.click*0.90*vel,t);
+  cg.gain.linearRampToValueAtTime(0.0001,t+0.045/warp);
+  crack.connect(ckHpf);ckHpf.connect(cg);cg.connect(dest);
+  crack.start(t);
+  autoClean(crack,ckHpf,cg);
+
+  // Snare-wire tail — skip for ghost (too quiet) and rim (no head contact)
+  if(art==='ghost' || art==='rim') return;
+  const tLen=Math.floor(ctx.sampleRate*(0.16+chaos*0.12+s.decay*0.08)/warp);
+  const tBuf=ctx.createBuffer(2,tLen,ctx.sampleRate);
   for(let ch=0;ch<2;ch++){
     const td=tBuf.getChannelData(ch);
     for(let i=0;i<tLen;i++){
-      td[i]=(Math.random()*2-1)*(ch===0?1+s.color*0.3:1-s.color*0.3);  // L/R differ
+      td[i]=(Math.random()*2-1)*(ch===0?1+s.color*0.3:1-s.color*0.3);
     }
   }
   const tail=ctx.createBufferSource();tail.buffer=tBuf;
   const hpf=ctx.createBiquadFilter();hpf.type='highpass';hpf.frequency.value=(1200+chaos*2000+s.color*1200)*warp;
   const lpf=ctx.createBiquadFilter();lpf.type='lowpass';lpf.frequency.value=(8000+s.click*6000)*warp;
   const tg=ctx.createGain();
-  tg.gain.setValueAtTime(s.tone*0.52*tailVol,t);
-  tg.gain.linearRampToValueAtTime(0.0001,t+(0.18+s.decay*0.10)*decayMul/warp);
-  tail.connect(hpf);hpf.connect(lpf);lpf.connect(tg);tg.connect(dest);tail.start(t);
+  tg.gain.setValueAtTime(s.tone*0.52*vel,t);
+  tg.gain.linearRampToValueAtTime(0.0001,t+(0.18+s.decay*0.10)/warp);
+  tail.connect(hpf);hpf.connect(lpf);lpf.connect(tg);tg.connect(dest);
+  tail.start(t);
   autoClean(tail,hpf,lpf,tg);
 }
 
-function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7){
-  const s=drumSeed();
-  s._wild = false;                 // drums never go wildcard
+function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7,durMult=1.0){
+  // User sample override — if a hat WAV is loaded, play it.
+  if(typeof _drumSamples!=='undefined' && _drumSamples.hat){
+    const src=ctx.createBufferSource(); src.buffer=_drumSamples.hat;
+    src.playbackRate.value = (open?0.88:1.0) * (1 + (Math.random()-0.5)*0.04);
+    const g=ctx.createGain();
+    g.gain.value = Math.max(0.1, Math.min(1.2, velocity*(open?1.1:1.0)));
+    src.connect(g); g.connect(dest);
+    src.start(t);
+    autoClean(src,g);
+    return;
+  }
+  const s=humanizedSeed('hat', 0.07);
   const cymType = open ? 'open' : 'closed';
-  // Drums don't rotate recipes. Use the style profile's hatMode as-is.
   const hatMode = styleP().hatMode || 'metallic';
   // Per-hit brightness wobble — real hi-hats open/close slightly with foot pressure
   const brJit = inputBright * (1 + (Math.random()-0.5)*0.25);
@@ -7112,7 +7258,12 @@ function App(){
       // On DROP bar: force sub+bass to ALL fire at beat 0 with the kick so
       // the layers stack for a unified mega-hit on the 1. Drop also forces
       // an extra-loud bass hit simultaneously.
-      const isSubBeat=(beat===0||(beat===bb&&Math.random()<0.75));
+      // Sub+kick pocket: the sub locks to wherever the kick pattern is
+      // firing so the low end punches with the kick instead of fighting it.
+      // Downbeat always fires; other sub hits follow kick steps.
+      const _dpKick = (typeof _drumKitPattern!=='undefined' && _drumKitPattern) ? _drumKitPattern : null;
+      const _kickHere = _dpKick && _dpKick.k && !!_dpKick.k[beat%16];
+      const isSubBeat = !ar._quietBar && (beat===0 || _kickHere || (beat===bb && Math.random()<0.55));
       if(isSubBeat&&!mutes.sub){
         synthSubBass(ctx,time,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,beat);
         voices.bass.play();voices.bass.lastNote=baseNote;
