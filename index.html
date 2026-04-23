@@ -1004,6 +1004,35 @@ class AudioBus{
     this.drumBus=ctx.createGain();this.drumBus.gain.value=0.55;
     this.drumBus.connect(drumHPF);
 
+    // -- SNARE SEND: slight left pan + tight short reverb -----------------
+    // Snares sound more natural off-centre. The reverb is short (60 ms IR)
+    // and band-passed so it doesn't muddy the low end or hiss the highs.
+    // Synths route to bus.snareDest() instead of bus.getInput('drum').
+    this.snareBus = ctx.createGain(); this.snareBus.gain.value = 0.85;
+    const snarePan = ctx.createStereoPanner(); snarePan.pan.value = -0.20;
+    this.snareBus.connect(snarePan);
+    snarePan.connect(this.drumBus);
+    // Tight reverb send for the snare only
+    {
+      const irLen = Math.floor(ctx.sampleRate * 0.060);
+      const irBuf = ctx.createBuffer(2, irLen, ctx.sampleRate);
+      for(let ch=0; ch<2; ch++){
+        const d = irBuf.getChannelData(ch);
+        for(let i=0; i<irLen; i++){
+          d[i] = (Math.random()*2-1) * Math.pow(1 - i/irLen, 3.5) * (ch===0 ? 1 : -0.95);
+        }
+      }
+      const conv = ctx.createConvolver(); conv.buffer = irBuf;
+      const sendGain = ctx.createGain(); sendGain.gain.value = 0.18;
+      // Sharp cutoffs: HP at 1.6 kHz so reverb tail isn't boomy, LP at 7 kHz
+      // so it isn't hissy. Reverb sits right in the snare's natural body band.
+      const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=1600; hp.Q.value=0.8;
+      const lp = ctx.createBiquadFilter(); lp.type='lowpass';  lp.frequency.value=7000; lp.Q.value=0.7;
+      this.snareBus.connect(sendGain);
+      sendGain.connect(hp); hp.connect(conv); conv.connect(lp); lp.connect(this.drumBus);
+      this._snareReverb = conv;
+    }
+
     // -- BASS BUS: Moog-style glue compressor -----------------------------
     // 8ms attack preserves the attack pluck/slap, 4:1 for consistent sustain
     // HPF at 60Hz -- anything below is sub territory, not bass territory
@@ -1166,6 +1195,7 @@ class AudioBus{
   getInput(type){
     if(!this.ctx)return null;
     if(type==='drum')return this.drumBus;
+    if(type==='snare')return this.snareBus || this.drumBus;
     if(type==='sub') return this.subBus;
     if(type==='bass')return this.bassBus;
     if(type==='mid') return this.midBus;
@@ -5100,7 +5130,52 @@ const _MID_CHAR_ALIAS = {
 };
 function runMidSynth(name, ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale){
   const character = (MID_CHARACTERS[name] ? name : _MID_CHAR_ALIAS[name]) || 'grand-piano';
-  return synthMidVoice(ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale, character);
+  // Stereo doubling with DIFFERENT character per side. Hard-pan both, but
+  // the L side gets a short bright reverb (40 ms tail, HP 800Hz) and the
+  // R side gets a slightly longer darker reverb (90 ms, LP 4kHz). Plus a
+  // ~3.5 ms Haas delay on the R side. Result: notes feel naturally wide
+  // and three-dimensional instead of just-the-same-sound-in-both-ears.
+  const pL = ctx.createStereoPanner(); pL.pan.value = -0.95; pL.connect(dest);
+  const pR = ctx.createStereoPanner(); pR.pan.value = +0.95; pR.connect(dest);
+  // Per-side micro-reverbs (generated short noise IRs). Different lengths
+  // and frequency tilt = distinct character.
+  const _midSideReverb = (lenMs, hpHz, lpHz) => {
+    const irLen = Math.floor(ctx.sampleRate * (lenMs/1000));
+    const irBuf = ctx.createBuffer(1, irLen, ctx.sampleRate);
+    const d = irBuf.getChannelData(0);
+    for(let i=0; i<irLen; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/irLen, 2.6);
+    const cv = ctx.createConvolver(); cv.buffer = irBuf;
+    const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value = hpHz; hp.Q.value = 0.7;
+    const lp = ctx.createBiquadFilter(); lp.type='lowpass';  lp.frequency.value = lpHz; lp.Q.value = 0.5;
+    const wet = ctx.createGain(); wet.gain.value = 0.25;
+    cv.connect(hp); hp.connect(lp); lp.connect(wet);
+    return { input: cv, output: wet };
+  };
+  const revL = _midSideReverb( 40, 800, 7500); // bright + short
+  const revR = _midSideReverb( 90, 200, 4500); // dark + longer
+  revL.output.connect(pL); revR.output.connect(pR);
+  // Per-hit microtonal drift: ±5 cents per side, independent
+  const driftL = (Math.random() - 0.5) * 0.10;
+  const driftR = (Math.random() - 0.5) * 0.10;
+  const notesL = notes.map(n => n + driftL);
+  const notesR = notes.map(n => n + driftR);
+  // Each side: dry pan + send to its reverb (parallel, so dry hits + tail blend)
+  const dryL = ctx.createGain(); dryL.gain.value = 1.0; dryL.connect(pL); dryL.connect(revL.input);
+  const dryR = ctx.createGain(); dryR.gain.value = 1.0; dryR.connect(pR); dryR.connect(revR.input);
+  synthMidVoice(ctx, t,            notesL, chordType, chaos, warp, dryL, windBoost, durScale * 0.99, character);
+  // 3.5 ms Haas delay on the right side — perceived width without phase issues
+  synthMidVoice(ctx, t + 0.0035,   notesR, chordType, chaos, warp, dryR, windBoost, durScale * 1.01, character);
+  // Explicit cleanup — autoClean would no-op on these (panner/filter/gain
+  // don't fire onended). Schedule a disconnect 2 s after the note so the
+  // wrapper nodes can't pile up over a long session.
+  const _killT = (durScale > 4 ? 8 : 2) * 1000;
+  setTimeout(()=>{
+    try { pL.disconnect(); pR.disconnect();
+          revL.input.disconnect(); revL.output.disconnect();
+          revR.input.disconnect(); revR.output.disconnect();
+          dryL.disconnect(); dryR.disconnect(); }
+    catch(e){}
+  }, _killT);
 }
 
 // LEAD mode rotation: picks a name out of styleP().leadBank; synthLead reads
@@ -5311,6 +5386,49 @@ function synthMid(ctx,t,notes,chordType,chaos,warp,dest,windBoost=0,durScale=1.0
 // -- LEAD: multi-mode synth engine --------------------------------------------
 // leadMode is set per style profile and evolves via brain reinforcement.
 // Modes: 'saw' (poly detuned), 'fm' (FM stab), 'bell' (FM bell), 'pluck' (KS pluck), 'whistle' (sine+vib)
+
+// Stereo-doubled lead: hard-pan + per-side reverb so the lead sits wide
+// instead of being a single mono note in the centre. Different reverb
+// character per side (L: bright/short, R: dark/long) plus a 4 ms Haas
+// delay on the right makes each note feel three-dimensional. Microtonal
+// drift (±5 cents per side, independent) breaks phase symmetry too.
+function playLeadStereo(ctx, t, note, chaos, warp, dest, windBoost, durScale){
+  if(!dest) return;
+  const pL = ctx.createStereoPanner(); pL.pan.value = -0.95; pL.connect(dest);
+  const pR = ctx.createStereoPanner(); pR.pan.value = +0.95; pR.connect(dest);
+  const _sideRev = (lenMs, hpHz, lpHz) => {
+    const irLen = Math.floor(ctx.sampleRate * (lenMs/1000));
+    const irBuf = ctx.createBuffer(1, irLen, ctx.sampleRate);
+    const d = irBuf.getChannelData(0);
+    for(let i=0; i<irLen; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/irLen, 2.4);
+    const cv = ctx.createConvolver(); cv.buffer = irBuf;
+    const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value = hpHz; hp.Q.value = 0.7;
+    const lp = ctx.createBiquadFilter(); lp.type='lowpass';  lp.frequency.value = lpHz; lp.Q.value = 0.5;
+    const wet = ctx.createGain(); wet.gain.value = 0.18;
+    cv.connect(hp); hp.connect(lp); lp.connect(wet);
+    return { input: cv, output: wet };
+  };
+  const revL = _sideRev( 55, 1200, 8000); // bright + short
+  const revR = _sideRev(110,  400, 5000); // dark + longer
+  revL.output.connect(pL); revR.output.connect(pR);
+  const dryL = ctx.createGain(); dryL.gain.value = 1.0; dryL.connect(pL); dryL.connect(revL.input);
+  const dryR = ctx.createGain(); dryR.gain.value = 1.0; dryR.connect(pR); dryR.connect(revR.input);
+  // ±5 cent independent microtonal drift
+  const driftL = (Math.random() - 0.5) * 0.10;
+  const driftR = (Math.random() - 0.5) * 0.10;
+  synthLead(ctx, t,          note + driftL, chaos, warp, dryL, windBoost, (durScale||1) * 0.99);
+  synthLead(ctx, t + 0.0040, note + driftR, chaos, warp, dryR, windBoost, (durScale||1) * 1.01);
+  // Same explicit cleanup as the mid doubler — autoClean is a no-op on
+  // panner/filter/gain nodes so we schedule disconnect ourselves.
+  setTimeout(()=>{
+    try { pL.disconnect(); pR.disconnect();
+          revL.input.disconnect(); revL.output.disconnect();
+          revR.input.disconnect(); revR.output.disconnect();
+          dryL.disconnect(); dryR.disconnect(); }
+    catch(e){}
+  }, 2000);
+}
+
 function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
   const s=drumSeed();
   const _lStyle=styleP();
@@ -8069,7 +8187,7 @@ function App(){
       if(playS){
         const sT = time;
         const snVel = Math.max(0.35, Math.min(1, sVel*0.7 + 0.15));
-        synthSnare(ctx,sT,chaos,warpMultiplier,bus.getInput('drum'),snVel);
+        synthSnare(ctx,sT,chaos,warpMultiplier,bus.getInput('snare'),snVel);
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{s:true});
         if(hapticModeRef.current==='rhythm')hap.snare();
@@ -8103,7 +8221,7 @@ function App(){
       // Ghost snare: same rule -- only when user is drumming, so they're
       // fills between your hits, not clutter on top of an AI-led groove.
       if(userIsDrummer && playGhostSnare && !sup.drum){
-        synthSnare(ctx,time+(60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25*0.5),chaos,warpMultiplier,bus.getInput('drum'),0.18);
+        synthSnare(ctx,time+(60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25*0.5),chaos,warpMultiplier,bus.getInput('snare'),0.18);
         voices.drum.play();
       }
       // Crash cymbal on turnaround downbeat
@@ -8279,10 +8397,19 @@ function App(){
         const _midArc = tensionArc.currentFor('mid').r * 0.018 * (((ar.measureCount||0)%2===0)?-1:1);
         const _midSwing = (motionTween.swingFor('mid') - 0.18) * 0.018;
         const _midT = time + _midArc + _midSwing;
-        if(_mm==='rhodes')
-          synthRhodes(ctx,_midT,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind);
-        else
-          synthMid(ctx,_midT,notes,chordType,chaos,warpMultiplier,bus.getInput('mid'),_midWind);
+        // Route through the modern rotating synth bank (grand-piano /
+        // rhodes-mk2 / vibraphone / nylon-guitar / string-ensemble etc.,
+        // picked by pickMidSynthName every 4 bars) via runMidSynth which
+        // also does the stereo doubling + per-side reverb.
+        if(!_silentMid){
+          const _midName = pickMidSynthName(ar);
+          runMidSynth(_midName, ctx, _midT, notes, chordType, chaos, warpMultiplier, bus.getInput('mid'), _midWind, 1.0);
+          // Anti-mud flag: the lead block reads this so chord + lead don't
+          // pile on the same beat.
+          window._midIsHitting = true;
+          clearTimeout(window._midIsHittingTimer);
+          window._midIsHittingTimer = setTimeout(()=>{ window._midIsHitting = false; }, 120);
+        }
         // Wood percussion layer (African + Indian)
         if(styleP().woodPerc && Math.random()<0.65){
           const _wd=bus.getInput('drum');
@@ -8308,7 +8435,7 @@ function App(){
       const pickupT = time + stepSec0*0.75;
       const pIv = brain.choose(userRole, leadOpts, chaos, effectiveChord);
       let pNote = rootMidi + pIv; while(pNote<60) pNote+=12; while(pNote>84) pNote-=12;
-      synthLead(ctx,pickupT,pNote,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07);
+      playLeadStereo(ctx,pickupT,pNote,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07,1.0);
     }
     if(!leadIsResting && !sup.lead&&!mutes.lead&&leadOpts.length){
       // Exclusion principle: lead ducks even harder than mid when drums hit (90% rest)
@@ -8370,7 +8497,7 @@ function App(){
         // Lead anticipates the beat when arc tension is high (leans into the phrase).
         const _leadArc = -tensionArc.currentFor('lead').r * 0.020;
         const _leadSwing = (motionTween.swingFor('lead') - 0.18) * 0.016;
-        synthLead(ctx,time+_leadArc+_leadSwing,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0));
+        playLeadStereo(ctx,time+_leadArc+_leadSwing,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0),1.0);
         voices.lead.play();voices.lead.lastNote=ln;
         brain.reward('lead',iv,0.6+voices.lead.glow*0.2+bandTaste.darkness*(iv%12===10||iv%12===3?0.2:-0.1),chordType);
       }
