@@ -545,13 +545,20 @@ if(typeof document!=='undefined'){
 // fail silently and the built-in library keeps working.
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchCloudProgressions(){
+  const override = (typeof localStorage!=='undefined') ? localStorage.getItem('bandx.cloudUrl') : null;
+  const url = override || 'progressions.json';
+  const isConfigured = !!override;
   try{
-    const override = (typeof localStorage!=='undefined') ? localStorage.getItem('bandx.cloudUrl') : null;
-    const url = override || 'progressions.json';
     const res = await fetch(url, { cache: 'no-store' });
-    if(!res.ok) return;
+    if(!res.ok){
+      if(isConfigured) console.warn('[Cloud] ' + url + ' returned HTTP ' + res.status + ' — worker reachable but endpoint wrong?');
+      return;
+    }
     const data = await res.json();
-    if(!data || !Array.isArray(data.library)) return;
+    if(!data || !Array.isArray(data.library)){
+      if(isConfigured) console.warn('[Cloud] response has no .library array — is that URL really the bandx worker?');
+      return;
+    }
     let added = 0;
     data.library.forEach(entry=>{
       if(!entry || typeof entry.seq !== 'string' || !isFinite(entry.score)) return;
@@ -577,9 +584,15 @@ async function fetchCloudProgressions(){
     if(progressionMemory.library.length > 64){
       progressionMemory.library.length = 64;
     }
-    if(added) console.log('[Cloud] Merged ' + added + ' discovered progressions. Library: ' + progressionMemory.library.length);
+    console.log('[Cloud] Merged ' + added + ' new, ' + (data.library.length - added) + ' already-known. Library: ' + progressionMemory.library.length);
   }catch(e){
-    // Silent — offline / CORS / no worker configured all end here
+    // When the user explicitly set bandx.cloudUrl, tell them the fetch
+    // didn't work so they can debug. When nothing is configured we stay
+    // silent — "no cloud worker" is a normal state.
+    if(isConfigured){
+      console.warn('[Cloud] fetch failed for ' + url + ': ' + (e.message || e) +
+        '. Check: firewall tag on the VM, http vs https, and that the worker is running.');
+    }
   }
 }
 

@@ -1,241 +1,128 @@
 # Background chord-progression worker
 
-This folder contains `chord_worker.py` — a Python script that runs forever on
-your GCP VM, evolving chord progressions by complexity + novelty fitness and
-writing the top-scoring set to `progressions.json`.
+A Python script that runs forever on any Linux box with systemd + Python 3.7+.
+It evolves chord progressions by complexity and novelty, and serves them on
+port 8080 with CORS so the BANDxMATE HTML app can fetch them directly.
 
-The HTML app fetches that JSON on every page load and merges it into its
-progression memory, so the band actively plays what this worker has
-discovered. The longer the worker runs, the wider and weirder the
-progression pool becomes.
-
-## What the worker is
-
-- **Not a neural net.** It's a genetic-algorithm style evolver with a
-  hand-coded fitness function that rewards harmonic variety, big harmonic
-  distance between chords, use of rare qualities (quartal, min11, dim,
-  aug, lydian, dom9), and actively *penalises* clichéd progressions like
-  I-V-vi-IV and ii-V-I. The band will still cadence — the worker isn't
-  throwing musicality away — it's just refusing to reward the obvious.
-- **Cheap.** Runs on CPU, uses ~50 MB of RAM. No GPU needed.
-- **Idempotent.** Save, stop, restart any time. It picks up the existing
-  `progressions.json` and keeps evolving.
+No nginx. No pip installs. No `gcloud` CLI required. One paste.
 
 ---
 
-## Option A — quickest: run on your existing toposim VM
+## One-line install (GCP VM, AWS, home server, whatever)
 
-This runs the worker alongside toposim without conflict. Python's venv
-keeps their packages isolated. The worker writes to a file; nothing in
-toposim touches it.
-
-### 1. SSH to the VM and set it up
-
-Copy-paste this whole block:
+SSH into the VM. Paste this single line:
 
 ```bash
-# Get the worker onto the VM (either scp from your laptop or git clone)
-mkdir -p ~/bandx && cd ~/bandx
-# If the repo is cloned already, copy from there:
-#   cp ~/BANDxMATE/cloud/chord_worker.py .
-# Otherwise download directly from your fork/branch, e.g.:
-#   curl -O https://raw.githubusercontent.com/YOURUSER/BANDxMATE/main/cloud/chord_worker.py
-
-# Fresh venv so it can't break toposim
-python3 -m venv venv
-source venv/bin/activate
-# Worker has zero dependencies — only uses the Python stdlib
-pip install --upgrade pip
-
-# Pick where to write output. If you'll serve it via nginx (Option 1 below),
-# write straight to /var/www/html:
-sudo mkdir -p /var/www/bandx
-sudo chown -R $USER /var/www/bandx
-export BANDX_OUT=/var/www/bandx/progressions.json
+bash <(curl -fsSL https://raw.githubusercontent.com/dropkickfriend-hub/BANDxMATE/main/cloud/install.sh)
 ```
 
-### 2. Make it a systemd service (runs forever, auto-restarts)
+The script:
+1. Installs `python3` + `python3-venv` if missing (apt / dnf / yum all supported)
+2. Writes the worker to `~/bandx/chord_worker.py`
+3. Registers a systemd service (`bandx-worker`) that runs it forever and auto-restarts
+4. Caps it at 256 MB / 30% CPU so it can't starve anything else (e.g. toposim)
+5. Attempts to open port 8080 via `gcloud` if the CLI is present
+6. Prints the exact `localStorage.setItem` line for the browser with your VM's IP filled in
+
+After ~15 seconds you'll see a big summary box and a "paste this in the browser console" line. Do that, reload the band app, done.
+
+**One manual step you'll probably have to do**: in the GCP web console, add the network tag `bandx` to your VM (VM instances → click your VM → Edit → Network tags → `bandx` → Save). If the installer could use `gcloud` it created the firewall rule for that tag, otherwise the final output tells you the web-console steps.
+
+---
+
+## If the `curl |` line fails (offline VM, private network, paranoid about piping to bash)
+
+Save the installer to the VM some other way (scp, copy-paste it via the GCP console SSH's paste field, etc.) and run it directly:
 
 ```bash
-sudo tee /etc/systemd/system/bandx-worker.service >/dev/null <<EOF
-[Unit]
-Description=BANDxMATE chord-progression evolver
-After=network.target
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$HOME/bandx
-Environment="BANDX_OUT=/var/www/bandx/progressions.json"
-Environment="BANDX_SAVE_EVERY=10"
-Environment="BANDX_POPULATION=48"
-Environment="BANDX_LIBRARY_SIZE=96"
-ExecStart=$HOME/bandx/venv/bin/python $HOME/bandx/chord_worker.py
-Restart=always
-RestartSec=5
-Nice=10
-# Limit memory so toposim can never be killed by this:
-MemoryMax=256M
-CPUQuota=30%
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now bandx-worker
-sudo systemctl status bandx-worker --no-pager
+bash ~/install.sh
 ```
 
-You should see `active (running)` and within ~10 seconds
-`/var/www/bandx/progressions.json` will exist.
+The installer embeds the worker source inline — it doesn't fetch anything else.
 
-Check the log any time:
+If you want to inspect the installer before running it, it's `cloud/install.sh` in this repo. No network calls inside it.
+
+---
+
+## What it actually does
+
+- Evolves chord progressions via mutation + crossover against a hand-coded fitness.
+- Fitness rewards: variety, big harmonic jumps (tritone subs, chromatic mediants), rare chord qualities (quartal, min11, dim, aug, lydian, dom9), resolution back near the opening chord.
+- Fitness *penalises*: I-IV-V-I, ii-V-I, I-vi-IV-V (50s doo-wop), I-V-vi-IV (Pachelbel / pop punk), vi-IV-I-V. −0.5 per matching cliché window.
+- Not a neural net. Pure genetic algorithm. Runs on any CPU, ~50 MB RAM, zero deps beyond Python stdlib.
+
+HTML side (already in `index.html`):
+- On boot, `fetchCloudProgressions()` reads `localStorage.getItem('bandx.cloudUrl')` or falls back to a relative `progressions.json`.
+- Merges entries into `progressionMemory.library` with their complexity scores.
+- `structureEngine.nextChord` picks from the cloud-fed library with 60% preference when it has a match for the current context.
+
+---
+
+## Daily ops
 
 ```bash
-journalctl -u bandx-worker -f
+sudo systemctl status bandx-worker        # is it running?
+journalctl -u bandx-worker -f              # tail logs
+sudo systemctl restart bandx-worker        # restart (e.g. after edit)
+sudo systemctl stop bandx-worker           # stop
+sudo systemctl disable --now bandx-worker  # stop and never restart
 ```
 
-### 3. Serve the JSON so the HTML app can fetch it
+Tuning knobs (edit `/etc/systemd/system/bandx-worker.service`, then `sudo systemctl daemon-reload && sudo systemctl restart bandx-worker`):
 
-The file is written but the browser needs to reach it. Two easy options:
+| env var                | default | meaning                              |
+| ---------------------- | ------- | ------------------------------------ |
+| `BANDX_PORT`           | `8080`  | HTTP port                            |
+| `BANDX_SAVE_EVERY`     | `10`    | seconds between file snapshots       |
+| `BANDX_POPULATION`     | `48`    | candidates spawned per generation    |
+| `BANDX_LIBRARY_SIZE`   | `96`    | max retained progressions            |
 
-#### Option 1: nginx on the same VM
+---
 
+## Troubleshooting
+
+**"curl failed"** — see above, scp the installer directly and run it.
+
+**"sudo systemctl status bandx-worker shows failed"**
 ```bash
-sudo apt-get install -y nginx
-sudo tee /etc/nginx/sites-available/bandx >/dev/null <<'EOF'
-server {
-    listen 80;
-    root /var/www/bandx;
-    # CORS so the HTML (served from anywhere) can fetch this:
-    add_header Access-Control-Allow-Origin "*" always;
-    add_header Cache-Control "no-store" always;
-    location / {
-        try_files $uri =404;
-    }
-}
-EOF
-sudo ln -sf /etc/nginx/sites-available/bandx /etc/nginx/sites-enabled/bandx
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo nginx -t && sudo systemctl reload nginx
-
-# Open the firewall on GCP:
-gcloud compute firewall-rules create allow-bandx-http \
-    --allow tcp:80 --target-tags=http-server || true
-gcloud compute instances add-tags $(hostname) \
-    --tags http-server --zone=$(gcloud config get-value compute/zone)
+journalctl -u bandx-worker -n 50 --no-pager
 ```
+Usually this is either (a) port 8080 already taken by something else (change `BANDX_PORT`) or (b) python3 not on the `$PATH` where systemd looks (the unit hard-codes the venv path — if you moved `~/bandx/` it breaks; just rerun the installer).
 
-Then in the HTML app open devtools → console once and run:
+**"browser says CORS error"** — the worker sends `Access-Control-Allow-Origin: *` on every response. If the browser still complains, the request never reached the worker. Most likely the firewall isn't open for port 8080 — add the `bandx` tag to your VM (GCP → VM → Edit → Network tags → `bandx`). If you named the rule differently or want all-instances scope, set up the firewall rule manually in GCP → VPC network → Firewall.
 
-```js
-localStorage.setItem('bandx.cloudUrl', 'http://YOUR_VM_EXTERNAL_IP/progressions.json');
-location.reload();
-```
+**"localStorage.setItem complains"** — you're not on the band app's page. Open the BANDxMATE page first, *then* open devtools, *then* paste.
 
-Find your VM's external IP on the GCP Compute Engine console or with
-`curl ifconfig.me` from inside the VM.
+**"worker ran fine for a while but now the band isn't using new progressions"** — the HTML merges cloud progressions once per page load. Reload the app to pull the latest.
 
-#### Option 2: Google Cloud Storage bucket (if you'd rather not open a port)
-
+**"I want to see what the worker has discovered right now"**
 ```bash
-# One-time bucket setup
-BUCKET=bandx-progressions-$(date +%s)
-gsutil mb gs://$BUCKET
-gsutil iam ch allUsers:objectViewer gs://$BUCKET
-
-# Tell the bucket to allow CORS from anywhere (the HTML does the fetch)
-cat > /tmp/cors.json <<'EOF'
-[{"origin":["*"],"method":["GET"],"maxAgeSeconds":60}]
-EOF
-gsutil cors set /tmp/cors.json gs://$BUCKET
-
-# Change the worker env to upload after each save.
-# Edit the service:
-sudo systemctl edit bandx-worker
-# Paste:
-#   [Service]
-#   Environment="BANDX_OUT=/tmp/progressions.json"
-#   ExecStartPost=/snap/bin/gsutil cp /tmp/progressions.json gs://BUCKETNAME/progressions.json
-# Save, exit, then:
-sudo systemctl restart bandx-worker
-```
-
-Then in the HTML app:
-
-```js
-localStorage.setItem('bandx.cloudUrl', 'https://storage.googleapis.com/BUCKETNAME/progressions.json');
-location.reload();
+curl -fsS http://127.0.0.1:8080/progressions.json | head -40
 ```
 
 ---
 
-## Option B — run it on your laptop as a test
+## HTTPS (optional, if you serve the HTML from https://)
+
+Browsers block mixed content — an https page can't fetch from http. If your BANDxMATE page is served from https, you need https for the worker too. Easiest:
+
+- **Cloudflare Tunnel**: `cloudflared tunnel run` gives you an https hostname that forwards to `localhost:8080`. Works behind firewalls.
+- **Caddy reverse proxy**: `sudo apt install caddy`, single-line `Caddyfile` pointing at `127.0.0.1:8080` with auto Let's Encrypt.
+
+Both are outside the scope of this installer. If you're running the HTML locally (file:// or http://localhost/) you don't need any of this.
+
+---
+
+## Uninstall
 
 ```bash
-cd cloud
-python3 chord_worker.py
-# ...wait 30 seconds, Ctrl+C...
-cat progressions.json | head -40
-```
-
-You'll see 96 progressions sorted by complexity score. Some will be
-normal-sounding, many will be weirdly good in ways a human wouldn't write.
-That's the point.
-
----
-
-## Config knobs
-
-All via env vars (set them in the systemd unit):
-
-| var                    | default | meaning                                                         |
-| ---------------------- | ------- | --------------------------------------------------------------- |
-| `BANDX_OUT`            | `./progressions.json` | path to write the JSON to                      |
-| `BANDX_SAVE_EVERY`     | `10`    | seconds between saves                                           |
-| `BANDX_POPULATION`     | `48`    | candidate progressions spawned per generation                   |
-| `BANDX_LIBRARY_SIZE`   | `96`    | max progressions retained                                       |
-
-Lower `SAVE_EVERY` for faster experiments, bump `POPULATION` if you want
-the search to explore more per generation (uses more CPU).
-
----
-
-## How complexity is scored
-
-From `chord_worker.py: sequence_complexity`:
-
-- **Variety** — unique chord qualities / length (0-1)
-- **Avg harmonic jump** — Jaccard distance between adjacent chords'
-  interval sets plus fm-consonance difference (0-1)
-- **Rare-chord bonus** — fraction of the sequence using quartal, min11,
-  dim, aug, lydian, dom9 (0-1)
-- **Resolution** — how close the last chord sits to the first (0-1)
-- **Cliché penalty** — -0.5 per 3-4 chord window that matches a known
-  cliché (I-IV-V-I, ii-V-I, I-V-vi-IV, vi-IV-I-V, etc.)
-
-Weighted roughly: 0.25 variety + 0.30 jump + 0.20 rare + 0.15 resolution
-minus clichés. The HTML then normalises to 0-1 before merging.
-
----
-
-## Live improv vs cloud training
-
-Deep-training mode (this worker) *always* favours novelty. Live playback
-in the browser has a `complexityWeight` that scales with `chaos` — at low
-chaos the band leans into known good progressions (including cloud-
-discovered), at high chaos it picks wilder moves. You don't need to do
-anything to get this — it's automatic based on the chaos slider.
-
----
-
-## To stop the worker
-
-```bash
-sudo systemctl stop bandx-worker
-sudo systemctl disable bandx-worker
-# optional: delete it
+sudo systemctl disable --now bandx-worker
 sudo rm /etc/systemd/system/bandx-worker.service
 sudo systemctl daemon-reload
+rm -rf ~/bandx
+```
+
+And in the browser:
+```js
+localStorage.removeItem('bandx.cloudUrl');
 ```
