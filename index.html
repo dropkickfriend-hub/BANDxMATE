@@ -642,7 +642,9 @@ const collectiveBrainLoad=async()=>{
     if(p.rhythmMem) rhythmMemory.load(p.rhythmMem);
     if(p.convergence) convergenceTracker.load(p.convergence);
   if(p.taste) bandTaste.load(p.taste);
-  if(p.songHistory) songHistory.load(p.songHistory);
+  // songHistory is declared inside the App component, so guard it —
+  // collectiveBrainLoad runs before the component mounts.
+  if(p.songHistory && typeof songHistory!=='undefined') songHistory.load(p.songHistory);
     if(p.tensionArc) tensionArc.load(p.tensionArc);
     if(p.paramMemory) paramMemory.load(p.paramMemory);
     if(p.autoFx) autoFx.load(p.autoFx);
@@ -669,7 +671,7 @@ const collectiveBrainSave=()=>{
         progression: progressionMemory.serialize(),
         convergence: convergenceTracker.serialize(),
         taste:       bandTaste.serialize(),
-        songHistory: songHistory.serialize(),
+        songHistory: (typeof songHistory!=='undefined' && songHistory.serialize) ? songHistory.serialize() : null,
         tensionArc:  tensionArc.serialize(),
         paramMemory: paramMemory.serialize(),
         autoFx:      autoFx.serialize(),
@@ -5758,6 +5760,39 @@ function App(){
   const[lockedIn,setLockedIn]=useState(false);
   // Sample slot names (shown in UI when the user has dropped a WAV/MP3 in)
   const[sampleNames,setSampleNames]=useState({kick:null,snare:null,hat:null,mid:null});
+  // Cloud-worker URL the band fetches discovered progressions from. Stored
+  // in localStorage so it persists between sessions. Connect/Disconnect
+  // handled inline in the UI — no devtools paste needed.
+  const[cloudUrl,setCloudUrl]=useState(() => {
+    try { return localStorage.getItem('bandx.cloudUrl') || ''; } catch(e) { return ''; }
+  });
+  const[cloudStatus,setCloudStatus]=useState('idle'); // idle | testing | ok | fail
+  const[cloudCount,setCloudCount]=useState(0);
+  const connectCloud=useCallback(async(rawUrl)=>{
+    const url = (rawUrl||'').trim();
+    if(!url){
+      try { localStorage.removeItem('bandx.cloudUrl'); } catch(e){}
+      setCloudStatus('idle'); setCloudCount(0);
+      addLog('[CLOUD] Disconnected.');
+      return;
+    }
+    setCloudStatus('testing');
+    try {
+      const res = await fetch(url, { cache:'no-store' });
+      if(!res.ok){ throw new Error('HTTP '+res.status); }
+      const data = await res.json();
+      if(!data || !Array.isArray(data.library)) throw new Error('response missing .library array');
+      try { localStorage.setItem('bandx.cloudUrl', url); } catch(e){}
+      setCloudStatus('ok'); setCloudCount(data.library.length);
+      // Trigger the merge into progressionMemory now so it takes effect
+      // immediately instead of waiting for the next page load.
+      if(typeof fetchCloudProgressions === 'function'){ fetchCloudProgressions().catch(()=>{}); }
+      addLog('[CLOUD] Connected — '+data.library.length+' progressions available.');
+    } catch(err){
+      setCloudStatus('fail');
+      addLog('[CLOUD] Failed: '+(err.message||err));
+    }
+  },[]);
   const loadDrumSample=useCallback(async(slot,file)=>{
     if(!file) return;
     try{
@@ -9527,6 +9562,47 @@ function App(){
           ))}
         </div>
         <div className="text-[8px] text-slate-600 mt-1.5">Synth engine is used when a slot is empty. Short one-shots work best.</div>
+      </div>
+
+      {/* CLOUD BRAIN — connect to a background worker running on your VM
+          so the band plays progressions it discovers while you're away.
+          Paste the URL the install script printed on the VM. */}
+      <div className="bg-[#0b1120] border border-slate-800/60 rounded-xl p-2">
+        <div className="flex items-center justify-between mb-1.5">
+          <div className="text-[9px] text-sky-400 uppercase tracking-widest font-bold">Cloud Brain (optional)</div>
+          <div className={"text-[8px] font-mono uppercase tracking-widest "+
+            (cloudStatus==='ok'?'text-emerald-400':
+             cloudStatus==='testing'?'text-amber-400':
+             cloudStatus==='fail'?'text-rose-400':'text-slate-500')}>
+            {cloudStatus==='ok' ? '✓ connected · '+cloudCount+' progressions' :
+             cloudStatus==='testing' ? 'testing…' :
+             cloudStatus==='fail' ? 'unreachable' :
+             cloudUrl ? 'saved — click connect' : 'not connected'}
+          </div>
+        </div>
+        <div className="flex gap-1.5">
+          <input
+            type="text"
+            value={cloudUrl}
+            onChange={e=>setCloudUrl(e.target.value)}
+            placeholder="http://VM_IP:8080/progressions.json"
+            spellCheck={false}
+            className="flex-1 bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[10px] font-mono text-slate-200 placeholder:text-slate-600 focus:border-sky-500/60 focus:outline-none"
+          />
+          <button onClick={()=>connectCloud(cloudUrl)}
+            className="px-3 py-1 rounded text-[9px] font-bold uppercase tracking-widest bg-sky-500/15 border border-sky-500/40 text-sky-300 hover:bg-sky-500/25">
+            Connect
+          </button>
+          {cloudUrl && (
+            <button onClick={()=>{setCloudUrl(''); connectCloud('');}}
+              className="px-2 py-1 rounded text-[9px] font-bold uppercase tracking-widest bg-slate-800/60 border border-slate-700 text-slate-400 hover:border-rose-500/40 hover:text-rose-300">
+              Clear
+            </button>
+          )}
+        </div>
+        <div className="text-[8px] text-slate-600 mt-1.5">
+          Paste the URL from the install script output. If you don't have a worker running, leave this blank — the band still plays fine offline.
+        </div>
       </div>
 
     </div>)}
