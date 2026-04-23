@@ -5057,10 +5057,22 @@ function _playMidTail(ctx, releaseStart, freq, note, prof, J, rawDest){
 // MID SYNTH ROUTER — reads styleP().midBank array + rotation index off AR.
 // Rotates every 4 measures so within one song you hear different timbres.
 // ═══════════════════════════════════════════════════════════════════════════════
+// Per-voice manual advance: incremented by a UI button so the user can
+// force the next character immediately instead of waiting 4 bars.
+let _midCharBump = 0;
+let _leadModeBump = 0;
+function bumpMidCharacter(){ _midCharBump = (_midCharBump + 1) | 0; }
+function bumpLeadMode(){ _leadModeBump = (_leadModeBump + 1) | 0; }
+if(typeof window!=='undefined'){
+  window.bumpMidCharacter = bumpMidCharacter;
+  window.bumpLeadMode = bumpLeadMode;
+}
+
 function pickMidSynthName(ar){
   const sp = (typeof styleP==='function')?styleP():null;
   const bank = (sp && sp.midBank) || [sp && sp.midMode || 'keys'];
-  const idx = Math.floor(((ar&&ar.measureCount)||0) / 4) % bank.length;
+  const barIdx = Math.floor(((ar&&ar.measureCount)||0) / 4);
+  const idx = ((barIdx + _midCharBump) % bank.length + bank.length) % bank.length;
   return bank[idx];
 }
 // Legacy-name → new-character aliases so existing midBank arrays keep working
@@ -5088,7 +5100,8 @@ let _overrideLeadMode = null;
 function pickLeadMode(ar){
   const sp = (typeof styleP==='function')?styleP():null;
   const bank = (sp && sp.leadBank) || [sp && sp.leadMode || 'saw'];
-  const idx = Math.floor(((ar&&ar.measureCount)||0) / 4) % bank.length;
+  const barIdx = Math.floor(((ar&&ar.measureCount)||0) / 4);
+  const idx = ((barIdx + _leadModeBump) % bank.length + bank.length) % bank.length;
   return bank[idx];
 }
 
@@ -7876,39 +7889,124 @@ function App(){
           // Open-hat only on designated steps, and only when that step actually plays
           dp.hOpen[st] = isDesignatedOpen0 && dp.h[st] > 0 && (Math.random() < 0.55 + chaos*0.2);
         }
-        // ---- PER-BAR VARIATION -------------------------------------------
-        // Real drummers don't play the same bar 4 times in a row. The
-        // template sets the identity; each bar in a 4-bar phrase gets a
-        // light edit so the groove breathes. EDM stays relentless because
-        // four-on-floor is supposed to be.
+        // ---- 16-BAR PHRASE VARIATION -------------------------------------
+        // Real drummers play over a 16-bar structure: bar 1 states, bars
+        // 2-3 vary subtly, bar 4 turns around; bars 5-8 answer with more
+        // density; bars 9-12 break down or contrast; bars 13-16 rebuild
+        // then land a big fill on 16. Each bar gets its own treatment —
+        // never the same bar twice in a 16-bar cycle.
+        // EDM stays relentless (four-on-floor is meant to be hypnotic);
+        // it only varies the turnarounds at bars 8 and 16.
         const barIdx = (ar.measureCount || 0);
-        const phase = ((barIdx % 4) + 4) % 4;
+        const phase16 = ((barIdx % 16) + 16) % 16;
         const isEDM = (typeof kickStyle !== 'undefined' && kickStyle === 'edm');
-        if(!isEDM){
-          if(phase === 1){
-            // Bar 2: pickup kick on the & of 1 + ghost snare mid-bar
-            if(!dp.k[3] && !dp.s[3] && Math.random()<0.55) dp.k[3] = 0.5;
-            if(!dp.k[6] && !dp.s[6] && Math.random()<0.55) dp.s[6] = 0.32;
-          } else if(phase === 2){
-            // Bar 3: push-pull — shift the beat-3 kick a 16th late
-            if(dp.k[8] > 0 && Math.random()<0.40){
-              dp.k[9] = dp.k[8]; dp.k[8] = 0;
-            }
-            if(!dp.k[14] && !dp.s[14] && Math.random()<0.45) dp.s[14] = 0.35;
-          } else if(phase === 3){
-            // Bar 4: TURNAROUND FILL — clear back-half kicks, snare roll
-            dp.k[10] = 0; dp.k[11] = 0; dp.k[12] = 0;
-            dp.s[12] = 0.75;
-            if(Math.random()<0.60) dp.s[13] = 0.55;
-            dp.s[14] = 0.80;
-            if(Math.random()<0.70) dp.s[15] = 0.65;
-            dp.hOpen[14] = true;
-          }
-        } else {
-          // EDM turnaround: 35% chance to pull the beat-4 kick for tension
-          if(phase === 3 && Math.random()<0.35){
+
+        if(isEDM){
+          // EDM: 16-bar structure is mostly kept; only bar 8 (mid-build)
+          // and bar 16 (drop-in) get the beat-4 kick pull.
+          if((phase16 === 7 || phase16 === 15) && Math.random() < 0.5){
             dp.k[12] = 0;
             dp.hOpen[14] = true;
+          }
+          // Bars 13-15: progressive snare roll build-up into 16
+          if(phase16 === 13 && Math.random() < 0.35) dp.s[12] = Math.max(dp.s[12], 0.5);
+          if(phase16 === 14 && Math.random() < 0.50){ dp.s[10] = 0.5; dp.s[14] = Math.max(dp.s[14], 0.55); }
+          if(phase16 === 15){
+            dp.hOpen[14] = true;
+            if(Math.random() < 0.55){ dp.s[12] = 0.65; dp.s[14] = 0.70; }
+          }
+        } else {
+          // Non-EDM: detailed per-bar treatments across 16 bars.
+          switch(phase16){
+            case 0: // statement — unchanged base
+              break;
+            case 1: // pickup kick on & of 1
+              if(!dp.k[3] && !dp.s[3] && Math.random()<0.55) dp.k[3] = 0.5;
+              if(!dp.k[6] && !dp.s[6] && Math.random()<0.45) dp.s[6] = 0.30;
+              break;
+            case 2: // push-pull beat 3
+              if(dp.k[8] > 0 && Math.random()<0.40){ dp.k[9] = dp.k[8]; dp.k[8] = 0; }
+              if(!dp.k[14] && !dp.s[14] && Math.random()<0.45) dp.s[14] = 0.35;
+              break;
+            case 3: // small turnaround (end of phrase 1)
+              dp.k[10] = 0; dp.k[11] = 0;
+              if(Math.random()<0.55) dp.s[14] = 0.6;
+              if(Math.random()<0.45) dp.hOpen[14] = true;
+              break;
+            case 4: // restatement, slightly busier hat
+              for(let st=1; st<16; st+=2) if(!dp.h[st] && Math.random()<0.30) dp.h[st] = 0.35;
+              break;
+            case 5: // extra ghost snare on & of 2 (Dilla-ish)
+              if(!dp.k[5] && !dp.s[5] && Math.random()<0.45) dp.s[5] = 0.28;
+              if(!dp.k[11] && !dp.s[11] && Math.random()<0.40) dp.s[11] = 0.30;
+              break;
+            case 6: // kick pickup before beat 4
+              if(!dp.s[14] && Math.random()<0.45) dp.k[14] = 0.55;
+              if(!dp.k[7] && !dp.s[7] && Math.random()<0.30) dp.s[7] = 0.28;
+              break;
+            case 7: // mid-phrase fill (bar 8, halfway point)
+              dp.k[10] = 0; dp.k[11] = 0; dp.k[12] = 0;
+              dp.s[12] = 0.7;
+              if(Math.random()<0.6) dp.s[14] = 0.8;
+              dp.hOpen[14] = true;
+              if(Math.random()<0.40) dp.s[15] = 0.55;
+              break;
+            case 8: // break / contrast — drop some hats for space
+              for(let st=1; st<16; st+=2) if(dp.h[st] > 0 && Math.random()<0.50) dp.h[st] = 0;
+              if(dp.k[8] > 0 && Math.random()<0.35){ dp.k[8] = 0; dp.k[10] = 0.6; }
+              break;
+            case 9: // sparser groove returns
+              if(!dp.k[3] && Math.random()<0.35) dp.k[3] = 0.45;
+              if(!dp.k[14] && !dp.s[14] && Math.random()<0.40) dp.s[14] = 0.30;
+              break;
+            case 10: // displacement — kick on &-of-1 and &-of-3
+              if(!dp.k[3] && Math.random()<0.50) dp.k[3] = 0.55;
+              if(!dp.k[11] && !dp.s[11] && Math.random()<0.40) dp.k[11] = 0.45;
+              break;
+            case 11: // ghost build
+              if(Math.random()<0.45) dp.s[6] = Math.max(dp.s[6]||0, 0.32);
+              if(Math.random()<0.45) dp.s[10] = Math.max(dp.s[10]||0, 0.32);
+              if(Math.random()<0.45) dp.s[14] = Math.max(dp.s[14]||0, 0.38);
+              break;
+            case 12: // restatement into final phrase
+              for(let st=1; st<16; st+=2) if(!dp.h[st] && Math.random()<0.35) dp.h[st] = 0.40;
+              break;
+            case 13: // start of 4-bar build to 16
+              if(!dp.k[3] && Math.random()<0.55) dp.k[3] = 0.55;
+              if(!dp.k[11] && !dp.s[11] && Math.random()<0.45) dp.k[11] = 0.50;
+              break;
+            case 14: // accelerating — more ghosts, start thinning hat
+              for(let st=1; st<16; st+=2){
+                if(!dp.k[st] && !dp.s[st] && Math.random()<0.30) dp.s[st] = 0.32;
+              }
+              if(Math.random()<0.50) dp.hOpen[14] = true;
+              break;
+            case 15: // BIG TURNAROUND — full snare roll landing on 16's 1
+              dp.k[8] = 0; dp.k[10] = 0; dp.k[11] = 0; dp.k[12] = 0;
+              dp.s[8] = 0.55;
+              dp.s[10] = 0.62;
+              dp.s[12] = 0.75;
+              if(Math.random()<0.75) dp.s[13] = 0.70;
+              dp.s[14] = 0.85;
+              if(Math.random()<0.85) dp.s[15] = 0.80;
+              dp.hOpen[14] = true;
+              dp.hVel[14] = 'hard';
+              // Style-specific flavour on the big fill
+              if(kickStyle==='jazz'){
+                dp.s[13] = 0; // softer — ride-based, drop busiest snare
+              } else if(kickStyle==='hiphop'||kickStyle==='westcoast'||kickStyle==='eastcoast'){
+                if(Math.random()<0.45) dp.k[15] = 0.65;
+              }
+              break;
+          }
+        }
+
+        // Chaos sprinkle — random ghost snare on any bar at high chaos
+        if(chaos > 0.45 && Math.random() < chaos*0.35){
+          const candidates = [3,5,6,7,10,11,14].filter(st=>!dp.k[st] && !dp.s[st]);
+          if(candidates.length){
+            const st = candidates[Math.floor(Math.random()*candidates.length)];
+            dp.s[st] = 0.30;
           }
         }
         ar._drumPattern = dp;
@@ -9522,19 +9620,77 @@ function App(){
         })}
       </div>
 
-      {/* DRUM KIT RESEED -- per-drum so a bad kick/snare/hat can be rerolled */}
-      <div className="bg-[#0b1120] border border-slate-800/60 rounded-xl p-2 flex items-center gap-2 text-[9px] text-slate-400">
-        <span className="uppercase tracking-widest font-bold text-rose-400">Kit</span>
-        {['kick','snare','hat'].map(k=>(
-          <button key={k} onClick={()=>reseedInstrument(k)}
-            className="flex-1 px-2 py-1 bg-slate-800/60 hover:bg-rose-500/20 border border-slate-700 hover:border-rose-500/40 rounded text-slate-300 hover:text-rose-200 uppercase tracking-widest">
-            {'\u{1F3B2} '}{k}
+      {/* ─── INSTRUMENT CONTROLS ────────────────────────────────────────
+          Big, labeled, visible. The previous tiny 🎲 icons in the voice
+          card corners got missed — these don't. If the drummer sucks,
+          hit "New Drummer". If the piano is annoying, hit "Next Sound".
+      */}
+      <div className="bg-[#0b1120] border border-slate-800/60 rounded-xl p-3 space-y-2.5">
+        <div className="flex items-center justify-between">
+          <span className="text-[9px] text-amber-400 uppercase tracking-widest font-bold">Instruments</span>
+          <button onClick={()=>reseedInstrument('all')}
+            className="px-3 py-1 bg-amber-500/15 border border-amber-500/40 rounded text-[9px] font-bold uppercase tracking-widest text-amber-300 hover:bg-amber-500/25">
+            {'\u{1F3B2}'} Reshuffle Band
           </button>
-        ))}
-        <button onClick={()=>reseedInstrument('all')}
-          className="px-2 py-1 bg-slate-800/60 hover:bg-amber-500/20 border border-slate-700 hover:border-amber-500/40 rounded text-slate-300 hover:text-amber-200 uppercase tracking-widest">
-          {'\u{1F3B2}'} Band
-        </button>
+        </div>
+
+        {/* Drums row */}
+        <div className="flex items-center gap-1.5">
+          <span className="w-12 text-[9px] uppercase tracking-widest font-bold text-rose-400">Drums</span>
+          <button onClick={()=>reseedInstrument('drum')}
+            className="flex-1 px-2 py-1.5 bg-rose-500/15 border border-rose-500/40 rounded text-[9px] font-bold uppercase tracking-widest text-rose-300 hover:bg-rose-500/25">
+            {'\u{1F3B2}'} New Drummer
+          </button>
+          <button onClick={()=>reseedInstrument('kick')}   title="Reseed just the kick"
+            className="px-2 py-1.5 bg-slate-800/60 hover:bg-rose-500/20 border border-slate-700 rounded text-[9px] uppercase tracking-widest text-slate-300">
+            Kick
+          </button>
+          <button onClick={()=>reseedInstrument('snare')}  title="Reseed just the snare"
+            className="px-2 py-1.5 bg-slate-800/60 hover:bg-rose-500/20 border border-slate-700 rounded text-[9px] uppercase tracking-widest text-slate-300">
+            Snare
+          </button>
+          <button onClick={()=>reseedInstrument('hat')}    title="Reseed just the hat"
+            className="px-2 py-1.5 bg-slate-800/60 hover:bg-rose-500/20 border border-slate-700 rounded text-[9px] uppercase tracking-widest text-slate-300">
+            Hat
+          </button>
+        </div>
+
+        {/* Bass row */}
+        <div className="flex items-center gap-1.5">
+          <span className="w-12 text-[9px] uppercase tracking-widest font-bold text-amber-400">Bass</span>
+          <button onClick={()=>reseedInstrument('bass')}
+            className="flex-1 px-2 py-1.5 bg-amber-500/10 border border-amber-500/30 rounded text-[9px] font-bold uppercase tracking-widest text-amber-200 hover:bg-amber-500/20">
+            {'\u{1F3B2}'} New Bassist
+          </button>
+        </div>
+
+        {/* Mid row */}
+        <div className="flex items-center gap-1.5">
+          <span className="w-12 text-[9px] uppercase tracking-widest font-bold text-violet-400">Mid</span>
+          <button onClick={()=>reseedInstrument('mid')}
+            className="flex-1 px-2 py-1.5 bg-violet-500/10 border border-violet-500/30 rounded text-[9px] font-bold uppercase tracking-widest text-violet-200 hover:bg-violet-500/20">
+            {'\u{1F3B2}'} Reshuffle Mid
+          </button>
+          <button onClick={()=>{ if(typeof bumpMidCharacter==='function') bumpMidCharacter(); addLog('[MID] Next sound'); }}
+            title="Jump to the next mid character right now"
+            className="px-3 py-1.5 bg-slate-800/60 hover:bg-violet-500/20 border border-slate-700 hover:border-violet-500/40 rounded text-[9px] font-bold uppercase tracking-widest text-slate-300 hover:text-violet-200">
+            → Next Sound
+          </button>
+        </div>
+
+        {/* Lead row */}
+        <div className="flex items-center gap-1.5">
+          <span className="w-12 text-[9px] uppercase tracking-widest font-bold text-cyan-400">Lead</span>
+          <button onClick={()=>reseedInstrument('lead')}
+            className="flex-1 px-2 py-1.5 bg-cyan-500/10 border border-cyan-500/30 rounded text-[9px] font-bold uppercase tracking-widest text-cyan-200 hover:bg-cyan-500/20">
+            {'\u{1F3B2}'} Reshuffle Lead
+          </button>
+          <button onClick={()=>{ if(typeof bumpLeadMode==='function') bumpLeadMode(); addLog('[LEAD] Next sound'); }}
+            title="Jump to the next lead character right now"
+            className="px-3 py-1.5 bg-slate-800/60 hover:bg-cyan-500/20 border border-slate-700 hover:border-cyan-500/40 rounded text-[9px] font-bold uppercase tracking-widest text-slate-300 hover:text-cyan-200">
+            → Next Sound
+          </button>
+        </div>
       </div>
 
       {/* SAMPLE LOADER -- drop any WAV/MP3 into kick / snare / hat and the

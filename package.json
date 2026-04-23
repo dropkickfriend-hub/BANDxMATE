@@ -6,6 +6,8 @@
   "scripts": {
     "fetch-vendor": "bash scripts/fetch-vendor.sh",
     "build": "bash scripts/build-www.sh",
+    "prod": "bash scripts/build-prod.sh",
+    "serve": "python3 -m http.server -d www 8000",
     "cap:add:android": "npx cap add android",
     "cap:sync": "npx cap sync",
     "cap:open:android": "npx cap open android"
@@ -13,6 +15,11 @@
   "devDependencies": {
     "@capacitor/cli": "^6.1.0",
     "@capacitor/core": "^6.1.0",
-    "@capacitor/android": "^6.1.0"
+    "@capacitor/android": "^6.1.0",
+    "@babel/core": "^7.23.0",
+    "@babel/cli": "^7.23.0",
+    "@babel/preset-env": "^7.23.0",
+    "@babel/preset-react": "^7.23.0",
+    "tailwindcss": "^3.4.3"
   }
 }

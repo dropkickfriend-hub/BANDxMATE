@@ -1,7 +1,12 @@
 node_modules/
 www/vendor/*.js
+www/app.js
+www/tailwind.css
+www/index.html
+.build-cache/
 android/
 ios/
 .DS_Store
 cloud/progressions.json
 cloud/venv/
+package-lock.json
