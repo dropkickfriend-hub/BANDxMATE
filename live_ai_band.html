@@ -1336,6 +1336,25 @@ function drumSeed(){return{
 const _drumKit={kick:drumSeed(),snare:drumSeed(),hat:drumSeed()};
 function drumSeedFor(name){return _drumKit[name]||drumSeed();}
 function reseedDrum(name){if(_drumKit[name]!==undefined){_drumKit[name]=drumSeed();}}
+
+// Kit identity stays locked, but a real drummer never hits two snares the same
+// way. `humanizedSeed` wobbles each parameter around the kit's mean so every
+// hit has organic pitch / decay / click variation without changing the drum's
+// overall character. `amount` scales the wobble envelope.
+function humanizedSeed(name, amount){
+  const b=drumSeedFor(name);
+  const a=amount==null?0.15:amount;
+  const j=function(k,scale){return b[k]*(1+(Math.random()-0.5)*a*(scale==null?1:scale));};
+  return {
+    pitch: j('pitch',0.55),
+    punch: j('punch',1.00),
+    decay: j('decay',1.00),
+    tone:  j('tone', 0.85),
+    sub:   j('sub',  0.60),
+    click: j('click',1.25),
+    color: Math.max(0, Math.min(1, b.color + (Math.random()-0.5)*a*0.5)),
+  };
+}
 if(typeof window!=='undefined'){window._drumKit=_drumKit;window.reseedDrum=reseedDrum;}
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1540,8 +1559,8 @@ const STYLE_PROFILES = {
     shuffleFeel:true,      // 16th grid swung 2:1 (triplet eighths)
     soloistStyle:'auto',   // Django for pluck leads, Ruben for rhodes/piano
     chromaRate:2,          // 1 chromatic approach every ~2 bars
-    midBank:['rhodes','wurli','marimba','clav','mid'],
-    leadBank:['bell','pluck','fm','moog'],
+    midBank:['rhodes','wurli','vibes','guitar','clav','marimba'],
+    leadBank:['bell','pluck','fm','moog','saw'],
     label:'Jazz',
   },
   pop: {
@@ -1552,8 +1571,8 @@ const STYLE_PROFILES = {
     leadMode:'saw',      // classic poly-saw lead
     hatMode:'metallic',  // standard physical cymbal model -- clean, bright
     hatGrooveOffset:0,   // on the grid
-    midBank:['mid','rhodes','xylo','clav','wurli'],
-    leadBank:['saw','moog','pluck','fm'],
+    midBank:['rhodes','guitar','xylo','clav','wurli','mid'],
+    leadBank:['saw','moog','pluck','fm','bell'],
     label:'Pop',
   },
   edm: {
@@ -1568,7 +1587,7 @@ const STYLE_PROFILES = {
     arpBias:0.75,           // 75% chance extra-instrument auto-picks arp
     arpContinuous:true,     // arp loops a scale pattern across bars
     doubleTimeBias:0.5,     // 50% chance a fresh session locks to double-time grid
-    midBank:['mid','rhodes','clav'],
+    midBank:['mid','rhodes','clav','xylo','vibes'],
     leadBank:['fm','saw','moog','pluck'],
     label:'Hip-Hop/EDM',
   },
@@ -1583,7 +1602,7 @@ const STYLE_PROFILES = {
     halftimeBias:true,     // snare only on step 12 (beat 4) — J-Dilla halftime
     snareDensity:0.5,      // drop 50% of non-backbeat snare candidates
     tempoBias:{range:[78,92], prob:0.33}, // 33% chance BPM snaps to Dilla pocket
-    midBank:['rhodes','wurli','clav','mid'],
+    midBank:['rhodes','wurli','clav','guitar','mid'],
     leadBank:['whistle','moog','pluck','fm'],
     label:'Hip-Hop',
   },
@@ -1595,7 +1614,7 @@ const STYLE_PROFILES = {
     leadMode:'whistle',  // G-Funk dog whistle / Talkbox synth
     hatMode:'tape',      // same tape-sat vibe as hip-hop
     hatGrooveOffset:0.010, // deep pocket -- G-Funk drags hard
-    midBank:['rhodes','wurli','clav'],
+    midBank:['rhodes','wurli','clav','guitar'],
     leadBank:['whistle','moog','saw','fm'],
     label:'West Coast',
   },
@@ -1607,7 +1626,7 @@ const STYLE_PROFILES = {
     leadMode:'pluck',    // Karplus-Strong pluck -- sample-like
     hatMode:'vinyl',     // dusty vinyl -- high-passed crackle, filtered noise
     hatGrooveOffset:0.004,
-    midBank:['rhodes','clav','wurli','mid'],
+    midBank:['rhodes','clav','wurli','guitar','mid'],
     leadBank:['pluck','saw','moog'],
     label:'East Coast',
   },
@@ -1622,7 +1641,7 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.005,
-    midBank:['marimba','xylo','mid','clav'],
+    midBank:['marimba','xylo','vibes','guitar','mid'],
     leadBank:['fm','moog','pluck','saw'],
     label:'African',
   },
@@ -1637,7 +1656,7 @@ const STYLE_PROFILES = {
     woodPerc:true,
     padSustain:true,
     hatGrooveOffset:0.007,
-    midBank:['mid','marimba','rhodes'],
+    midBank:['mid','marimba','vibes','guitar','rhodes'],
     leadBank:['bell','fm','pluck','moog'],
     label:'Indian',
   },
@@ -1710,7 +1729,11 @@ function synthEthnicKick(ctx,t,warp,dest,inputEnergy,mode,s){
 }
 
 function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
-  const s=drumSeedFor('kick');
+  // Kick articulation: 80% regular, 12% soft, 8% accent. Each uses the kit
+  // seed but humanized around the mean so no two kicks sound identical.
+  const rArt=Math.random();
+  const art = rArt<0.08 ? 'accent' : rArt<0.20 ? 'soft' : 'regular';
+  const s=humanizedSeed('kick', 0.10);
   const sp=styleP(); // current style profile
 
   // ── Ethnic kick modes: bongo (African call/response) and bayan (Indian bass tabla)
@@ -1718,6 +1741,9 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
     synthEthnicKick(ctx,t,warp,dest,inputEnergy,sp.kickMode,s);
     return;
   }
+  // Apply articulation to input energy (soft = quieter / less punchy, accent = opposite)
+  if(art==='soft')  inputEnergy = Math.max(0.08, inputEnergy*0.55);
+  if(art==='accent')inputEnergy = Math.min(1.00, inputEnergy*1.30+0.10);
 
   // ── Style-shaped parameters ────────────────────────────────────────────
   const f0 = styleLerp(sp.kickF0, s.pitch+inputEnergy*0.3) * warp;
@@ -1811,53 +1837,91 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   }
 }
 
-function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5){
-  const s=drumSeedFor('snare');
-  const bodyFreq=(155+s.pitch*90+inputTight*50)*warp;
+// Snare articulation picker: real drummers mix strokes. Most are regular
+// centered hits, with occasional rim-shots (bright crack), ghost notes
+// (super quiet, muffled), cross-stick rim (metal ring only), and flam
+// (two hits very close together).
+function pickSnareArticulation(inputTight){
+  const r=Math.random();
+  if(r<0.08) return 'ghost';
+  if(r<0.14) return 'rimshot';
+  if(r<0.16) return 'rim';
+  if(r<0.19) return 'flam';
+  return 'regular';
+}
+
+function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
+  // Flam: schedule a quiet leading grace note and let the main hit continue
+  if(articulation==='flam'){
+    synthSnare(ctx, t-0.028/warp, chaos, warp, dest, inputTight*0.55, 'ghost');
+    articulation='regular';
+  }
+  const art=articulation||pickSnareArticulation(inputTight);
+  const s=humanizedSeed('snare', 0.22);
+
+  // Articulation shaping
+  let bodyVol=1.0, crackVol=1.0, ringVol=1.0, tailVol=1.0;
+  let pitchMul=1.0, crackHpfMul=1.0, decayMul=1.0;
+  if(art==='ghost'){ bodyVol=0.28; crackVol=0.22; ringVol=0.10; tailVol=0.30; pitchMul=0.88; decayMul=0.55; }
+  else if(art==='rimshot'){ bodyVol=0.85; crackVol=1.90; ringVol=1.30; tailVol=0.95; pitchMul=1.10; crackHpfMul=1.20; }
+  else if(art==='rim'){ bodyVol=0.05; crackVol=0.80; ringVol=1.60; tailVol=0.12; pitchMul=1.55; crackHpfMul=1.50; decayMul=0.50; }
+
+  const bodyFreq=(155+s.pitch*90+inputTight*50)*warp*pitchMul;
   const tightness=s.tone*(0.5+inputTight*0.5);
 
-  // -- BODY: tonal thump -- unique pitch and decay per hit ------------------
-  const body=ctx.createOscillator();
-  body.type=s.color>0.5?'triangle':'sine';  // varies timbre class
-  body.frequency.setValueAtTime(bodyFreq,t);
-  body.frequency.exponentialRampToValueAtTime(bodyFreq*(0.55+s.tone*0.2),t+0.09/warp);
-  const bg=ctx.createGain();
-  bg.gain.setValueAtTime(s.punch*0.62,t);
-  bg.gain.linearRampToValueAtTime(0.0001,t+(0.13+s.decay*0.08)/warp);
-  bg.gain.setValueAtTime(0,t+(0.14+s.decay*0.08)/warp);
-  body.connect(bg);bg.connect(dest);body.start(t);body.stop(t+(0.15+s.decay*0.08)/warp);
-  autoClean(body,bg);
+  // -- BODY: tonal thump -- per-hit pitch wobble keeps it alive --------------
+  if(bodyVol>0.02){
+    const body=ctx.createOscillator();
+    body.type=s.color>0.5?'triangle':'sine';  // kit-level timbre class
+    body.frequency.setValueAtTime(bodyFreq,t);
+    body.frequency.exponentialRampToValueAtTime(bodyFreq*(0.55+s.tone*0.2),t+0.09/warp);
+    const bg=ctx.createGain();
+    const bodyDecay=(0.13+s.decay*0.08)*decayMul/warp;
+    bg.gain.setValueAtTime(s.punch*0.62*bodyVol,t);
+    bg.gain.linearRampToValueAtTime(0.0001,t+bodyDecay);
+    bg.gain.setValueAtTime(0,t+bodyDecay+0.01);
+    body.connect(bg);bg.connect(dest);body.start(t);body.stop(t+bodyDecay+0.02);
+    autoClean(body,bg);
+  }
 
   // -- RING: metallic overtone, unique ratio and decay ---------------------
-  if(s.color>0.3){  // not every hit has ring -- variation
+  if(s.color>0.3 && ringVol>0.04){
     const ring=ctx.createOscillator();ring.type='sine';
-    ring.frequency.value=bodyFreq*(1.4+s.color*0.8);  // unique ring pitch
+    // Per-hit ring pitch jitter (±4%) so consecutive rings don't lock-step
+    const ringJit = 1 + (Math.random()-0.5)*0.08;
+    ring.frequency.value=bodyFreq*(1.4+s.color*0.8)*ringJit;
     const rg=ctx.createGain();
-    rg.gain.setValueAtTime(s.color*0.22,t);
+    rg.gain.setValueAtTime(s.color*0.22*ringVol,t);
     rg.gain.linearRampToValueAtTime(0.0001,t+(0.06+s.color*0.06)/warp);
     ring.connect(rg);rg.connect(dest);ring.start(t);ring.stop(t+0.16/warp);
     autoClean(ring,rg);
   }
 
   // -- CRACK: unique noise burst -- different spectral shape every hit ------
-  // Generate noise with unique RNG seed pattern for spectral variety
-  const crLen=Math.floor(ctx.sampleRate*(0.028+tightness*0.030));
-  const crBuf=ctx.createBuffer(1,crLen,ctx.sampleRate);
-  const crD=crBuf.getChannelData(0);
-  const seed1=s.click,seed2=s.color;
-  for(let i=0;i<crLen;i++){
-    const noiseVal=(Math.random()*2-1);
-    const shape=Math.pow(1-i/crLen,0.6+seed1);
-    crD[i]=noiseVal*shape*(1+seed2*Math.sin(i*0.08+seed1*10));
+  if(crackVol>0.04){
+    const crLen=Math.floor(ctx.sampleRate*(0.028+tightness*0.030)*decayMul);
+    const crBuf=ctx.createBuffer(1,crLen,ctx.sampleRate);
+    const crD=crBuf.getChannelData(0);
+    const seed1=s.click,seed2=s.color;
+    for(let i=0;i<crLen;i++){
+      const noiseVal=(Math.random()*2-1);
+      const shape=Math.pow(1-i/crLen,0.6+seed1);
+      crD[i]=noiseVal*shape*(1+seed2*Math.sin(i*0.08+seed1*10));
+    }
+    const crack=ctx.createBufferSource();crack.buffer=crBuf;
+    const ckHpf=ctx.createBiquadFilter();ckHpf.type='highpass';
+    ckHpf.frequency.value=(2200+s.click*2800)*crackHpfMul*warp;
+    const cg=ctx.createGain();
+    cg.gain.setValueAtTime(s.click*0.90*crackVol,t);
+    cg.gain.linearRampToValueAtTime(0.0001,t+0.045*decayMul/warp);
+    crack.connect(ckHpf);ckHpf.connect(cg);cg.connect(dest);crack.start(t);
+    autoClean(crack,ckHpf,cg);
   }
-  const crack=ctx.createBufferSource();crack.buffer=crBuf;
-  const ckHpf=ctx.createBiquadFilter();ckHpf.type='highpass';ckHpf.frequency.value=(2200+s.click*2800)*warp;
-  const cg=ctx.createGain();cg.gain.setValueAtTime(s.click*0.90,t);cg.gain.linearRampToValueAtTime(0.0001,t+0.045/warp);
-  crack.connect(ckHpf);ckHpf.connect(cg);cg.connect(dest);crack.start(t);
-  autoClean(crack,ckHpf,cg);
+
+  if(tailVol<0.04){ return; } // rim / ghost may skip the wire tail
 
   // -- TAIL: snare wire noise -- unique length, brightness, and texture ------
-  const tLen=Math.floor(ctx.sampleRate*(0.16+chaos*0.12+s.decay*0.08)/warp);
+  const tLen=Math.floor(ctx.sampleRate*(0.16+chaos*0.12+s.decay*0.08)*decayMul/warp);
   const tBuf=ctx.createBuffer(2,tLen,ctx.sampleRate);  // stereo for width
   for(let ch=0;ch<2;ch++){
     const td=tBuf.getChannelData(ch);
@@ -1868,18 +1932,24 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5){
   const tail=ctx.createBufferSource();tail.buffer=tBuf;
   const hpf=ctx.createBiquadFilter();hpf.type='highpass';hpf.frequency.value=(1200+chaos*2000+s.color*1200)*warp;
   const lpf=ctx.createBiquadFilter();lpf.type='lowpass';lpf.frequency.value=(8000+s.click*6000)*warp;
-  const tg=ctx.createGain();tg.gain.setValueAtTime(s.tone*0.52,t);tg.gain.linearRampToValueAtTime(0.0001,t+(0.18+s.decay*0.10)/warp);
+  const tg=ctx.createGain();
+  tg.gain.setValueAtTime(s.tone*0.52*tailVol,t);
+  tg.gain.linearRampToValueAtTime(0.0001,t+(0.18+s.decay*0.10)*decayMul/warp);
   tail.connect(hpf);hpf.connect(lpf);lpf.connect(tg);tg.connect(dest);tail.start(t);
   autoClean(tail,hpf,lpf,tg);
 }
 
 function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7,durMult=1.0){
-  const s=drumSeedFor('hat');
+  // Humanize the hat seed per hit — small but audible tonal wobble so a run
+  // of closed hats doesn't sound like one sample retriggering.
+  const s=humanizedSeed('hat', 0.14);
   const isCrash = open && chaos > 0.68 && Math.random()<0.22;
   const isRide  = open && !isCrash && s.tone > 0.65;
   const cymType = isCrash?'crash':isRide?'ride':open?'open':'closed';
   const hatMode = styleP().hatMode || 'metallic';
-  synthCymbal(ctx, t, cymType, s, warp, dest, inputBright, velocity, hatMode, durMult);
+  // Per-hit brightness wobble — real hi-hats open/close slightly with foot pressure
+  const brJit = inputBright * (1 + (Math.random()-0.5)*0.25);
+  synthCymbal(ctx, t, cymType, s, warp, dest, brJit, velocity, hatMode, durMult);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3007,6 +3077,140 @@ function synthMarimba(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, 
   }
 }
 
+// Nylon/steel-string guitar: Karplus-Strong plucked string model. A short
+// noise burst (the pick) excites a delay line whose length equals the note
+// period; a low-pass feedback filter damps the string so each successive
+// reflection loses high frequencies. Body resonance is approximated with
+// two resonant band-passes (~100 Hz air mode + ~200 Hz top-plate mode).
+// Per-note pick position, brightness, and damping are randomized so
+// repeated pitches sound like different strokes.
+function synthGuitar(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0){
+  if(!dest)return;
+  const _dscl=Math.max(0.25, Math.min(6.0, durScale||1.0));
+  const SR=ctx.sampleRate;
+
+  const body1=ctx.createBiquadFilter(); body1.type='bandpass';
+  body1.frequency.value=100; body1.Q.value=8;
+  const body2=ctx.createBiquadFilter(); body2.type='bandpass';
+  body2.frequency.value=220; body2.Q.value=6;
+  const bodyMix=ctx.createGain(); bodyMix.gain.value=0.35;
+  const dry=ctx.createGain(); dry.gain.value=1.0;
+  body1.connect(bodyMix); body2.connect(bodyMix);
+  bodyMix.connect(dest); dry.connect(dest);
+  autoClean(body1,body2,bodyMix,dry);
+
+  (notes||[0]).forEach(function(semis, idx){
+    const freq=440*Math.pow(2,(semis-69)/12)*warp;
+    if(freq<=0||freq>2000) return;
+    // Pluck position (0.05-0.35 of string) shapes initial brightness
+    const pickPos = 0.08 + Math.random()*0.24;
+    // Karplus-Strong via ScriptProcessor-style: use a very short buffer as
+    // the initial excitation and feed it through a recursive delay + LP.
+    const period = 1/freq;
+    const dLine = ctx.createDelay(1);
+    dLine.delayTime.value = period;
+    const lp = ctx.createBiquadFilter(); lp.type='lowpass';
+    lp.frequency.value = 2200 + Math.random()*2400 + windBoost*800;
+    lp.Q.value = 0.4;
+    // Feedback gain controls decay length; randomize so each pluck rings
+    // differently
+    const fb = ctx.createGain();
+    const damp = 0.970 + Math.random()*0.022;  // 0.97-0.992
+    fb.gain.value = damp;
+    dLine.connect(lp); lp.connect(fb); fb.connect(dLine);
+
+    // Excitation: short burst of filtered noise shaped by pick position
+    const excLen = Math.floor(SR*(0.006+pickPos*0.012));
+    const excBuf = ctx.createBuffer(1, excLen, SR);
+    const eD = excBuf.getChannelData(0);
+    // Shape: early spike then comb filter via sin(2*pi*pickPos*i) — classic
+    // KS pick-position model
+    for(let i=0;i<excLen;i++){
+      const n=(Math.random()*2-1);
+      const env=Math.pow(1-i/excLen, 0.3+pickPos*0.5);
+      const comb=1-Math.cos(2*Math.PI*pickPos*(i/(excLen||1)));
+      eD[i]=n*env*comb*0.9;
+    }
+    const exc=ctx.createBufferSource(); exc.buffer=excBuf;
+
+    // Per-pluck gain envelope (stagger chord notes slightly so it sounds
+    // strummed not slammed)
+    const stagger = idx * (0.008 + Math.random()*0.010);
+    const g = ctx.createGain();
+    const durT = (0.9 + Math.random()*1.4) * _dscl / warp;
+    g.gain.setValueAtTime(0, t+stagger);
+    g.gain.linearRampToValueAtTime(0.22 + Math.random()*0.10, t+stagger+0.002);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+stagger+durT);
+
+    exc.connect(dLine); dLine.connect(g);
+    g.connect(dry); g.connect(body1); g.connect(body2);
+    exc.start(t+stagger);
+
+    autoClean(exc, dLine, lp, fb, g);
+  });
+}
+
+// Vibraphone: like marimba but with metallic inharmonic partials (3.0x,
+// 5.4x, 9.6x) and a motor-driven tremolo (vanes spinning in the resonator
+// tubes at ~6-9 Hz) that cycles amplitude of the sustain. Very long decay
+// — that's the vibraphone signature. Softer mallet than xylo.
+function synthVibes(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, durScale=1.0){
+  if(!dest)return;
+  const s=drumSeed();
+  const _dscl=Math.max(0.25, Math.min(8.0, durScale||1.0));
+  const decay = (1.4+s.decay*0.8)*_dscl/warp;
+  // Motor tremolo shared across all notes in this chord
+  const motor=ctx.createOscillator(); motor.type='sine';
+  motor.frequency.value = 6.5 + Math.random()*2.5;
+  const motorAmt=ctx.createGain(); motorAmt.gain.value = 0.28;
+  const motorOut=ctx.createGain(); motorOut.gain.value = 1.0;
+  motor.connect(motorAmt); motorAmt.connect(motorOut.gain);
+  motor.start(t); motor.stop(t+decay+0.1);
+  motorOut.connect(dest);
+  autoClean(motor,motorAmt,motorOut);
+
+  for(const semis of (notes||[0])){
+    const freq=440*Math.pow(2,(semis-69)/12)*warp;
+    if(freq<=0)continue;
+    // Fundamental (sine — vibraphone is nearly pure)
+    const f0=ctx.createOscillator(); f0.type='sine'; f0.frequency.value=freq;
+    const g0=ctx.createGain();
+    g0.gain.setValueAtTime(0.30+s.punch*0.04, t);
+    g0.gain.exponentialRampToValueAtTime(0.0001, t+decay);
+    f0.connect(g0); g0.connect(motorOut);
+    f0.start(t); f0.stop(t+decay+0.05);
+    // 3x metallic partial
+    const f1=ctx.createOscillator(); f1.type='sine';
+    f1.frequency.value = freq*(3.0 + (Math.random()-0.5)*0.06);
+    const g1=ctx.createGain();
+    g1.gain.setValueAtTime(0.11, t);
+    g1.gain.exponentialRampToValueAtTime(0.0001, t+decay*0.75);
+    f1.connect(g1); g1.connect(motorOut);
+    f1.start(t); f1.stop(t+decay*0.8);
+    // 5.4x brighter partial (vibraphone tube resonance)
+    const f2=ctx.createOscillator(); f2.type='sine';
+    f2.frequency.value = freq*5.4;
+    const g2=ctx.createGain();
+    g2.gain.setValueAtTime(0.04, t);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t+decay*0.45);
+    f2.connect(g2); g2.connect(motorOut);
+    f2.start(t); f2.stop(t+decay*0.5);
+    // Mallet click — yarn mallet, dense + soft
+    const nLen=Math.floor(ctx.sampleRate*0.010);
+    const nBuf=ctx.createBuffer(1,nLen,ctx.sampleRate);
+    const nD=nBuf.getChannelData(0);
+    for(let i=0;i<nLen;i++) nD[i]=(Math.random()*2-1)*Math.pow(1-i/nLen,1.5);
+    const ns=ctx.createBufferSource(); ns.buffer=nBuf;
+    const nBp=ctx.createBiquadFilter(); nBp.type='bandpass';
+    nBp.frequency.value=1600; nBp.Q.value=2;
+    const nG=ctx.createGain();
+    nG.gain.setValueAtTime(0.055, t); nG.gain.exponentialRampToValueAtTime(0.0001, t+0.020);
+    ns.connect(nBp); nBp.connect(nG); nG.connect(dest);
+    ns.start(t);
+    autoClean(f0,g0,f1,g1,f2,g2,ns,nBp,nG);
+  }
+}
+
 // Moog-style analog lead: 3 detuned sawtooths through a resonant lowpass
 // with an envelope that opens fast then slowly closes. Subtle saturation
 // and a fresh cutoff per note so repeated pitches don't sound identical.
@@ -3107,6 +3311,8 @@ function runMidSynth(name, ctx, t, notes, chordType, chaos, warp, dest, windBoos
     case 'clav':    return synthClav   (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
     case 'xylo':    return synthXylo   (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
     case 'marimba': return synthMarimba(ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
+    case 'vibes':   return synthVibes  (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
+    case 'guitar':  return synthGuitar (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
     case 'keys':
     case 'mid':
     default:        return synthMid    (ctx, t, notes, chordType, chaos, warp, dest, windBoost, durScale);
@@ -3879,8 +4085,25 @@ function App(){
       if(lockedIn)addLog('Mic off . Hands-free mode active.');
       else addLog('Mic off.');return;
     }
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+      addLog('[MIC] Browser has no mic API. Try Chrome/Safari.');
+      return;
+    }
+    // Some laptop mics reject detailed constraints. Try the tuned config
+    // first, fall back to the plain `{audio:true}` on OverconstrainedError.
+    const openStream=async()=>{
+      try{
+        return await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+      }catch(e){
+        if(e && (e.name==='OverconstrainedError' || e.name==='NotReadableError')){
+          addLog('[MIC] Retrying with relaxed constraints…');
+          return await navigator.mediaDevices.getUserMedia({audio:true});
+        }
+        throw e;
+      }
+    };
     try{
-      const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+      const stream=await openStream();
       if(!AR.current.ctx)AR.current.ctx=(()=>{const SR=DeviceComp.score<0.45?22050:44100;try{return new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR,latencyHint:'playback'});}catch(e){return new(window.AudioContext||window.webkitAudioContext)();}})();
       if(AR.current.ctx.state==='suspended')await AR.current.ctx.resume();
       bus.init(AR.current.ctx);
@@ -3888,8 +4111,29 @@ function App(){
       const an=AR.current.ctx.createAnalyser();an.fftSize=8192;an.smoothingTimeConstant=0.76;
       src.connect(an);AR.current.micStream=stream;AR.current.analyser=an;
       setMicActive(true);
-      addLog('Listening. Play -- AI builds band around you. Lock In then stop mic for best quality.');
-    }catch(e){addLog('Mic access denied.');}
+      // Track info for debugging — tells us what the OS actually gave us
+      const tr=stream.getAudioTracks()[0];
+      if(tr){
+        const lbl=(tr.label||'(unknown mic)').substring(0,40);
+        addLog('[MIC] Opened: '+lbl);
+      }
+      // Self-test: after ~300 ms check if any frequency data is arriving.
+      // If nothing, the OS is routing the stream to a muted device.
+      setTimeout(()=>{
+        if(!AR.current.analyser) return;
+        const fd=new Uint8Array(AR.current.analyser.frequencyBinCount);
+        AR.current.analyser.getByteFrequencyData(fd);
+        let peak=0;for(let i=0;i<fd.length;i++)if(fd[i]>peak)peak=fd[i];
+        if(peak<2) addLog('[MIC] Warning: no signal detected. Check system mic permissions / input device.');
+        else addLog('[MIC] Signal OK (peak '+peak+'/255). Play — AI follows.');
+      }, 300);
+    }catch(e){
+      const name=(e&&e.name)||'Error';
+      if(name==='NotAllowedError')      addLog('[MIC] Permission denied. Allow mic in browser/OS settings.');
+      else if(name==='NotFoundError')   addLog('[MIC] No mic found on this device.');
+      else if(name==='NotReadableError')addLog('[MIC] Mic busy. Another app is using it — close & retry.');
+      else                              addLog('[MIC] Error: '+name);
+    }
   };
 
   // -- SECTION MUTE ----------------------------------------------------------
@@ -5361,6 +5605,9 @@ function App(){
       }
       if(playS){
         const sT = time + (dp.sWobble[b16]||0) + (Math.random()-0.5)*styleP().microJitter;
+        // Backbeat hits randomly vary articulation — rim-shot on accented
+        // bars, regular on most, occasional rim or flam for spice. synthSnare
+        // picks for us if we pass undefined.
         synthSnare(ctx,sT,chaos,warpMultiplier,bus.getInput('drum'),1-ie);
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{s:true});
@@ -5392,7 +5639,7 @@ function App(){
 
       // Ghost snare (response phase) -- quiet, barely-there
       if(playGhostSnare && !sup.drum){
-        synthSnare(ctx,time+(60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25*0.5),chaos,warpMultiplier,bus.getInput('drum'),0.18);
+        synthSnare(ctx,time+(60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25*0.5),chaos,warpMultiplier,bus.getInput('drum'),0.18,'ghost');
         voices.drum.play();
       }
       // Crash cymbal on turnaround downbeat
