@@ -1,0 +1,73 @@
+name: Build and deploy to GitHub Pages
+
+# Runs on every push to main. Builds the production bundle (pre-compiled
+# Babel, static Tailwind CSS, vendored React) and deploys www/ to Pages so
+# the public site has none of the "don't use in production" console warnings
+# the dev index.html would show.
+
+on:
+  push:
+    branches: [main]
+  # Manual trigger from the Actions tab if you ever need to redeploy
+  # without a commit.
+  workflow_dispatch:
+
+# GitHub Pages deployment needs these. Without them the deploy step fails.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Avoid piling up queued deploys if two pushes land close together.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          # npm cache keyed off package-lock.json so subsequent runs are fast
+          cache: 'npm'
+
+      - name: Install build dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Fetch vendor (React, ReactDOM, Babel-standalone, Tailwind)
+        # The dev index.html still references these as CDN but the
+        # production build pipeline rewrites to vendor/ local paths, so
+        # the file needs to exist before we build.
+        run: npm run fetch-vendor
+
+      - name: Build production bundle
+        run: npm run prod
+
+      - name: Verify output exists
+        run: |
+          test -s www/index.html    || { echo "www/index.html missing"; exit 1; }
+          test -s www/app.js        || { echo "www/app.js missing"; exit 1; }
+          test -s www/tailwind.css  || { echo "www/tailwind.css missing"; exit 1; }
+          test -s www/vendor/react.production.min.js || { echo "vendored React missing"; exit 1; }
+          echo "---"
+          ls -lh www/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: www/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

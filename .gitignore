@@ -9,4 +9,3 @@ ios/
 .DS_Store
 cloud/progressions.json
 cloud/venv/
-package-lock.json
