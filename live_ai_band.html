@@ -1335,24 +1335,53 @@ function drumSeed(){return{
 // Reseed a single drum via reseedDrum('kick'|'snare'|'hat'). Velocity + timing still vary per hit.
 const _drumKit={kick:drumSeed(),snare:drumSeed(),hat:drumSeed()};
 function drumSeedFor(name){return _drumKit[name]||drumSeed();}
-function reseedDrum(name){if(_drumKit[name]!==undefined){_drumKit[name]=drumSeed();}}
+let reseedDrum=function(name){if(_drumKit[name]!==undefined){_drumKit[name]=drumSeed();}};
 
-// Kit identity stays locked, but a real drummer never hits two snares the same
-// way. `humanizedSeed` wobbles each parameter around the kit's mean so every
-// hit has organic pitch / decay / click variation without changing the drum's
-// overall character. `amount` scales the wobble envelope.
+// Sample slots: when a user drops a WAV/MP3 onto the kick / snare / hat
+// slot in the UI, we decode it into an AudioBuffer and park it here. The
+// synth routers below short-circuit to sample playback whenever a buffer
+// is present, so you can feed the band any drum break you own and the
+// groove engine drives it. Per-hit velocity is applied via gain; tiny
+// detune lives on playbackRate so repeated hits don't sound identical.
+const _drumSamples={kick:null,snare:null,hat:null};
+function setDrumSample(name, buffer){ if(_drumSamples[name]!==undefined) _drumSamples[name]=buffer; }
+function clearDrumSample(name){ if(_drumSamples[name]!==undefined) _drumSamples[name]=null; }
+function playDrumSample(name, ctx, t, dest, velocity){
+  const buf=_drumSamples[name]; if(!buf||!dest||!ctx) return false;
+  const src=ctx.createBufferSource(); src.buffer=buf;
+  // Tiny detune (±25 cents) + velocity on gain — sample stays the sample
+  // but each hit has subtle variation so it doesn't feel retriggered.
+  src.playbackRate.value = 1 + (Math.random()-0.5)*0.03;
+  const g=ctx.createGain();
+  g.gain.value = Math.max(0.05, Math.min(1.5, velocity||0.85));
+  src.connect(g); g.connect(dest);
+  src.start(t);
+  autoClean(src,g);
+  return true;
+}
+if(typeof window!=='undefined'){
+  window.setDrumSample=setDrumSample;
+  window.clearDrumSample=clearDrumSample;
+  window._drumSamples=_drumSamples;
+}
+
+// Kit identity stays locked. Drummers ARE tight — the only thing we vary per
+// hit is velocity, a tiny pitch/decay breath, and the noise grains. Anything
+// more makes the kit feel wobbly and amateur. `amount` defaults low on
+// purpose (0.06). Snare articulations (ghost/rimshot/rim/flam) do the heavy
+// lifting for expressive variation — the seed stays centered.
 function humanizedSeed(name, amount){
   const b=drumSeedFor(name);
-  const a=amount==null?0.15:amount;
+  const a=amount==null?0.06:amount;
   const j=function(k,scale){return b[k]*(1+(Math.random()-0.5)*a*(scale==null?1:scale));};
   return {
-    pitch: j('pitch',0.55),
-    punch: j('punch',1.00),
-    decay: j('decay',1.00),
-    tone:  j('tone', 0.85),
-    sub:   j('sub',  0.60),
-    click: j('click',1.25),
-    color: Math.max(0, Math.min(1, b.color + (Math.random()-0.5)*a*0.5)),
+    pitch: j('pitch',0.35),
+    punch: j('punch',0.70),
+    decay: j('decay',0.55),
+    tone:  j('tone', 0.50),
+    sub:   j('sub',  0.40),
+    click: j('click',0.80),
+    color: Math.max(0, Math.min(1, b.color + (Math.random()-0.5)*a*0.3)),
   };
 }
 if(typeof window!=='undefined'){window._drumKit=_drumKit;window.reseedDrum=reseedDrum;}
@@ -1729,11 +1758,13 @@ function synthEthnicKick(ctx,t,warp,dest,inputEnergy,mode,s){
 }
 
 function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
+  // If a user sample is loaded for the kick, play it instead of synthesis.
+  if(playDrumSample('kick', ctx, t, dest, 0.85+inputEnergy*0.20)) return;
   // Kick articulation: 80% regular, 12% soft, 8% accent. Each uses the kit
   // seed but humanized around the mean so no two kicks sound identical.
   const rArt=Math.random();
   const art = rArt<0.08 ? 'accent' : rArt<0.20 ? 'soft' : 'regular';
-  const s=humanizedSeed('kick', 0.10);
+  const s=humanizedSeed('kick', 0.05);
   const sp=styleP(); // current style profile
 
   // ── Ethnic kick modes: bongo (African call/response) and bayan (Indian bass tabla)
@@ -1948,13 +1979,20 @@ function synthSnare909(ctx, t, warp, dest, vel, s){
 }
 
 function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
+  // If a user snare sample is loaded, play it. Ghost / rim still fall
+  // through to synthesis so articulations remain expressive.
+  if(articulation!=='ghost' && articulation!=='rim' && articulation!=='flam'){
+    const vel = articulation==='rimshot' ? 1.1 : 0.90;
+    if(playDrumSample('snare', ctx, t, dest, vel)) return;
+  }
   // Flam: schedule a quiet leading grace note and let the main hit continue
   if(articulation==='flam'){
     synthSnare(ctx, t-0.028/warp, chaos, warp, dest, inputTight*0.55, 'ghost');
     articulation='regular';
   }
   const art=articulation||pickSnareArticulation(inputTight);
-  const s=humanizedSeed('snare', 0.22);
+  // Snare: tight kit wobble (8%) — articulation handles the big variation
+  const s=humanizedSeed('snare', 0.08);
 
   // Machine-preset routing: '808' and '909' are distinct synths; 'acoustic'
   // uses the detailed multi-layer model below. Ghost/rim still fall through
@@ -2047,9 +2085,22 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
 }
 
 function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7,durMult=1.0){
+  // User sample override: when a hat sample is loaded, play it at the
+  // pattern's velocity. Open-hat hits use a slightly slower playback rate
+  // to simulate an opened hat; closed hits at full rate.
+  if(_drumSamples.hat){
+    const src=ctx.createBufferSource(); src.buffer=_drumSamples.hat;
+    src.playbackRate.value = (open?0.88:1.0) * (1 + (Math.random()-0.5)*0.04);
+    const g=ctx.createGain();
+    g.gain.value = Math.max(0.1, Math.min(1.2, velocity*(open?1.1:1.0)));
+    src.connect(g); g.connect(dest);
+    src.start(t);
+    autoClean(src,g);
+    return;
+  }
   // Humanize the hat seed per hit — small but audible tonal wobble so a run
   // of closed hats doesn't sound like one sample retriggering.
-  const s=humanizedSeed('hat', 0.14);
+  const s=humanizedSeed('hat', 0.07);
   const isCrash = open && chaos > 0.68 && Math.random()<0.22;
   const isRide  = open && !isCrash && s.tone > 0.65;
   const cymType = isCrash?'crash':isRide?'ride':open?'open':'closed';
@@ -3073,7 +3124,7 @@ function synthClav(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0, dur
   // Pickup bandpass — randomized cutoff per voice for funky variety
   const pickup=ctx.createBiquadFilter(); pickup.type='bandpass';
   pickup.frequency.value = 1400 + Math.random()*1200;
-  pickup.Q.value = 2.2 + chaos*1.4;
+  pickup.Q.value = Math.min(2.6, 1.4 + chaos*0.9);
   // Gentle wah envelope on the filter (makes it talk)
   pickup.frequency.setValueAtTime(pickup.frequency.value*0.6, t);
   pickup.frequency.exponentialRampToValueAtTime(pickup.frequency.value, t+0.05);
@@ -3363,14 +3414,15 @@ function synthMoogLead(ctx, t, note, chaos, warp, dest, windBoost=0, durScale=1.
   const durT=(0.35+s.tone*0.35+windBoost*0.2+chaos*0.20)*_ls.noteLenMult*_dscl/warp;
   const freq=440*Math.pow(2,(note-69)/12)*warp;
 
-  // Resonant lowpass — this is what gives Moog its "singing" quality
+  // Resonant lowpass — this is what gives Moog its "singing" quality.
+  // Q capped at 4.5 so it doesn't self-oscillate into feedback squeal.
   const flt=ctx.createBiquadFilter(); flt.type='lowpass';
   const openHz = 1200 + Math.random()*3200 + windBoost*600;
   const closeHz = 300 + Math.random()*400;
   flt.frequency.setValueAtTime(closeHz, t);
   flt.frequency.exponentialRampToValueAtTime(openHz, t+0.02);       // fast open
   flt.frequency.exponentialRampToValueAtTime(closeHz*1.3, t+durT*0.9); // slow close
-  flt.Q.value = 4 + chaos*5 + Math.random()*3;
+  flt.Q.value = Math.min(4.5, 1.8 + chaos*1.6 + Math.random()*1.2);
 
   // Soft saturation for warmth
   const sat=ctx.createWaveShaper();
@@ -3615,7 +3667,7 @@ function synthMid(ctx,t,notes,chordType,chaos,warp,dest,windBoost=0,durScale=1.0
     const fClose=(300+dark*400+chaos*200)*warp;
     flt.frequency.setValueAtTime(fOpen,t);
     flt.frequency.linearRampToValueAtTime(fClose,t+susT*0.6);
-    flt.Q.value=0.8+s.punch*2.2+chaos*1.4;
+    flt.Q.value=Math.min(2.6, 0.8+s.punch*1.2+chaos*0.7);
 
     // Envelope
     const g=ctx.createGain();
@@ -3676,7 +3728,7 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
     const detuneSpread=5+s.color*18+chaos*12;
     const fOpen=(900+chaos*3800+s.punch*1200+windBoost*600)*warp;
     const fClose=(200+s.tone*400+windBoost*200)*warp;
-    const fQ=1.2+chaos*4.5+s.color*2.0;
+    const fQ=Math.min(3.5, 1.2+chaos*1.8+s.color*1.0);
     const master=ctx.createGain();
     const flt=ctx.createBiquadFilter();flt.type='lowpass';
     flt.frequency.setValueAtTime(fOpen,t+portTime*0.5);
@@ -3915,6 +3967,28 @@ function App(){
   const[guideVisible,setGuideVisible]=useState(true);
   const[isPlaying,setIsPlaying]=useState(false);
   const[lockedIn,setLockedIn]=useState(false);
+  // Sample slot names (shown in UI when the user has dropped a WAV/MP3 in)
+  const[sampleNames,setSampleNames]=useState({kick:null,snare:null,hat:null});
+  const loadDrumSample=useCallback(async(slot,file)=>{
+    if(!file) return;
+    try{
+      if(!AR.current.ctx){
+        const SR=DeviceComp.score<0.45?22050:44100;
+        try{ AR.current.ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR,latencyHint:'playback'}); }
+        catch(e){ AR.current.ctx=new(window.AudioContext||window.webkitAudioContext)(); }
+      }
+      const ab=await file.arrayBuffer();
+      const buf=await AR.current.ctx.decodeAudioData(ab);
+      setDrumSample(slot, buf);
+      setSampleNames(prev=>({...prev,[slot]:file.name.replace(/\.[^.]+$/,'').substring(0,18)}));
+      addLog('[SAMPLE] '+slot+': '+file.name);
+    }catch(e){ addLog('[SAMPLE] decode failed: '+(e.message||'error')); }
+  },[]);
+  const removeDrumSample=useCallback((slot)=>{
+    clearDrumSample(slot);
+    setSampleNames(prev=>({...prev,[slot]:null}));
+    addLog('[SAMPLE] '+slot+' cleared — synth engine resumed.');
+  },[]);
   const[chaos,setChaos]=useState(0.32);
   const[density,setDensity]=useState(0.55);
   const[swing,setSwing]=useState(20);
@@ -5903,7 +5977,11 @@ function App(){
       const _respBoost = ar._callResponseDue ? 1.6 : 1.0;
       const _vampBoost = ar._vampMode ? 1.20 : 1.0;
       const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost;
-      if(Math.random()<prob){
+      // Guaranteed downbeat hit on bar 0: makes the rotating synth bank
+      // audible every 4 measures even at low density/chaos. Skips only if
+      // the user is actively playing (so we leave them space).
+      const _forceDownbeat = beat===0 && !ar._userIsActive && !ar._quietBar;
+      if(_forceDownbeat || Math.random()<prob){
         // Voicing rotation: chord shape shifts every 2 measures so the mid
         // voice never plays the same spacing twice in a row.
         const learnedVoicing = brain.suggestVoicing(chordType);
@@ -7274,6 +7352,33 @@ function App(){
           className="px-2 py-1 bg-slate-800/60 hover:bg-amber-500/20 border border-slate-700 hover:border-amber-500/40 rounded text-slate-300 hover:text-amber-200 uppercase tracking-widest">
           {'\u{1F3B2}'} Band
         </button>
+      </div>
+
+      {/* SAMPLE LOADER -- drop any WAV/MP3 into kick / snare / hat and the
+          band plays that instead of the synth. Use royalty-free breaks
+          from freesound.org, Splice, or anything you own the rights to. */}
+      <div className="bg-[#0b1120] border border-slate-800/60 rounded-xl p-2">
+        <div className="text-[9px] text-amber-400 uppercase tracking-widest font-bold mb-1.5">Samples — drop WAV/MP3</div>
+        <div className="grid grid-cols-3 gap-2">
+          {['kick','snare','hat'].map(slot=>(
+            <label key={slot}
+              onDragOver={e=>{e.preventDefault();}}
+              onDrop={e=>{e.preventDefault();const f=e.dataTransfer.files&&e.dataTransfer.files[0];if(f)loadDrumSample(slot,f);}}
+              className={"cursor-pointer relative border rounded px-2 py-2 text-center text-[9px] uppercase tracking-widest transition-all "+(sampleNames[slot]?'bg-emerald-500/10 border-emerald-500/40 text-emerald-300':'bg-slate-800/40 border-slate-700 border-dashed text-slate-500 hover:border-amber-500/40 hover:text-amber-300')}>
+              <input type="file" accept="audio/*" className="hidden"
+                onChange={e=>{const f=e.target.files&&e.target.files[0];if(f)loadDrumSample(slot,f);e.target.value='';}}/>
+              <div className="font-bold">{slot}</div>
+              <div className="text-[8px] font-mono mt-0.5 truncate">
+                {sampleNames[slot] ? sampleNames[slot] : 'drop / click'}
+              </div>
+              {sampleNames[slot] && (
+                <button onClick={e=>{e.preventDefault();e.stopPropagation();removeDrumSample(slot);}}
+                  className="absolute top-0 right-1 text-[9px] text-rose-400 hover:text-rose-300">×</button>
+              )}
+            </label>
+          ))}
+        </div>
+        <div className="text-[8px] text-slate-600 mt-1.5">Synth engine is used when a slot is empty. Short one-shots work best.</div>
       </div>
 
     </div>)}
