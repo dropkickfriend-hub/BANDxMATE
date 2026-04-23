@@ -71,6 +71,28 @@ window.onunhandledrejection = function(e) {
 window._externalBpm   = null;   // set by postMessage from simcolt parent
 window._fpsSyncActive = false;
 
+// Global uncaught-error logger — without this, runtime throws show up as
+// opaque "app.js col 12345" in the user's browser. This handler prints a
+// readable stack trace to the console so we can see which synth / block
+// failed. Also throttles repeats so one error per tick doesn't spam.
+(function(){
+  const _seen = new Map();
+  window.addEventListener('error', function(ev){
+    try{
+      const msg = (ev && ev.error && ev.error.stack) ? ev.error.stack : (ev.message || 'Unknown');
+      const key = (ev && ev.message ? ev.message : '') + ':' + (ev && ev.lineno ? ev.lineno : '');
+      const count = (_seen.get(key) || 0) + 1;
+      _seen.set(key, count);
+      if(count <= 3 || count % 50 === 0){
+        console.error('[BANDX UNCAUGHT ' + count + 'x]\n' + msg);
+      }
+    }catch(_){}
+  });
+  window.addEventListener('unhandledrejection', function(ev){
+    try{ console.error('[BANDX PROMISE REJECT]\n' + (ev.reason && ev.reason.stack ? ev.reason.stack : ev.reason)); }catch(_){}
+  });
+})();
+
 window.addEventListener('message', function(e) {
   if (!e.data || e.data.type !== 'BAND_BPM_SYNC') return;
   var bpm = parseInt(e.data.bpm);
