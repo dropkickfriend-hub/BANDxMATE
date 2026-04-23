@@ -5189,6 +5189,34 @@ function App(){
     if(beat===0){
       ar.measureCount=(ar.measureCount||0)+1;
       flushBarQueue(); // Apply queued user inputs at bar boundary
+
+      // -- LIVE MIC REACTIVITY: call/response + vamp detection ---------------
+      // Runs at every bar boundary. `_userIsActive` is true if the user hit
+      // a mic onset in the last ~1.5 seconds. Consecutive active bars pile
+      // up into vamp mode; a bar going silent right after activity triggers
+      // a band response on this very bar.
+      const _nowSec = ctx.currentTime;
+      const _userFresh = ar._userLastOnsetAt != null && (_nowSec - ar._userLastOnsetAt) < 1.5;
+      ar._userIsActive = _userFresh;
+      const _wasActive = !!ar._userWasActiveLastBar;
+      if(_userFresh){
+        ar._userActiveBars = (ar._userActiveBars||0) + 1;
+        ar._userSilentBars = 0;
+      } else {
+        ar._userSilentBars = (ar._userSilentBars||0) + 1;
+        ar._userActiveBars = Math.max(0, (ar._userActiveBars||0) - 1);
+      }
+      // Vamp mode: user has been playing consistently for 3+ bars → band
+      // locks into the current chord longer and fills more.
+      ar._vampMode = (ar._userActiveBars||0) >= 3;
+      // Call/response: user just stopped playing after being active → next
+      // bar is the band's turn to answer.
+      ar._callResponseDue = _wasActive && !_userFresh && (ar._userSilentBars===1);
+      ar._userWasActiveLastBar = _userFresh;
+      if(ar._callResponseDue) addLog('[RESPOND] Band answering…');
+      if(ar._vampMode && !ar._vampLogged){ ar._vampLogged=true; addLog('[VAMP] Locked in with you.'); }
+      if(!ar._vampMode) ar._vampLogged=false;
+
       ar.measuresThisChord=(ar.measuresThisChord||0)+1;
       // Motif phase: call(1-2) / response(3) / turnaround(4) within each phrase
       ar._motifPhase = structureEngine.motifPhase(ar.measuresThisChord);
@@ -5323,6 +5351,10 @@ function App(){
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{k:true});
         if(hapticModeRef.current==='bass'||deafModeRef.current)hap.kick();else hap.tap();
+        // Band-onset log so mic analysis can reject speaker-bleed from
+        // being counted as user input.
+        if(!ar._bandOnsets) ar._bandOnsets=[];
+        ar._bandOnsets.push(kT); if(ar._bandOnsets.length>32) ar._bandOnsets.shift();
         // Exclusion principle: flag that a strong drum hit just fired; melodic voices duck
         window._isDrumHitting=true; clearTimeout(window._isDrumHittingTimer);
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
@@ -5333,6 +5365,8 @@ function App(){
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{s:true});
         if(hapticModeRef.current==='rhythm')hap.snare();
+        if(!ar._bandOnsets) ar._bandOnsets=[];
+        ar._bandOnsets.push(sT); if(ar._bandOnsets.length>32) ar._bandOnsets.shift();
         // Exclusion principle: snare also triggers the flag
         window._isDrumHitting=true; clearTimeout(window._isDrumHittingTimer);
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
@@ -5443,7 +5477,12 @@ function App(){
       const midMotifMod = isCall?1.2 : isResponse?0.6 : isTurnaround?1.4 : 1.0;
       // Exclusion principle: when kick/snare is sounding, mid ducks hard (80% chance to rest)
       const midExclusion = window._isDrumHitting ? 0.18 : 1.0;
-      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion;
+      // Live-mic reactivity: duck when user is playing, boost on the response
+      // bar so the band audibly answers the user's phrase.
+      const _userDuck = ar._userIsActive ? 0.55 : 1.0;
+      const _respBoost = ar._callResponseDue ? 1.6 : 1.0;
+      const _vampBoost = ar._vampMode ? 1.20 : 1.0;
+      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost;
       if(Math.random()<prob){
         // Voicing rotation: chord shape shifts every 2 measures so the mid
         // voice never plays the same spacing twice in a row.
@@ -5502,7 +5541,11 @@ function App(){
     if(!sup.lead&&!mutes.lead&&leadOpts.length){
       // Exclusion principle: lead ducks even harder than mid when drums hit (90% rest)
       const leadExclusion = window._isDrumHitting ? 0.10 : 1.0;
-      const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion;
+      // Live-mic reactivity: the lead defers hard to the user (0.35 when user
+      // is active), then answers back with a ~2× boost on the response bar.
+      const _leadDuck = ar._userIsActive ? 0.35 : 1.0;
+      const _leadResp = ar._callResponseDue ? 2.0 : 1.0;
+      const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp;
       if(Math.random()<prob){
         // Expanded note pool: full diatonic scale + chord tones + chromatic
         // approaches + octave jumps + blue notes. Prevents the 6-note menu
@@ -5767,25 +5810,49 @@ function App(){
         c.fillStyle=phase<0.06?'rgba(255,55,55,.95)':'rgba(255,255,255,.4)';c.fillRect(tx-1,H-7,2,7);
       }
 
-      // -- MIC ANALYSIS -- throttled on weak devices --------------------------
-      if(micActive&&AR.current.analyser&&(DeviceComp.score>0.4||frame%2===0)){
+      // -- MIC ANALYSIS -- runs every frame so onsets aren't missed ---------
+      // Adaptive noise-floor tracking + band-onset rejection so the mic
+      // doesn't mistake the band's own speaker output for user playing.
+      if(micActive&&AR.current.analyser){
         const an=AR.current.analyser;const fd=new Uint8Array(an.frequencyBinCount);an.getByteFrequencyData(fd);
         let rms=0,maxIdx=0,maxVal=0;
         for(let i=0;i<fd.length;i++){rms+=fd[i]*fd[i];if(fd[i]>maxVal){maxVal=fd[i];maxIdx=i;}}
         rms=Math.sqrt(rms/fd.length);
         AR.current.inputEnergy=rms/128;setInputEnergy(Math.min(1,rms/100));
 
+        // Adaptive noise floor: slow-decay EMA of the quietest ~15% of frames.
+        // Threshold = floor + margin; adapts to room / mic sensitivity.
+        AR.current._micFloor = AR.current._micFloor==null ? rms : (AR.current._micFloor*0.995 + Math.min(rms, AR.current._micFloor*1.05)*0.005);
+        const micFloor = AR.current._micFloor||0;
+        const onsetThreshold = Math.max(8, micFloor + 10);
+
         const now2=Date.now();
-        const isOnset=rms>20&&rms>AR.current.previousEnergy*1.42&&(now2-AR.current.lastOnset)>120;
+        const ctxNow = AR.current.ctx ? AR.current.ctx.currentTime : now2/1000;
+
+        // Band-onset rejection: each scheduled kick/snare pushes its start
+        // time into ar._bandOnsets. Reject detected onsets that fall within
+        // 70 ms of any band hit (± speaker latency) — that's the band bleed.
+        const bandOnsets = AR.current._bandOnsets || [];
+        let bandBleed = false;
+        for(let i=bandOnsets.length-1; i>=0 && i>bandOnsets.length-12; i--){
+          if(Math.abs(ctxNow - bandOnsets[i]) < 0.070){ bandBleed=true; break; }
+        }
+
+        const isOnset = rms>onsetThreshold && rms>AR.current.previousEnergy*1.32 && (now2-AR.current.lastOnset)>100 && !bandBleed;
         if(isOnset){
           const delta=now2-AR.current.lastOnset;AR.current.lastOnset=now2;onsetRate++;
           motifEng.addOnset(now2);
+          // User-activity tracking: scheduler reads these to duck the band
+          // when the user is singing and to trigger a response on silence.
+          AR.current._userLastOnsetAt = ctxNow;
+          AR.current._userIsActive = true;
           const result=motifEng._analyzeRhythm();
           if(result&&!lockedRef.current){
             const{bpm:ab,swingPct,subdivisions:sub}=result;
             if(ab>=40&&ab<=250){
-              if(Math.abs(ab-AR.current.bpm)>10&&frame%12===0){addLog(`TEMPO: ${ab} BPM`);setTCFlag(true);setTimeout(()=>setTCFlag(false),1500);}
-              if(Math.abs(ab-AR.current.bpm)>3){AR.current.bpm=ab;if(frame%18===0)setBpm(ab);}
+              if(Math.abs(ab-AR.current.bpm)>6&&frame%10===0){addLog(`TEMPO: ${ab} BPM`);setTCFlag(true);setTimeout(()=>setTCFlag(false),1500);}
+              // Tighter snap: 2 BPM delta, UI update every 12 frames
+              if(Math.abs(ab-AR.current.bpm)>2){AR.current.bpm=ab;if(frame%12===0)setBpm(ab);}
             }
             if(swingPct>0&&frame%20===0){setSwing(swingPct);AR.current.swing=swingPct;setDSwing(swingPct);}
             if(sub>2&&frame%40===0)setSubdivisions(sub);
@@ -6580,9 +6647,28 @@ function App(){
               onChange={e=>{const v=parseInt(e.target.value);setDMidi(v);AR.current.rootMidi=v;}}/>}
           </div>
           <button onClick={toggleMic}
-            className={"w-full py-2 rounded-lg text-[10px] font-bold tracking-widest uppercase border transition-all "+(micActive?'bg-rose-500/10 text-rose-400 border-rose-500/40':'bg-cyan-500/10 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/20')}>
+            className={"w-full py-2 rounded-lg text-[10px] font-bold tracking-widest uppercase border transition-all flex items-center justify-center gap-2 "+(micActive?'bg-rose-500/10 text-rose-400 border-rose-500/40':'bg-cyan-500/10 text-cyan-400 border-cyan-500/30 hover:bg-cyan-500/20')}>
+            {micActive && (
+              <span
+                style={{
+                  width: 8, height: 8, borderRadius: 999,
+                  background: inputEnergy>0.04 ? '#34d399' : '#64748b',
+                  boxShadow: inputEnergy>0.04 ? '0 0 '+(4+inputEnergy*20)+'px #34d399' : 'none',
+                  transition: 'box-shadow 80ms linear, background 120ms linear'
+                }}
+              />
+            )}
             {micActive?'Stop Mic':'Open Mic'}
+            {micActive && <span className="text-[7px] text-slate-400 font-mono">{Math.round(inputEnergy*100)}</span>}
           </button>
+          {micActive && (
+            <div className="flex items-center justify-between text-[7px] font-mono text-slate-500">
+              <span>{bpm} BPM · {midiToNote(detectedMidi)} · {currentChord}</span>
+              <span className={AR.current._userIsActive?'text-emerald-400':'text-slate-600'}>
+                {AR.current._callResponseDue ? 'RESPOND' : AR.current._vampMode ? 'VAMP' : AR.current._userIsActive ? 'YOU' : 'LISTEN'}
+              </span>
+            </div>
+          )}
           <button onClick={handleLockIn}
             className={"w-full py-1.5 rounded-lg text-[10px] font-bold tracking-widest uppercase border transition-all "+(lockedIn?'bg-cyan-500/12 text-cyan-300 border-cyan-500/45 locked':'bg-slate-800/60 text-slate-400 border-slate-700 hover:border-cyan-500/30')}>
             {lockedIn?'[lock] Locked In':'[unlock] Lock In Groove'}
