@@ -1404,21 +1404,45 @@ const motifEng=new MotifEngine();
       console.warn('[AudioParam] non-finite ' + kind + ' = ' + v + ' — ' + stack);
     }catch(_){}
   };
+  // Variadic wrapper — Web Audio AudioParam methods have different
+  // arities: setTargetAtTime takes (value, time, timeConstant) while
+  // linear/exponential ramps take (value, time). Pass all received
+  // arguments through so method signatures match.
   const wrap = (name, defaultVal) => {
     const orig = AudioParam.prototype[name];
     if(!orig) return;
-    AudioParam.prototype[name] = function(value, time){
-      if(typeof value !== 'number' || !Number.isFinite(value)){
-        _report(name, value);
-        value = defaultVal;
+    AudioParam.prototype[name] = function(){
+      const args = [].slice.call(arguments);
+      // First arg is always the value
+      if(args.length >= 1){
+        const value = args[0];
+        if(typeof value !== 'number' || !Number.isFinite(value)){
+          _report(name, value);
+          args[0] = defaultVal;
+        }
+        // exponentialRampToValueAtTime rejects zero / negative
+        if(name === 'exponentialRampToValueAtTime' && args[0] <= 0){
+          args[0] = 0.00001;
+        }
       }
-      if(typeof time !== 'number' || !Number.isFinite(time)){
-        _report(name+'(time)', time);
-        time = 0;
+      // Second arg is time (for all four patched methods)
+      if(args.length >= 2){
+        const time = args[1];
+        if(typeof time !== 'number' || !Number.isFinite(time)){
+          _report(name+'(time)', time);
+          args[1] = 0;
+        }
       }
-      // exponentialRampToValueAtTime can't take 0 either
-      if(name === 'exponentialRampToValueAtTime' && value <= 0) value = 0.00001;
-      return orig.call(this, value, time);
+      // Third arg (setTargetAtTime only: timeConstant) passes through,
+      // but guard against NaN there too.
+      if(args.length >= 3){
+        const tc = args[2];
+        if(typeof tc !== 'number' || !Number.isFinite(tc) || tc <= 0){
+          _report(name+'(timeConstant)', tc);
+          args[2] = 0.01;
+        }
+      }
+      return orig.apply(this, args);
     };
   };
   wrap('setValueAtTime', 0);
