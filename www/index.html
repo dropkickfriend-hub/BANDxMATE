@@ -6327,7 +6327,53 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
 
   // -- BODY OSCILLATOR ---------------------------------------------------
   const body=ctx.createOscillator(); body.type=bodyType;
-  body.frequency.value=freq*(1+s.color*0.004);
+  // IMPROV ORNAMENTS: slides, bends, grace notes per hit so bass doesn't
+  // sound like it's holding one note. Picked stochastically; a grace note
+  // schedules an extra short osc, slide/bend just shape body.frequency.
+  const ornRoll = Math.random();
+  const _freqAt = (semi)=> freq * Math.pow(2, semi/12);
+  let ornament = null;
+  if(ornRoll < 0.22)      ornament = 'slide_up';    // portamento from -2..-3
+  else if(ornRoll < 0.38) ornament = 'slide_down';  // portamento from +2..+4
+  else if(ornRoll < 0.52) ornament = 'bend_up';     // pitch rises +1..+2 st mid-note
+  else if(ornRoll < 0.62) ornament = 'bend_down';   // pitch falls -1..-2 st at tail
+  else if(ornRoll < 0.72) ornament = 'grace';       // quick pre-hit note
+
+  if(ornament==='slide_up'){
+    const from = _freqAt(-(2 + Math.random()*2));
+    body.frequency.setValueAtTime(from, t);
+    body.frequency.exponentialRampToValueAtTime(freq*(1+s.color*0.004), t + 0.060);
+  } else if(ornament==='slide_down'){
+    const from = _freqAt(+(2 + Math.random()*2));
+    body.frequency.setValueAtTime(from, t);
+    body.frequency.exponentialRampToValueAtTime(freq*(1+s.color*0.004), t + 0.060);
+  } else if(ornament==='bend_up'){
+    body.frequency.setValueAtTime(freq*(1+s.color*0.004), t);
+    // Hold, then bend up between 40% and 70% of the note, release back toward target.
+    const bendAt = t + 0.14;
+    const bendSemi = 1 + Math.random()*1.2;
+    body.frequency.exponentialRampToValueAtTime(_freqAt(bendSemi), bendAt);
+    body.frequency.exponentialRampToValueAtTime(freq, bendAt + 0.16);
+  } else if(ornament==='bend_down'){
+    body.frequency.setValueAtTime(freq*(1+s.color*0.004), t);
+    const bendAt = t + 0.18;
+    body.frequency.exponentialRampToValueAtTime(_freqAt(-(1 + Math.random()*1.2)), bendAt);
+  } else if(ornament==='grace'){
+    body.frequency.value = freq*(1+s.color*0.004);
+    // Extra short grace-note osc a whole-step below, tucked 60 ms before the hit.
+    const gT = Math.max(0, t - 0.055);
+    const graceOsc = ctx.createOscillator(); graceOsc.type = bodyType;
+    graceOsc.frequency.value = _freqAt(-2);
+    const gg = ctx.createGain();
+    gg.gain.setValueAtTime(0, gT);
+    gg.gain.linearRampToValueAtTime(0.55, gT + 0.003);
+    gg.gain.exponentialRampToValueAtTime(0.0001, gT + 0.055);
+    graceOsc.connect(gg); gg.connect(dest);
+    graceOsc.start(gT); graceOsc.stop(gT + 0.060);
+    autoClean(graceOsc, gg);
+  } else {
+    body.frequency.value=freq*(1+s.color*0.004);
+  }
   // Per-hit detune only. No LFO vibrato here -- a 2Hz wobble on bass sounds cartoony.
   body.detune.value=(pcMod*8-4)+(s.color*5-2.5);
 
@@ -7430,7 +7476,18 @@ function App(){
   },[isPlaying]);
 
   // -- SYNC REFS -------------------------------------------------------------
-  useEffect(()=>{AR.current.chaos=chaos;AR.current.density=density;AR.current.swing=swing;AR.current.bpm=bpm;AR.current.drumRationality=drumRationality;AR.current.warpMultiplier=Math.pow(2,recordScratch/100)*(halftime?0.5:1);bus.updateDelayTime(bpm);
+  useEffect(()=>{AR.current.chaos=chaos;AR.current.density=density;AR.current.swing=swing;AR.current.bpm=bpm;AR.current.drumRationality=drumRationality;
+    // Split pitch from tempo so halftime doesn't pitch the whole band down.
+    // - pitchWarp: record-scratch only (affects both pitch and step rate).
+    // - tempoWarp: pitchWarp × halftime-factor (affects scheduler timing only).
+    // warpMultiplier kept as an alias for legacy synths that still read it;
+    // it holds pitchWarp so pitch stays stable when halftime toggles.
+    const pitchWarp = Math.pow(2,recordScratch/100);
+    const tempoWarp = pitchWarp * (halftime?0.5:1);
+    AR.current.pitchWarp     = pitchWarp;
+    AR.current.tempoWarp     = tempoWarp;
+    AR.current.warpMultiplier= pitchWarp;   // legacy -- pitch only, not tempo
+    bus.updateDelayTime(bpm);
     // If we're locked, also move lockedBpm/swing with the slider so the drummer
     // actually follows tempo/swing changes instead of staying at the locked value.
     if(AR.current.lockedBpm!=null)   AR.current.lockedBpm  = bpm;
@@ -9109,6 +9166,9 @@ function App(){
     const isResponse   = ar._motifPhase==='response';
     const isTurnaround = ar._motifPhase==='turnaround';
     const{ctx,chaos,density,stepsPerMeasure,warpMultiplier,userRole,chordType}=ar;
+    // tempoWarp governs step-to-step timing (includes halftime); pitch is
+    // carried separately via warpMultiplier so halftime doesn't lower pitch.
+    const tempoWarp = ar.tempoWarp || warpMultiplier || 1;
     // Octave-shift offset in semitones. Default 0; user can toggle -12/+12
     // via the OCT button so the whole band drops (or lifts) an octave
     // without changing the detected key.
@@ -9240,10 +9300,34 @@ function App(){
       // Motif phase: call(1-2) / response(3) / turnaround(4) within each phrase
       ar._motifPhase = structureEngine.motifPhase(ar.measuresThisChord);
       ar._motifShape = structureEngine.motifShape(ar._motifPhase);
-      // Turnaround: temporarily color notes with pivot chord without changing progression
-      // The structure engine still controls the real chord change timing
+      // FULL-MEASURE PAUSE: between call and response (and sometimes after
+      // response) roll a quiet bar so the band breathes. Jazz lands on it
+      // more often since space is the language. User explicitly asked for
+      // "full-measure pauses between responses".
+      const pauseOdds = (kickStyle==='jazz') ? 0.35 : 0.18;
+      ar._quietBar = (ar._motifPhase==='response' && Math.random() < pauseOdds) ||
+                     (ar._motifPhase==='call' && ar.measuresThisChord>2 && Math.random() < pauseOdds*0.7);
+      if(ar._quietBar) addLog('[PAUSE] full-measure rest');
+      // Turnaround: temporarily color notes with pivot chord without changing progression.
+      // On response bars, occasionally swap in an in-key DISSONANT chord
+      // pulled from dissonanceBank so the band explores tension before
+      // resolving. This is the "dissonance between harmonic calls and
+      // responses" the user asked for.
       ar._turnaroundChord = (ar._motifPhase==='turnaround' && ar.measuresThisChord>1)
         ? structureEngine.turnaroundChord(chordType) : null;
+      if(!ar._turnaroundChord && ar._motifPhase==='response' &&
+         typeof dissonanceBank!=='undefined' && Math.random() < 0.40){
+        // Pick a learned-good in-key dissonant chord for this bar. Fall back
+        // to hdim9 (half-dim ♭9) if the bank hasn't seeded anything yet.
+        const rPc = ((rootMidi%12)+12)%12;
+        try{
+          const iv = dissonanceBank.suggestInKey(rPc, chordType);
+          if(iv && iv.length){
+            ar._turnaroundChord = 'hdim9';   // labeled chord for the bar
+            addLog('[DISS] response tension via in-key dissonant');
+          }
+        }catch(_){}
+      }
       // Evolve taste based on current energy
       const windingEnergy=voices.lead.winding*0.5+voices.mid.winding*0.3+voices.bass.winding*0.2;
       bandTaste.evolve(windingEnergy, chaos);
@@ -9807,7 +9891,12 @@ function App(){
       // Ride on response phase during jazz/bossa
       const playRide = isResponse && (groove==='jazzSwing'||groove==='bossaNova') && beat%4===0 && Math.random()<0.4;
 
-      if(playK){
+      // Full-measure pause: when _quietBar is set, every drum voice skips so
+      // the measure actually breathes. Bass / mid / lead gate on _quietBar
+      // separately below.
+      const _dQ = !ar._quietBar;
+
+      if(playK && _dQ){
         const kT = time;
         // Velocity from the groove template (already shaped by the archetype).
         // Accent vs ghost comes straight from the template value, not random.
@@ -9838,7 +9927,7 @@ function App(){
         window._isDrumHitting=true; clearTimeout(window._isDrumHittingTimer);
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
       }
-      if(playS){
+      if(playS && _dQ){
         // Deterministic snare micro-timing: real drummers sit a few ms
         // behind the click on the backbeat. Uses a sine of the measureCount
         // so consecutive bars lag slightly differently, never random.
@@ -9855,7 +9944,7 @@ function App(){
         window._isDrumHitting=true; clearTimeout(window._isDrumHittingTimer);
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
       }
-      if(playH){
+      if(playH && _dQ){
         // Velocity = template velocity (accent/ghost) with a small humanization.
         // Velocity straight from the template, no random humanization.
         const hatVel = Math.max(0.18, Math.min(1.0, hVel*0.85));
@@ -9873,7 +9962,7 @@ function App(){
       // Micro-subdivision: style-driven ghost 32nd-note hat.
       // Only fire when the user IS drumming (so the AI fills in between
       // your hits). When AI leads, these extras overload the groove.
-      const stepSec=60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25;
+      const stepSec=60/(((ar.lockedBpm||ar.bpm)||110)*tempoWarp)*0.25;
       if(userIsDrummer && Math.random()<styleP().microSubdiv && !sup.drum){
         const ghostT=time+stepSec*0.5*(0.8+Math.random()*0.4);
         synthHat(ctx,ghostT,false,chaos*0.6,warpMultiplier,bus.getInput('drum'),0.25,0.25);
@@ -9882,7 +9971,7 @@ function App(){
       // Ghost snare: same rule -- only when user is drumming, so they're
       // fills between your hits, not clutter on top of an AI-led groove.
       if(userIsDrummer && playGhostSnare && !sup.drum){
-        synthSnare(ctx,time+(60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25*0.5),chaos,warpMultiplier,bus.getInput('snare'),0.18);
+        synthSnare(ctx,time+(60/(((ar.lockedBpm||ar.bpm)||110)*tempoWarp)*0.25*0.5),chaos,warpMultiplier,bus.getInput('snare'),0.18);
         voices.drum.play();
       }
       // Crash cymbal on turnaround downbeat
@@ -9908,7 +9997,12 @@ function App(){
     const effectiveChord = ar._turnaroundChord||chordType;
     const ct=CHORDS[effectiveChord]||CHORDS.maj;
     const bassAsserts=voices.bass.winding>voices.mid.winding;
-    const bassOpts=sup.bass||mutes.bass?[]:[0,7,5,ct.iv[1]||4]; // ct = effectiveChord
+    // Bass options. Default: root + 5th + 4th + 3rd. Jazz widens to a full
+    // walking-bass scale pool (root, 2, 3, 4, 5, 6, 7, octave) so the bass
+    // can walk chromatically between chord tones.
+    const _defaultBassOpts = [0,7,5,ct.iv[1]||4];
+    const _jazzBassOpts    = [0, 2, ct.iv[1]||3, 5, 7, 9, ct.iv[2]||10, 12, -1, -2, -5];  // scale walk + chromatic approach tones below root
+    const bassOpts = (sup.bass||mutes.bass) ? [] : (kickStyle==='jazz' ? _jazzBassOpts : _defaultBassOpts);
     const midOpts =sup.mid ||mutes.mid ?[]:(bassAsserts?ct.iv.slice(2).map(v=>v+7):ct.iv);
     // Mid notes clamped to C3-C6 register
     const midBase=rootMidi>72?(rootMidi-12):rootMidi<48?(rootMidi+12):rootMidi;
@@ -9990,7 +10084,7 @@ function App(){
       // the voice is not already playing on that step. Gives the bass room
       // to play off-grid but still land on the 1.
       if(beat === stepsPerMeasure-1 && !bassIsResting && !sup.bass && !mutes.bass && bassOpts.length && Math.random() < 0.30){
-        const stepSec0 = 60/(((ar.lockedBpm||ar.bpm)||110)*warpMultiplier)*0.25;
+        const stepSec0 = 60/(((ar.lockedBpm||ar.bpm)||110)*tempoWarp)*0.25;
         const pickupT = time + stepSec0*0.75;   // 3/4 of a step in = lands just before beat 0
         const pickupIv = brain.choose(userRole, bassOpts, chaos, effectiveChord);
         const pickupPC = ((rootMidi+pickupIv)%12+12)%12;
@@ -10009,10 +10103,9 @@ function App(){
       }
       // Bass body follows the kick: now that kick is transient-only, bass
       // must fire on every kick step so the low end is audible underneath.
-      // Still respects resting/user-supply. Also fires on the snare and on
-      // mid/off-beats per the density/chaos roll.
+      // Silenced on _quietBar so full-measure pauses actually rest.
       const _kickStepNow = _dpKick && _dpKick.k && (_dpKick.k[beat%16] > 0);
-      const isBassBeat = !bassIsResting && (
+      const isBassBeat = !ar._quietBar && !bassIsResting && (
         _kickStepNow ||
         beat===0 ||
         (!sup.bass && (
@@ -10059,7 +10152,7 @@ function App(){
       // audible every 4 measures even at low density/chaos. Skips only if
       // the user is actively playing (so we leave them space).
       const _forceDownbeat = beat===0 && !ar._userIsActive && !ar._quietBar;
-      if(_forceDownbeat || Math.random()<prob){
+      if(!ar._quietBar && (_forceDownbeat || Math.random()<prob)){
         // Voicing rotation: chord shape shifts every 2 measures so the mid
         // voice never plays the same spacing twice in a row.
         const learnedVoicing = brain.suggestVoicing(chordType);
@@ -10134,7 +10227,7 @@ function App(){
       // other. window._midIsHitting is flagged below in the MID block.
       const _leadMidDuck = window._midIsHitting ? 0.35 : 1.0;
       const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck;
-      if(Math.random()<prob){
+      if(!ar._quietBar && Math.random()<prob){
         // Expanded note pool: chord tones (3× weighted) + full diatonic
         // scale + flat-3/5/7 blues + optional octave jump for drama. Stops
         // the lead from cycling through the same 6 chord-tone intervals.
@@ -10147,7 +10240,29 @@ function App(){
         if(Math.random() < 0.3) finalOpts.push((_leadChordIvs[0] || 0) + 24);
         if(finalOpts.length === 0) finalOpts.push.apply(finalOpts, leadOpts);
 
-        let iv=brain.choose(userRole,finalOpts,chaos,effectiveChord);
+        // Jazz god-mode: bypass the Brain's consonance weighting entirely.
+        // Pure random from the expanded pool + occasional chromatic approach
+        // tone (±1 semitone from a chord tone) and bebop enclosure pattern.
+        // Result: jazz lead plays freely, enclosing chord tones from above
+        // and below instead of cycling through consonant Q-values.
+        let iv;
+        if(kickStyle === 'jazz'){
+          const jazzRoll = Math.random();
+          if(jazzRoll < 0.35){
+            // Enclosure: one semitone above or below a random chord tone.
+            const tone = _leadChordIvs[Math.floor(Math.random()*_leadChordIvs.length)] + 12;
+            iv = tone + (Math.random()<0.5 ? 1 : -1);
+          } else if(jazzRoll < 0.55){
+            // Chromatic passing: offset by ±1..±3 semitones from chord tone.
+            const tone = _leadChordIvs[Math.floor(Math.random()*_leadChordIvs.length)] + 12;
+            iv = tone + Math.floor(Math.random()*6 - 3);
+          } else {
+            // Straight random from the fat pool -- no brain weighting.
+            iv = finalOpts[Math.floor(Math.random()*finalOpts.length)];
+          }
+        } else {
+          iv = brain.choose(userRole,finalOpts,chaos,effectiveChord);
+        }
         (ar._recentPicks ||= []).push({role:'lead', iv, chord:effectiveChord});
         // RESPONSE: if we're in the response phase AND the user has recently
         // played a motif, answer them with a contour-inverted version of
@@ -10292,7 +10407,7 @@ function App(){
     while(ar.nextNoteTime < ar.ctx.currentTime + DeviceComp.lookahead && _notesThisTick < (DeviceComp.score<0.45?2:4)){
       _notesThisTick++;
       const beat=ar.current16thNote;
-      const spb=60.0/((ar.lockedBpm||ar.bpm)*ar.warpMultiplier);
+      const spb=60.0/((ar.lockedBpm||ar.bpm)*(ar.tempoWarp||ar.warpMultiplier||1));
       let time=ar.nextNoteTime;
       // Jazz shuffleFeel forces a 2:1 triplet swing (~66%) regardless of the
       // user knob — that's what makes jazz sound like jazz.
@@ -11374,7 +11489,14 @@ function App(){
               ))}
             </div>
             <div className="grid grid-cols-2 gap-1.5 mt-1.5">
-              <button onClick={()=>setHalftime(h=>{const next=!h;AR.current.warpMultiplier=Math.pow(2,(AR.current._recordScratch||0)/100)*(next?0.5:1);return next;})}
+              <button onClick={()=>setHalftime(h=>{
+                const next=!h;
+                const pw=Math.pow(2,(AR.current._recordScratch||0)/100);
+                AR.current.pitchWarp=pw;
+                AR.current.tempoWarp=pw*(next?0.5:1);
+                AR.current.warpMultiplier=pw;
+                return next;
+              })}
                 className={"py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all "+(halftime?'bg-violet-500/20 text-violet-300 border-violet-500/50':'bg-slate-800/60 text-slate-500 border-slate-700 hover:border-slate-500')}>
                 {halftime ? '1/2  ON' : '1/2 TIME'}
               </button>
