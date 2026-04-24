@@ -670,6 +670,9 @@ const collectiveBrainLoad=async()=>{
     if(p.tensionArc) tensionArc.load(p.tensionArc);
     if(p.paramMemory) paramMemory.load(p.paramMemory);
     if(p.autoFx) autoFx.load(p.autoFx);
+    if(p.dissonanceBank) dissonanceBank.load(p.dissonanceBank);
+    if(p.deepDesign) deepDesign.load(p.deepDesign);
+    if(p.billboard) billboard.load(p.billboard);
     if(p.sessionJudge) sessionJudge.load(p.sessionJudge);
     const voicingCount=Object.values(brain.voicingMem).reduce((s,a)=>s+a.length,0);
     console.log('[GenesisBrain] Loaded -- n:'+brain.n+' phrases:'+motifEng.phrases.length+' voicings:'+voicingCount);
@@ -697,6 +700,9 @@ const collectiveBrainSave=()=>{
         tensionArc:  tensionArc.serialize(),
         paramMemory: paramMemory.serialize(),
         autoFx:      autoFx.serialize(),
+        dissonanceBank: dissonanceBank.serialize(),
+        deepDesign:  deepDesign.serialize(),
+        billboard:   billboard.serialize(),
         sessionJudge: sessionJudge.serialize(),
         _ts:         Date.now()
       };
@@ -992,7 +998,14 @@ class AudioBus{
     this.limiter.ratio.value=20.0;   // effectively infinite limiting
     this.limiter.attack.value=0.001; // 1ms -- catches fast transients
     this.limiter.release.value=0.05; // 50ms -- quick recovery
-    this.dropFilter.connect(this.limiter);
+    // -- GROSSBEAT GATE: tempo-synced volume automation between dropFilter and
+    // limiter. Always in the path; defaults to gain=1 (transparent). When
+    // grossbeat.active is true the scheduler drives its gain from a 16-step
+    // pattern bank. Wiring the node inline means no disconnects at runtime.
+    this.grossbeatGain=ctx.createGain(); this.grossbeatGain.gain.value=1;
+    this.dropFilter.connect(this.grossbeatGain);
+    this.grossbeatGain.connect(this.limiter);
+    if(typeof grossbeat !== 'undefined') grossbeat.node = this.grossbeatGain;
     this.limiter.connect(ctx.destination);
 
     // -- MASTER BUS COMPRESSOR: glue everything together ------------------
@@ -1462,6 +1475,35 @@ class MotifEngine{
   }
 
   popEcho(){return this.echoQueue.shift()||null;}
+
+  // -- STOCK MOTIF BANK -----------------------------------------------------
+  // Interval-set motifs the band can pull from when the user hasn't sung
+  // anything recent. Each motif includes a contour, a prescribed rhythm
+  // (durations in 16th notes), and a "call" vs "response" vs "turnaround"
+  // tag so the call-and-response engine can pick the right role.
+  static STOCK = [
+    {name:'rising_arp',   ivs:[0,4,7,12],     dur:[2,2,2,2], role:'call'},
+    {name:'falling_arp',  ivs:[12,7,4,0],     dur:[2,2,2,2], role:'response'},
+    {name:'pentatonic',   ivs:[0,3,5,7,10],   dur:[1,1,1,2,3], role:'call'},
+    {name:'blues_lick',   ivs:[0,3,5,6,5,3,0],dur:[2,1,1,2,1,1,4], role:'response'},
+    {name:'bebop_enclose',ivs:[0,2,1,0,-1,0], dur:[1,1,1,1,1,3], role:'response'},
+    {name:'bossa_hook',   ivs:[0,4,7,4,9,7],  dur:[2,2,2,2,2,6], role:'call'},
+    {name:'call_48',      ivs:[0,4,7,9],      dur:[4,4,4,4], role:'call'},
+    {name:'response_48',  ivs:[9,7,4,0],      dur:[3,3,4,6], role:'response'},
+    {name:'turnaround_ii',ivs:[2,5,7,10,12],  dur:[1,1,2,2,2], role:'turnaround'},
+    {name:'turnaround_V', ivs:[7,11,14,10,12],dur:[1,1,2,2,2], role:'turnaround'},
+    {name:'motif_3_up',   ivs:[0,3,7],        dur:[2,2,4], role:'call'},
+    {name:'motif_5_down', ivs:[7,5,3,2,0],    dur:[1,1,1,1,4], role:'response'},
+  ];
+
+  // Pick a stock motif matching a role ('call'|'response'|'turnaround') and
+  // return an interval+duration list. Used as a fallback when the user's
+  // phrase buffer is empty or when the band wants to vary its own lines.
+  suggestStock(role){
+    const pool = MotifEngine.STOCK.filter(m => m.role===role);
+    if(!pool.length) return null;
+    return pool[Math.floor(Math.random()*pool.length)];
+  }
 }
 const motifEng=new MotifEngine();
 
@@ -1855,6 +1897,433 @@ const paramMemory = {
 };
 if(typeof window!=='undefined') window.paramMemory=paramMemory;
 
+// -- DISSONANCE COMPLEXITY BANK --------------------------------------------
+// Logs interval-sets that were played over each chord context and whether
+// they were "good dissonance" (winding went up) or "bad dissonance" (winding
+// dropped or listener tensed up). Separately tracks the in-key scale heard
+// on each root pitch class so we can pick in-key dissonant chords on demand.
+// The "FROM" moments (where the arc wants tension, not resolution) pull an
+// ivSet from the good bank whose notes are ALL in the active scale.
+const dissonanceBank = {
+  scaleMem: {},        // rootPc -> Set of pc's heard in the scale
+  good: {},            // key -> {ivSet, sig, score, uses, ctx, rootPc}
+  bad: {},
+  maxEntries: 48,
+
+  _dissScore(ivSet){
+    if(!ivSet||!ivSet.length) return 0;
+    let n=0;
+    for(const iv of ivSet){
+      const m=((iv%12)+12)%12;
+      if(m===1||m===2||m===6||m===10||m===11) n++;
+    }
+    return n/ivSet.length;
+  },
+
+  markScale(rootPc, pc){
+    rootPc=((rootPc%12)+12)%12; pc=((pc%12)+12)%12;
+    if(!this.scaleMem[rootPc]) this.scaleMem[rootPc]=[];
+    if(!this.scaleMem[rootPc].includes(pc)) this.scaleMem[rootPc].push(pc);
+  },
+  inKey(rootPc, pc){
+    rootPc=((rootPc%12)+12)%12; pc=((pc%12)+12)%12;
+    const s=this.scaleMem[rootPc];
+    if(!s||!s.length) return true; // haven't learned the scale yet -- assume in-key
+    return s.includes(pc);
+  },
+
+  observe(chordCtx, ivSet, windingDelta, rootPc){
+    if(!ivSet||!ivSet.length) return;
+    const diss=this._dissScore(ivSet);
+    if(diss<0.20) return;                // not dissonant enough to log
+    const sig=ivSet.slice().sort((a,b)=>a-b).join(',');
+    const target= windingDelta>0.05 ? this.good : windingDelta<-0.05 ? this.bad : null;
+    if(!target) return;
+    const k=`${chordCtx||'x'}|${sig}`;
+    const e=target[k];
+    if(e){ e.score=Math.min(1, e.score+Math.abs(windingDelta)*0.20); e.uses++; }
+    else{
+      target[k]={ivSet:[...ivSet], sig, score:Math.min(1,Math.abs(windingDelta)), uses:1, ctx:chordCtx, rootPc};
+      const keys=Object.keys(target);
+      if(keys.length>this.maxEntries){
+        keys.map(k2=>({k:k2,s:target[k2].score}))
+          .sort((a,b)=>a.s-b.s).slice(0,keys.length-this.maxEntries)
+          .forEach(o=>delete target[o.k]);
+      }
+    }
+  },
+
+  // Return an in-key dissonant ivSet for a FROM moment. Falls back to a safe
+  // jazz cluster if the good bank hasn't seeded anything for this context.
+  suggestInKey(rootPc, chordCtx){
+    const pool=Object.values(this.good)
+      .filter(e=>e.ctx===chordCtx)
+      .sort((a,b)=>b.score-a.score);
+    for(const e of pool){
+      if(e.ivSet.every(iv=>this.inKey(rootPc, rootPc+iv))) return e.ivSet.slice();
+    }
+    // Fallback: sus2-plus-tritone cluster. Keep only pcs that exist in scale.
+    const fb=[0,2,6,10].filter(iv=>this.inKey(rootPc, rootPc+iv));
+    return fb.length>=2 ? fb : [0,2,7];
+  },
+
+  serialize(){
+    return { scaleMem:{...this.scaleMem}, good:this.good, bad:this.bad };
+  },
+  load(d){
+    if(!d) return;
+    if(d.scaleMem){
+      this.scaleMem={};
+      for(const [k,v] of Object.entries(d.scaleMem)){
+        this.scaleMem[k]= Array.isArray(v) ? v : (v.forEach ? [...v] : []);
+      }
+    }
+    if(d.good) this.good=d.good;
+    if(d.bad)  this.bad =d.bad;
+  },
+};
+if(typeof window!=='undefined') window.dissonanceBank=dissonanceBank;
+
+// -- DEEP DESIGN -----------------------------------------------------------
+// Per-voice Q-learner over live sound-design moves. Each hit can optionally
+// apply one of 10 moves (hpf, lpf_up, drive, detune, harm_boost, fundamental,
+// staccato, vibrato, tremolo, bend). The voice's winding delta since the last
+// choice is the positive reward; an "annoyance" score (clipping + harshness)
+// is subtracted. Moves that keep winning are picked more often.
+const deepDesign = {
+  moves: ['hpf','lpf_up','drive','detune','harm_boost','fundamental','staccato','vibrato','tremolo','bend'],
+  q: { drum:{}, bass:{}, mid:{}, lead:{} },
+  last: { drum:null, bass:null, mid:null, lead:null },
+  lastWinding: { drum:0, bass:0, mid:0, lead:0 },
+  active: true,
+  eps: 0.35,
+
+  _key(ctx){ return `${ctx.chord||'-'}|${ctx.arc||'-'}|${ctx.tBucket||'mid'}`; },
+
+  // Pick 0-1 moves for this hit. Returns {move, ctxKey} or null.
+  pick(voice, ctx){
+    if(!this.active) return null;
+    if(!this.q[voice]) return null;
+    const k=this._key(ctx||{});
+    const tbl=this.q[voice][k]||{};
+    let move;
+    if(Math.random()<this.eps || Object.keys(tbl).length<3){
+      move=this.moves[Math.floor(Math.random()*this.moves.length)];
+    } else {
+      let bs=-1, best=null;
+      for(const m of this.moves){
+        const e=tbl[m]; if(!e) continue;
+        if(e.score>bs){ bs=e.score; best=m; }
+      }
+      move=best||this.moves[Math.floor(Math.random()*this.moves.length)];
+    }
+    this.last[voice]={k,move};
+    return {move, ctxKey:k};
+  },
+
+  // Reward based on winding delta since last pick; annoyance subtracts.
+  observe(voice, windingNow, annoyance){
+    const la=this.last[voice]; if(!la) return;
+    const delta=windingNow - (this.lastWinding[voice]||0);
+    this.lastWinding[voice]=windingNow;
+    const reward=Math.max(-1, Math.min(1, delta*0.7 - (annoyance||0)*1.3));
+    const tbl=this.q[voice]; if(!tbl[la.k]) tbl[la.k]={};
+    const e=tbl[la.k][la.move]||{score:0.5, uses:0};
+    e.score=Math.max(0, Math.min(1, e.score*0.88 + (0.5+reward*0.5)*0.12));
+    e.uses=(e.uses||0)+1;
+    tbl[la.k][la.move]=e;
+    this.eps=Math.max(0.08, 0.35 - Object.keys(tbl).length*0.002);
+  },
+
+  serialize(){ return {q:this.q, eps:this.eps, active:this.active}; },
+  load(d){ if(!d) return; if(d.q) this.q=d.q; if(typeof d.eps==='number') this.eps=d.eps; if(typeof d.active==='boolean') this.active=d.active; },
+};
+if(typeof window!=='undefined') window.deepDesign=deepDesign;
+
+// -- EXPRESSION FX ---------------------------------------------------------
+// Stateless helpers for live sound-design moves. Callers wire the returned
+// LFO nodes into their own autoClean lists.
+const expressionFX = {
+  // Vibrato: sine LFO modulates a freq AudioParam ~25 cents default depth.
+  vibrato(ctx, freqParam, freqHz, rateHz=5.5, depthCents=25, t=0, dur=1){
+    const lfo=ctx.createOscillator(); lfo.type='sine';
+    lfo.frequency.value=Math.max(0.1, rateHz);
+    const g=ctx.createGain();
+    g.gain.value=Math.max(0, freqHz)*(depthCents/1200);
+    lfo.connect(g); g.connect(freqParam);
+    lfo.start(t); lfo.stop(t+dur+0.02);
+    return [lfo,g];
+  },
+  // Tremolo: sine LFO modulates a gain AudioParam.
+  tremolo(ctx, gainParam, baseGain=0.3, rateHz=6.0, depth=0.25, t=0, dur=1){
+    const lfo=ctx.createOscillator(); lfo.type='sine';
+    lfo.frequency.value=Math.max(0.1, rateHz);
+    const g=ctx.createGain();
+    g.gain.value=Math.max(0, baseGain)*Math.max(0,Math.min(1,depth));
+    lfo.connect(g); g.connect(gainParam);
+    lfo.start(t); lfo.stop(t+dur+0.02);
+    return [lfo,g];
+  },
+  // Exponential pitch bend between two frequencies on a freq AudioParam.
+  pitchBend(freqParam, startHz, endHz, t, bendDur){
+    try{
+      freqParam.setValueAtTime(Math.max(1,startHz), t);
+      freqParam.exponentialRampToValueAtTime(Math.max(1,endHz), t+Math.max(0.005, bendDur));
+    }catch(_){}
+  },
+  // Staccato scale factor on a note length. 0.45 is a tight jazzy pluck.
+  staccatoFactor(){ return 0.45; },
+};
+if(typeof window!=='undefined') window.expressionFX=expressionFX;
+
+// -- DRUM KEY TRACKER ------------------------------------------------------
+// Maps the kick fundamental to the track's root pitch class (2 octaves below)
+// and snaps the snare body's center freq to a perfect 5th above root. Makes
+// drums musically coherent with the key instead of floating as pure noise.
+const drumKeyTracker = {
+  mode: 'root',   // 'root' | 'fifth' | 'off'
+  kickFreqFor(rootMidi){
+    if(this.mode==='off' || typeof rootMidi!=='number' || !isFinite(rootMidi)) return null;
+    const pc=((rootMidi%12)+12)%12;
+    const midi=24 + pc + (this.mode==='fifth' ? 7 : 0);
+    let freq=440*Math.pow(2,(midi-69)/12);
+    while(freq<40) freq*=2;
+    while(freq>95) freq*=0.5;
+    return freq;
+  },
+  snareBodyFor(rootMidi){
+    if(this.mode==='off' || typeof rootMidi!=='number' || !isFinite(rootMidi)) return null;
+    const pc=((rootMidi%12)+12)%12;
+    let freq=440*Math.pow(2, ((48 + pc + 7) - 69)/12);
+    while(freq<150) freq*=2;
+    while(freq>280) freq*=0.5;
+    return freq;
+  },
+};
+if(typeof window!=='undefined') window.drumKeyTracker=drumKeyTracker;
+
+// -- GROSSBEAT GATE --------------------------------------------------------
+// Tempo-synced volume automation on a dedicated master-adjacent gain node.
+// Pattern bank of 16-step gate maps; pattern rotates every `barsPerPattern`
+// bars. Auto-DJ cut/transition feel. Wired in at AudioBus.init().
+const grossbeat = {
+  active: false,
+  node: null,
+  patterns: {
+    straight:      [1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1],
+    chop:          [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0],
+    stutter:       [1,1,0,1, 0,0,1,1, 0,1,0,0, 1,1,1,0],
+    half_mute:     [1,1,1,1, 1,1,1,1, 0,0,0,0, 0,0,0,0],
+    reverse_swell: [0.10,0.15,0.22,0.30, 0.40,0.50,0.62,0.74, 0.84,0.92,0.97,1.0, 1.0,1.0,1.0,1.0],
+    off_beat:      [0.25,1,0.25,1, 0.25,1,0.25,1, 0.25,1,0.25,1, 0.25,1,0.25,1],
+    sidechain_pump:[0.20,0.35,0.55,0.75, 0.88,0.95,1.0,1.0, 0.20,0.35,0.55,0.75, 0.88,0.95,1.0,1.0],
+    quarter_ghost: [1,0.20,0.20,0.20, 1,0.20,0.20,0.20, 1,0.20,0.20,0.20, 1,0.20,0.20,0.20],
+    reverse_chop:  [1,1,1,1, 0,0,0,0, 1,1,1,1, 0,0,0,0],
+    dj_build:      [0.60,0.65,0.70,0.75, 0.80,0.85,0.90,0.95, 1.0,0.30,1.0,0.30, 1.0,0.0,1.0,0.0],
+  },
+  order: ['straight','chop','stutter','half_mute','reverse_swell','off_beat','sidechain_pump','quarter_ghost','reverse_chop','dj_build'],
+  current: 'straight',
+  barIdx: 0,
+  barsPerPattern: 4,
+
+  attach(ctx, input, output){
+    if(this.node || !ctx || !input || !output) return;
+    this.node=ctx.createGain(); this.node.gain.value=1;
+    input.connect(this.node); this.node.connect(output);
+  },
+
+  onStep(ctx, stepIdx){
+    if(!this.active || !this.node || !ctx) return;
+    const pat=this.patterns[this.current]||this.patterns.straight;
+    const v=Math.max(0, Math.min(1, pat[((stepIdx%16)+16)%16]));
+    const tNow=ctx.currentTime;
+    try{
+      this.node.gain.cancelScheduledValues(tNow);
+      this.node.gain.setTargetAtTime(v, tNow, 0.008);
+    }catch(_){}
+  },
+
+  onBar(){
+    if(!this.active) return;
+    this.barIdx=(this.barIdx|0)+1;
+    if(this.barIdx % this.barsPerPattern === 0){
+      const idx=this.order.indexOf(this.current);
+      let next=idx;
+      while(next===idx && this.order.length>1) next=Math.floor(Math.random()*this.order.length);
+      this.current=this.order[next];
+    }
+  },
+
+  toggle(){
+    this.active=!this.active;
+    if(!this.active && this.node){
+      try{
+        this.node.gain.cancelScheduledValues(0);
+        this.node.gain.setTargetAtTime(1,0,0.01);
+      }catch(_){}
+    }
+    return this.active;
+  },
+};
+if(typeof window!=='undefined') window.grossbeat=grossbeat;
+
+// -- BILLBOARD -------------------------------------------------------------
+// Local-first Top-10-per-genre of recorded sessions. Users record a track,
+// optionally capture per-voice stems, rate each voice, and add their socials.
+// Weekly reset picks the #1 per genre for competition; ratings feed back into
+// paramMemory / deepDesign so the band gradually plays more like the tracks
+// the community rates highest.
+const billboard = {
+  // Serializable state -- persisted via collectiveBrainSave.
+  entries: [],          // [{id, genre, title, socials, ts, weekId, master:{dur,buf}, stems:{drum,bass,mid,lead}, ratings:{drum,bass,mid,lead}, totalRating, ratingCount}]
+  weeklyChamps: {},     // genre -> {weekId, entryId, snapshotTs}
+  currentWeek: null,    // computed from Date.now()
+
+  _weekId(ts){
+    // ISO week: year + week-of-year. Entries reset display every Monday 00:00 UTC.
+    const d = new Date(ts || Date.now());
+    d.setUTCHours(0,0,0,0);
+    const jan1 = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+    const days = Math.floor((d - jan1)/(24*3600*1000));
+    const w = Math.floor((days + jan1.getUTCDay()) / 7);
+    return `${d.getUTCFullYear()}-W${String(w).padStart(2,'0')}`;
+  },
+
+  // Add a new entry. Master is an AudioBuffer serialized to Float32.
+  async add(entry){
+    const ts = Date.now();
+    const weekId = this._weekId(ts);
+    const id = `bb-${ts}-${Math.random().toString(36).slice(2,8)}`;
+    const full = {
+      id, ts, weekId,
+      genre:  entry.genre || 'pop',
+      title:  entry.title || 'Untitled',
+      socials:entry.socials || '',
+      master: entry.master || null,     // {dur, ch, sr, data: Float32Array[]}
+      stems:  entry.stems  || {},       // each: {dur, ch, sr, data: Float32Array[]}
+      ratings:{drum:0, bass:0, mid:0, lead:0},
+      ratingCounts:{drum:0, bass:0, mid:0, lead:0},
+      totalRating: 0,
+      ratingCount: 0,
+    };
+    this.entries.unshift(full);
+    if(this.entries.length > 200) this.entries.pop();
+    return full;
+  },
+
+  // User rates a voice on an entry, 1-5 stars. Averages are kept online
+  // via (old*n + new)/(n+1). Feeds back into paramMemory and deepDesign.
+  rate(entryId, voice, stars){
+    const e = this.entries.find(x => x.id===entryId); if(!e) return null;
+    const v = voice in e.ratings ? voice : null; if(!v) return null;
+    const s = Math.max(1, Math.min(5, stars|0));
+    const n = e.ratingCounts[v]||0;
+    e.ratings[v] = (e.ratings[v]*n + s) / (n+1);
+    e.ratingCounts[v] = n+1;
+    // Recompute aggregate
+    let tot=0, cnt=0;
+    for(const k of ['drum','bass','mid','lead']){
+      if(e.ratingCounts[k]){ tot += e.ratings[k]*e.ratingCounts[k]; cnt += e.ratingCounts[k]; }
+    }
+    e.totalRating = cnt ? tot/cnt : 0;
+    e.ratingCount = cnt;
+    // Feedback: high-rated voices (>=4.0) promote their active params; low (<=2.0) demote.
+    try{
+      if(typeof paramMemory!=='undefined'){
+        const vm = paramMemory.voices[v];
+        if(vm && e.ratings[v] >= 4.0) vm.n = Math.min(120, (vm.n||0) + 2);
+        else if(vm && e.ratings[v] <= 2.0 && vm.n>10) vm.n = Math.max(10, vm.n-3);
+      }
+    }catch(_){}
+    return e.totalRating;
+  },
+
+  // Top-N per genre, ranked by totalRating * log(ratingCount+1)
+  topN(genre, n=10){
+    return this.entries
+      .filter(e => (genre ? e.genre===genre : true))
+      .map(e => ({...e, rank: e.totalRating * Math.log2((e.ratingCount||0)+2)}))
+      .sort((a,b)=>b.rank - a.rank)
+      .slice(0, n);
+  },
+
+  // The deep-learned top-10: entries whose voices have the highest learned
+  // scores across paramMemory + user ratings. Updated weekly.
+  deepTop(genre, n=10){
+    return this.entries
+      .filter(e => (genre ? e.genre===genre : true))
+      .map(e => {
+        const ageHrs = (Date.now() - e.ts)/3.6e6;
+        const recency = Math.exp(-ageHrs/(24*7));                     // 1 this week, decays
+        const score = e.totalRating * Math.log2((e.ratingCount||0)+2) * (0.6 + recency*0.4);
+        return {...e, deepScore: score};
+      })
+      .sort((a,b)=>b.deepScore - a.deepScore)
+      .slice(0, n);
+  },
+
+  // Pick a weekly champion per genre. Called once per week boundary.
+  updateWeeklyChamps(){
+    const wk = this._weekId(Date.now());
+    const GENRES = ['jazz','pop','edm','hiphop','westcoast','eastcoast','african','indian'];
+    for(const g of GENRES){
+      const top = this.deepTop(g, 1)[0];
+      if(top) this.weeklyChamps[g] = {weekId: wk, entryId: top.id, snapshotTs: Date.now()};
+    }
+    this.currentWeek = wk;
+  },
+
+  // Delete an entry (user cleanup)
+  remove(entryId){
+    const i = this.entries.findIndex(e=>e.id===entryId);
+    if(i>=0){ this.entries.splice(i,1); return true; }
+    return false;
+  },
+
+  serialize(){
+    // Strip raw audio buffers to keep the brain payload small. Stem blobs are
+    // persisted separately in IndexedDB under `billboard-<id>-<voice>`.
+    const strip = (e)=>({
+      ...e,
+      master: e.master ? {dur:e.master.dur, ch:e.master.ch, sr:e.master.sr} : null,
+      stems:  Object.fromEntries(Object.entries(e.stems||{}).map(([k,v])=>[k, v?{dur:v.dur, ch:v.ch, sr:v.sr}:null])),
+    });
+    return { entries: this.entries.map(strip), weeklyChamps: this.weeklyChamps, currentWeek: this.currentWeek };
+  },
+  load(d){
+    if(!d) return;
+    if(Array.isArray(d.entries)) this.entries = d.entries;
+    if(d.weeklyChamps) this.weeklyChamps = d.weeklyChamps;
+    if(d.currentWeek)  this.currentWeek  = d.currentWeek;
+    const wkNow = this._weekId(Date.now());
+    if(this.currentWeek && this.currentWeek !== wkNow) this.updateWeeklyChamps();
+  },
+};
+if(typeof window!=='undefined') window.billboard=billboard;
+
+// Encode an AudioBuffer-like {ch,sr,data:Float32Array[]} into a 16-bit WAV Blob.
+function _bbEncodeWav(ab){
+  if(!ab || !ab.data || !ab.data.length) return null;
+  const ch=ab.ch||ab.data.length, sr=ab.sr||44100, len=ab.data[0].length;
+  const bytes = 44 + len*ch*2;
+  const buf = new ArrayBuffer(bytes);
+  const v = new DataView(buf);
+  const wr = (o,s)=>{ for(let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
+  wr(0,'RIFF'); v.setUint32(4, bytes-8, true); wr(8,'WAVE');
+  wr(12,'fmt '); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,ch,true);
+  v.setUint32(24,sr,true); v.setUint32(28,sr*ch*2,true); v.setUint16(32,ch*2,true); v.setUint16(34,16,true);
+  wr(36,'data'); v.setUint32(40,len*ch*2,true);
+  let o=44;
+  for(let i=0;i<len;i++){
+    for(let c=0;c<ch;c++){
+      const x=Math.max(-1,Math.min(1,ab.data[c][i]||0));
+      v.setInt16(o, x<0?x*0x8000:x*0x7FFF, true); o+=2;
+    }
+  }
+  return new Blob([buf], {type:'audio/wav'});
+}
+if(typeof window!=='undefined') window._bbEncodeWav=_bbEncodeWav;
+
 // -- AUTO FX: Q-learner that picks reverb/delay/chorus/fuzz combinations ----
 // Keyed on (style × chord × arc × tension-bucket). Each context remembers the
 // best mask it has tried. Rewarded when the mid/lead voice winding rises
@@ -2019,15 +2488,31 @@ function humanizedSeed(name, amount){
 if(typeof window!=='undefined'){window._drumKit=_drumKit;window.reseedDrum=reseedDrum;window._drumRecipes=_drumRecipes;}
 
 // Locked bass kit: reseeding flips the bass character to a different mode.
-// 'auto' = neural-picked (legacy), other modes FORCE that character so the
-// user can kill the Squidward wobble and get a clean/locked tone.
+// 'auto' = neural-picked, other modes FORCE that character so the user can
+// kill the Squidward reece-bass wobble and get a cleaner/warmer tone.
+// 'upright' / 'acoustic' delegate to synthUprightBass for a real acoustic
+// bass feel independent of style; 'finger' and 'pick' are softer/brighter
+// variants of the electric bass.
 const _bassKit = {mode:'auto'};
-const BASS_MODE_CYCLE = ['auto','clean','pluck','slap','sustain','growl'];
+const BASS_MODE_CYCLE = ['auto','finger','pick','clean','pluck','slap','sustain','growl','upright','acoustic'];
 let reseedBassKit = function(){
   const i = BASS_MODE_CYCLE.indexOf(_bassKit.mode);
   _bassKit.mode = BASS_MODE_CYCLE[(i+1) % BASS_MODE_CYCLE.length];
 };
 if(typeof window!=='undefined'){window._bassKit=_bassKit;window.reseedBassKit=reseedBassKit;}
+
+// Drum feel cycle: user-overridable rhythmic feel applied AFTER pattern gen.
+// Auto lets the scheduler pick based on tempo + arc + user activity.
+const DRUM_FEEL_CYCLE = ['auto','normal','halftime','doubletime','delta_sparse','ballad'];
+let cycleDrumFeel = function(){
+  if(typeof window==='undefined' || !window._bandAR) return null;
+  const cur = window._bandAR._drumFeel || 'auto';
+  const i = DRUM_FEEL_CYCLE.indexOf(cur);
+  const next = DRUM_FEEL_CYCLE[(i+1) % DRUM_FEEL_CYCLE.length];
+  window._bandAR._drumFeel = next;
+  return next;
+};
+if(typeof window!=='undefined') window.cycleDrumFeel = cycleDrumFeel;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DRUM-RULES PATTERN ENGINE
@@ -2876,12 +3361,47 @@ function styleLerp(range, seed){ return range[0] + seed*(range[1]-range[0]); }
 // sine-sweep is still the most common, but fm and noise-body variants
 // genuinely pop up 30-40% of the time and change the timbre.
 function kickSineSweep(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
-  // Existing sine-sweep body (what we had). Carrier sweeps exponentially
-  // from f0 down to f1 over `decay`. Optional 200Hz EQ thump for hip-hop/edm.
+  // Sine-sweep kick with the "chesty 150 Hz bump + lowpass to kill highs +
+  // transient envelope on pitch/volume/decay" character the user wanted.
+  //
+  // Signal chain:   body osc -> 150Hz peak -> LPF (enveloped) -> gain env -> dest
+  // Parallel: short filtered click transient, independently enveloped.
+  //
+  // If drumKeyTracker is on, f0/f1 are re-anchored to the track's key root
+  // so the kick fundamental sits on the tonic (or the 5th) instead of floating.
+  const rootMidi = (typeof window!=='undefined' && window._bandAR) ? (window._bandAR.lockedRoot ?? window._bandAR.rootMidi) : null;
+  const keyKickF = (typeof drumKeyTracker!=='undefined') ? drumKeyTracker.kickFreqFor(rootMidi) : null;
+  if(keyKickF){
+    // Blend 60% toward the key-anchored fundamental so style range still breathes.
+    f0 = f0*0.4 + keyKickF*1.55*0.6;      // start ~1.5× the fundamental
+    f1 = f1*0.3 + keyKickF*0.7;           // land just below the fundamental
+  }
+
   const body=ctx.createOscillator(); body.type='sine';
   body.frequency.setValueAtTime(f0,t);
+  // Transient pitch blip: a quarter-ms hold at the very top makes the attack
+  // read as "struck", then the sweep continues. Separate from the body sweep.
   body.frequency.setValueAtTime(f0*(kickStyle==='jazz'?0.88:0.92),t+0.002);
-  body.frequency.exponentialRampToValueAtTime(f1,t+decay);
+  body.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+decay);
+
+  // 150 Hz bump for chest thump. Always-on at +4 dB (+6 on EDM), a bit wider
+  // than the old 200Hz bump so the warmth is felt, not just heard.
+  const eq150=ctx.createBiquadFilter(); eq150.type='peaking';
+  eq150.frequency.value=148 + s.tone*12;     // 148..160
+  eq150.Q.value=1.1 + s.punch*0.3;
+  eq150.gain.value=(kickStyle==='edm'?6.5:kickStyle==='jazz'?2.8:4.2);
+
+  // LPF with envelope to remove highs. Opens briefly on the hit (so the
+  // transient has a bit of sparkle) then closes to ~180 Hz as the body dies.
+  // This is the "high[low]pass to remove highs" the user asked for.
+  const lpf=ctx.createBiquadFilter(); lpf.type='lowpass';
+  const lpfOpen = 3200 + punch*1800;            // open on transient
+  const lpfClose = 180 + s.tone*80;             // close to body/sub
+  lpf.frequency.setValueAtTime(lpfOpen,t);
+  lpf.frequency.exponentialRampToValueAtTime(Math.max(80,lpfClose),t+decay*0.75);
+  lpf.Q.value=0.72;
+
+  // Volume envelope: fast attack, quick sag, exponential decay.
   const bg=ctx.createGain();
   bg.gain.setValueAtTime(0,t);
   const attackT = kickStyle==='jazz'?0.008:kickStyle==='edm'?0.0005:0.003;
@@ -2889,17 +3409,34 @@ function kickSineSweep(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
   bg.gain.setValueAtTime(punch*(0.88+s.punch*0.08), t+attackT*3);
   bg.gain.linearRampToValueAtTime(0.0001, t+decay+(kickStyle==='edm'?0.12:0.04));
   bg.gain.setValueAtTime(0, t+decay+(kickStyle==='edm'?0.14:0.06));
-  if(kickStyle==='edm'||kickStyle==='hiphop'||kickStyle==='westcoast'||kickStyle==='eastcoast'){
-    const eq200=ctx.createBiquadFilter(); eq200.type='peaking';
-    eq200.frequency.value=200; eq200.Q.value=1.4;
-    eq200.gain.value=(kickStyle==='edm'?6:kickStyle==='westcoast'?5:4);
-    body.connect(eq200); eq200.connect(bg); bg.connect(dest);
-    autoClean(eq200);
-  }else{
-    body.connect(bg); bg.connect(dest);
-  }
+
+  body.connect(eq150); eq150.connect(lpf); lpf.connect(bg); bg.connect(dest);
   body.start(t); body.stop(t+decay+(kickStyle==='edm'?0.16:0.08));
-  autoClean(body,bg);
+  autoClean(body,eq150,lpf,bg);
+
+  // Transient-shaping click: short filtered noise burst at ~1.2 kHz band,
+  // separately enveloped so volume/decay/pitch move independently of the body.
+  // This is the "transient filter applied to pitch, volume, and decay" layer.
+  if(s.click > 0.05){
+    const clLen=Math.max(2, Math.floor(ctx.sampleRate*0.018));
+    const clBuf=ctx.createBuffer(1,clLen,ctx.sampleRate);
+    const cd=clBuf.getChannelData(0);
+    for(let i=0;i<clLen;i++) cd[i]=(Math.random()*2-1)*Math.pow(1-i/clLen,1.8);
+    const cl=ctx.createBufferSource(); cl.buffer=clBuf;
+    const clBp=ctx.createBiquadFilter(); clBp.type='bandpass';
+    clBp.frequency.setValueAtTime(1200+s.click*900, t);
+    clBp.frequency.exponentialRampToValueAtTime(260, t+0.020);
+    clBp.Q.value=1.5;
+    const clHpf=ctx.createBiquadFilter(); clHpf.type='highpass';
+    clHpf.frequency.value=60;   // kill any sub mud in the click tail
+    const clG=ctx.createGain();
+    clG.gain.setValueAtTime(0, t);
+    clG.gain.linearRampToValueAtTime(s.click*0.55*(kickStyle==='edm'?1.2:0.9), t+0.001);
+    clG.gain.exponentialRampToValueAtTime(0.0001, t+0.012+s.click*0.010);
+    cl.connect(clBp); clBp.connect(clHpf); clHpf.connect(clG); clG.connect(dest);
+    cl.start(t); cl.stop(t+0.030);
+    autoClean(cl,clBp,clHpf,clG);
+  }
 }
 function kickFM(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
   // FM kick: carrier at f0 is frequency-modulated by a sine at f0*ratio.
@@ -3309,7 +3846,11 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
   // Reseed cycles classic / fm / clap for real topology changes.
   // Articulation shapes velocity; the kit character stays constant per reseed.
   const vel = art==='ghost' ? 0.30 : art==='rimshot' ? 1.15 : art==='rim' ? 0.85 : 1.0;
-  const bodyFreq=(155+s.pitch*90+inputTight*50)*warp * (art==='rim'?1.45:1.0);
+  // Key-track body freq to the perfect 5th above root if the tracker is on.
+  const _rm = (typeof window!=='undefined' && window._bandAR) ? (window._bandAR.lockedRoot ?? window._bandAR.rootMidi) : null;
+  const _keyBody = (typeof drumKeyTracker!=='undefined') ? drumKeyTracker.snareBodyFor(_rm) : null;
+  const bodyFreqBase = _keyBody != null ? _keyBody : (155+s.pitch*90+inputTight*50);
+  const bodyFreq=bodyFreqBase*warp * (art==='rim'?1.45:1.0);
 
   // Body recipe: skip for rim (that's a pure stick hit). Ghost/rim always use
   // the quiet classic body so the subtle articulations stay readable.
@@ -5401,6 +5942,15 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   const freq=440*Math.pow(2,(note-69)/12)*warp;
   const s=drumSeed();
   const pc=((note%12)+12)%12; const pcMod=pc/12;
+  // Deep-design move for this hit. Routed into vibrato/tremolo/pitch-bend
+  // /staccato/drive based on the Q-learner's pick. The module scores itself
+  // off voice winding so annoying moves eventually lose weight.
+  let _dd=null;
+  try{
+    const arcName = (typeof tensionArc!=='undefined' && tensionArc.currentArc && tensionArc.currentArc.name) || '-';
+    const chName  = (typeof window!=='undefined' && window._bandAR) ? (window._bandAR.chordType||'-') : '-';
+    _dd = deepDesign.pick('bass', {chord:chName, arc:arcName, tBucket: windBoost>0.5?'hi':windBoost>0.25?'mid':'lo'});
+  }catch(_){}
   // LFO: slow drift on cutoff offset, med drift on the presence harmonic
   // gain (below). No fast LFO on bass -- 2Hz vibrato on low notes = cartoon.
   const lSlow = lfoBank.get('slow',t);
@@ -5418,15 +5968,27 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   const nn=bassBrain.infer(inputs);
 
   // Select synthesis mode. Bass kit can override the neural pick so the
-  // user's reseed actually changes the bass character. 'clean' is a new
-  // mode: pure pulse through a gentle LPF, zero LFO/wobble, no ring mod --
-  // specifically for when the other modes feel Squidward-ish.
+  // user's reseed actually changes the bass character. 'clean' / 'finger' /
+  // 'pick' / 'upright' / 'acoustic' give varieties beyond the reece-ish
+  // growl/sustain modes.
   let mode;
   if(_bassKit.mode === 'auto'){
+    // Tilt auto selection toward the gentler modes; growl only at high chaos.
     const modeVal=(nn.harmonicMix + chaos*0.3 + windBoost*0.2 + pcMod*0.15) % 1.0;
-    mode = modeVal<0.28?'pluck':modeVal<0.52?'slap':modeVal<0.76?'sustain':'growl';
+    if(chaos < 0.25 && windBoost < 0.35) mode = 'finger';
+    else if(modeVal<0.22)               mode = 'pluck';
+    else if(modeVal<0.42)               mode = 'finger';
+    else if(modeVal<0.60)               mode = 'pick';
+    else if(modeVal<0.78)               mode = 'sustain';
+    else if(modeVal<0.90)               mode = 'slap';
+    else                                mode = 'growl';
   } else {
     mode = _bassKit.mode;
+  }
+  // Delegate upright/acoustic to the dedicated pluck-with-body synth.
+  if(mode==='upright' || mode==='acoustic'){
+    synthUprightBass(ctx, t, note, chaos, warp, windBoost, dest);
+    return;
   }
 
   const _styleLen=styleP().noteLenMult;
@@ -5454,8 +6016,10 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   // Envelope tween: scale decay by the slow-moving envelope target for bass.
   // Tight (low env) = shorter/punchier. Open (high env) = longer, breathier.
   const _bassEnv = motionTween.envFor('bass');
-  const decayTime={pluck:0.22*_styleLen,slap:0.18*_styleLen,sustain:0.55*_styleLen,growl:0.40*_styleLen}[mode]/warp * (0.6 + _bassEnv*0.8);
-  const bodyType={pluck:'triangle',slap:'square',sustain:'sawtooth',growl:'sawtooth'}[mode];
+  const _DT = {pluck:0.22,slap:0.18,sustain:0.55,growl:0.40,finger:0.28,pick:0.20};
+  const _BT = {pluck:'triangle',slap:'square',sustain:'sawtooth',growl:'sawtooth',finger:'triangle',pick:'sawtooth'};
+  const decayTime=(_DT[mode] ?? 0.28)*_styleLen/warp * (0.6 + _bassEnv*0.8);
+  const bodyType=_BT[mode] || 'triangle';
 
   // -- BODY OSCILLATOR ---------------------------------------------------
   const body=ctx.createOscillator(); body.type=bodyType;
@@ -5465,21 +6029,25 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
 
   // -- RESONANT FILTER: neural cutoff + mode-specific envelope ----------
   const flt=ctx.createBiquadFilter(); flt.type='lowpass';
-  const baseQ={pluck:4.5,slap:6.0,sustain:2.5,growl:8.0}[mode];
-  flt.Q.value=baseQ+chaos*8+nn.filterCutoff*5+s.punch*3;
+  const _BQ={pluck:4.5,slap:6.0,sustain:2.5,growl:8.0,finger:1.8,pick:3.2};
+  const baseQ=_BQ[mode] ?? 2.5;
+  flt.Q.value=baseQ+chaos*(mode==='finger'?2:8)+nn.filterCutoff*5+s.punch*3;
 
   // Filter envelope: each mode has distinct shape. Keep LFO contribution
   // tiny and SLOW only -- enough to make consecutive hits differ, not enough
   // to modulate the cutoff audibly within a note.
-  const fOpen={pluck:800,slap:2200,sustain:600,growl:1400}[mode];
-  const fClose={pluck:80,slap:120,sustain:180,growl:60}[mode];
+  const _FO={pluck:800,slap:2200,sustain:600,growl:1400,finger:900,pick:1800};
+  const _FC={pluck:80,slap:120,sustain:180,growl:60,finger:220,pick:260};
+  const fOpen=_FO[mode] ?? 800;
+  const fClose=_FC[mode] ?? 150;
   const lfoCutoff = lSlow*45;
   flt.frequency.setValueAtTime(Math.max(80,(fOpen+windBoost*400+inputChar*600+chaos*1200+pcMod*300+lfoCutoff)*warp), t);
   flt.frequency.exponentialRampToValueAtTime(Math.max(40,(fClose+pcMod*30)*warp), t+decayTime);
 
   // -- GAIN ENVELOPE -----------------------------------------------------
   const _atk=styleP().attackMult;
-  const attackT={pluck:0.003*_atk,slap:0.001*_atk,sustain:0.020*_atk,growl:0.008*_atk}[mode];
+  const _AT={pluck:0.003,slap:0.001,sustain:0.020,growl:0.008,finger:0.006,pick:0.0015};
+  const attackT=(_AT[mode] ?? 0.008)*_atk;
   const g=ctx.createGain();
   g.gain.setValueAtTime(0,t);
   g.gain.linearRampToValueAtTime(0.80+windBoost*0.12+pcMod*0.05, t+attackT);
@@ -5507,6 +6075,37 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
     click.connect(cg); cg.connect(dest);
     click.start(t); click.stop(t+0.03/warp);
     autoClean(click,cg);
+  }
+
+  // -- PICK MODE: bright filtered click that reads as a pick-attack -----
+  if(mode==='pick'){
+    const click=ctx.createOscillator(); click.type='triangle';
+    click.frequency.setValueAtTime(freq*5.5,t);
+    click.frequency.exponentialRampToValueAtTime(freq*2,t+0.008/warp);
+    const cg=ctx.createGain();
+    cg.gain.setValueAtTime(s.punch*0.40,t);
+    cg.gain.linearRampToValueAtTime(0.0001,t+0.014/warp);
+    click.connect(cg); cg.connect(dest);
+    click.start(t); click.stop(t+0.02/warp);
+    autoClean(click,cg);
+  }
+
+  // -- FINGER MODE: no click, a soft flesh-on-string thump via a short
+  // lowpassed noise burst. Very gentle, warm, "real bass" feel.
+  if(mode==='finger'){
+    const nLen=Math.floor(ctx.sampleRate*0.018);
+    const nBuf=ctx.createBuffer(1,nLen,ctx.sampleRate);
+    const nd=nBuf.getChannelData(0);
+    for(let i=0;i<nLen;i++) nd[i]=(Math.random()*2-1)*Math.pow(1-i/nLen,2.0);
+    const ns=ctx.createBufferSource(); ns.buffer=nBuf;
+    const nlp=ctx.createBiquadFilter(); nlp.type='lowpass';
+    nlp.frequency.value=Math.min(900, freq*3.5); nlp.Q.value=0.6;
+    const ng=ctx.createGain();
+    ng.gain.setValueAtTime(0.22+s.punch*0.10,t);
+    ng.gain.exponentialRampToValueAtTime(0.0001,t+0.020);
+    ns.connect(nlp); nlp.connect(ng); ng.connect(dest);
+    ns.start(t); ns.stop(t+0.025);
+    autoClean(ns,nlp,ng);
   }
 
   // -- PRESENCE HARMONIC: overtone for articulation ----------------------
@@ -5538,6 +6137,33 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   body.connect(flt); flt.connect(g); g.connect(dest);
   body.start(t); body.stop(t+decayTime+0.08);
   autoClean(body,flt,g);
+  // Apply deepDesign move (live sound-design). The module picks one of
+  // staccato / vibrato / tremolo / bend per hit when active.
+  try{
+    if(_dd && deepDesign.active){
+      if(_dd.move==='staccato'){
+        // Already started; shorten envelope by re-scheduling an early fade.
+        g.gain.cancelScheduledValues(t+decayTime*0.4);
+        g.gain.exponentialRampToValueAtTime(0.0001, t+decayTime*0.5);
+      } else if(_dd.move==='vibrato'){
+        const [lfo,g2] = expressionFX.vibrato(ctx, body.frequency, freq, 5.2, 15, t, decayTime+0.05);
+        autoClean(lfo,g2);
+      } else if(_dd.move==='tremolo' && (mode==='sustain'||mode==='growl'||mode==='finger')){
+        const [lfo,g2] = expressionFX.tremolo(ctx, g.gain, 0.4, 6.5, 0.20, t, decayTime+0.05);
+        autoClean(lfo,g2);
+      } else if(_dd.move==='bend'){
+        // Bend up one semitone over the first 40% of the note.
+        expressionFX.pitchBend(body.frequency, freq*0.94, freq, t, decayTime*0.40);
+      }
+    }
+    // Observe winding delta once per hit; voice winding comes from the
+    // scheduler via window._bandVoices.
+    const _bv = (typeof window!=='undefined') ? window._bandVoices : null;
+    if(_bv && _bv.bass){
+      const annoyance = s._wild ? 0.25 : 0;
+      deepDesign.observe('bass', _bv.bass.winding||0, annoyance);
+    }
+  }catch(_){}
   // Teach the bass "good-params" distribution on strong, non-wildcard hits.
   if(!s._wild && windBoost > 0.28){
     paramMemory.observe('bass', {punch:s.punch,tone:s.tone,color:s.color,pitch:s.pitch}, Math.min(1, windBoost*1.6));
@@ -5667,6 +6293,13 @@ function playLeadStereo(ctx, t, note, chaos, warp, dest, windBoost, durScale){
 function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
   const s=drumSeed();
   const _lStyle=styleP();
+  // Deep-design pick for lead
+  let _ddL=null;
+  try{
+    const arcName = (typeof tensionArc!=='undefined' && tensionArc.currentArc && tensionArc.currentArc.name) || '-';
+    const chName  = (typeof window!=='undefined' && window._bandAR) ? (window._bandAR.chordType||'-') : '-';
+    _ddL = deepDesign.pick('lead', {chord:chName, arc:arcName, tBucket: windBoost>0.5?'hi':windBoost>0.25?'mid':'lo'});
+  }catch(_){}
   // Per-hit lead mode rotation: style default ~60% of the time, but 40% of
   // hits pick a different lead character (saw / fm / bell / whistle / pluck).
   // Wildcards always rotate. Makes the lead stop sounding like one patch.
@@ -5841,6 +6474,14 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
   if(!s._wild && windBoost > 0.25){
     paramMemory.observe('lead', {punch:s.punch,tone:s.tone,color:s.color,decay:s.decay}, Math.min(1, windBoost*1.8));
   }
+  // Observe deepDesign reward based on current lead winding.
+  try{
+    const _bv = (typeof window!=='undefined') ? window._bandVoices : null;
+    if(_bv && _bv.lead){
+      const annoyance = s._wild ? 0.20 : 0;
+      deepDesign.observe('lead', _bv.lead.winding||0, annoyance);
+    }
+  }catch(_){}
 }
 
 // -- FLIP ENGINE ----------------------------------------------------------
@@ -6247,6 +6888,16 @@ function App(){
   const[recordingUrl,setRecordingUrl]=useState(null);
   const mediaRecorderRef=useRef(null);
   const recordChunksRef=useRef([]);
+
+  // -- BILLBOARD STATE -------------------------------------------------------
+  // Per-entry blob URLs are kept in-memory only (not persisted) to avoid
+  // ballooning IndexedDB. Metadata + ratings persist via billboard.serialize.
+  const[bbEntries,setBbEntries]=useState([]);
+  const bbBlobsRef=useRef({});       // id -> {master:url, stems:{drum,bass,mid,lead}}
+  const[bbRec,setBbRec]=useState({on:false, remaining:0});
+  const[bbForm,setBbForm]=useState({title:'', socials:'', genre:'pop', duration:30});
+  const[bbViewGenre,setBbViewGenre]=useState('pop');
+  const bbActiveRecRef=useRef(null);  // active record session
   const[sim3Balls,setSim3Balls]=useState([]); // local sim3 snapshot
   const[sim3Chaos,setSim3Chaos]=useState(null);
   const[perfMode,setPerfMode]=useState(false);
@@ -6333,7 +6984,10 @@ function App(){
   },[]);
 
   // -- COLLECTIVE BRAIN LOAD on mount ----------------------------------------
-  useEffect(()=>{collectiveBrainLoad();},[]);
+  useEffect(()=>{collectiveBrainLoad().then(()=>{
+    // Re-render billboard list once the brain load finishes.
+    setBbEntries(billboard.entries.slice());
+  });},[]);
 
   // -- SYNC LEARNING MODE to engine objects --------------------------------
   useEffect(()=>{
@@ -6373,7 +7027,12 @@ function App(){
   },[isPlaying]);
 
   // -- SYNC REFS -------------------------------------------------------------
-  useEffect(()=>{AR.current.chaos=chaos;AR.current.density=density;AR.current.swing=swing;AR.current.bpm=bpm;AR.current.drumRationality=drumRationality;AR.current.warpMultiplier=Math.pow(2,recordScratch/100)*(halftime?0.5:1);bus.updateDelayTime(bpm);},[chaos,density,swing,bpm,drumRationality,recordScratch,halftime]);
+  useEffect(()=>{AR.current.chaos=chaos;AR.current.density=density;AR.current.swing=swing;AR.current.bpm=bpm;AR.current.drumRationality=drumRationality;AR.current.warpMultiplier=Math.pow(2,recordScratch/100)*(halftime?0.5:1);bus.updateDelayTime(bpm);
+    // If we're locked, also move lockedBpm/swing with the slider so the drummer
+    // actually follows tempo/swing changes instead of staying at the locked value.
+    if(AR.current.lockedBpm!=null)   AR.current.lockedBpm  = bpm;
+    if(AR.current.lockedSwing!=null) AR.current.lockedSwing= swing;
+  },[chaos,density,swing,bpm,drumRationality,recordScratch,halftime]);
 
   // Push arc-intensity slider into the tensionArc module; poll for the current
   // arc name + bar so the UI reflects whatever the conductor picked.
@@ -6719,6 +7378,146 @@ function App(){
       setIsRecording(true);
       addLog('Recording started...');
     }catch(err){addLog('Recording error: '+err.message);}
+  };
+
+  // -- BILLBOARD RECORDING ----------------------------------------------------
+  // Starts a fixed-duration recording of the master bus + four per-voice
+  // stems (drum, bass, mid, lead) in parallel. At stop, stashes blob URLs
+  // per entry id and pushes a new metadata record into the billboard module.
+  const startBillboardRecord = async () => {
+    const ar = AR.current;
+    if(!ar.ctx || !bus || !bus.master){ addLog('Start the band first -- nothing to record.'); return; }
+    if(bbRec.on){ addLog('Billboard: already recording.'); return; }
+    const dur = Math.max(5, Math.min(90, bbForm.duration|0));
+    try{
+      const ctx = ar.ctx;
+      const streams = {
+        master: ctx.createMediaStreamDestination(),
+        drum:   ctx.createMediaStreamDestination(),
+        bass:   ctx.createMediaStreamDestination(),
+        mid:    ctx.createMediaStreamDestination(),
+        lead:   ctx.createMediaStreamDestination(),
+      };
+      bus.master.connect(streams.master);
+      if(bus.drumBus) bus.drumBus.connect(streams.drum);
+      if(bus.bassBus) bus.bassBus.connect(streams.bass);
+      if(bus.midBus)  bus.midBus.connect(streams.mid);
+      if(bus.leadBus) bus.leadBus.connect(streams.lead);
+      const chunks = {master:[], drum:[], bass:[], mid:[], lead:[]};
+      const mrs = {};
+      for(const k of Object.keys(streams)){
+        const mr = new MediaRecorder(streams[k].stream, {mimeType:'audio/webm;codecs=opus'});
+        mr.ondataavailable = e => { if(e.data && e.data.size>0) chunks[k].push(e.data); };
+        mr.start(100);
+        mrs[k] = mr;
+      }
+      bbActiveRecRef.current = {mrs, streams, chunks, start:Date.now(), dur};
+      setBbRec({on:true, remaining:dur});
+
+      const tick = setInterval(()=>{
+        const rem = dur - Math.floor((Date.now()-bbActiveRecRef.current.start)/1000);
+        if(rem <= 0){ clearInterval(tick); finish(); }
+        else setBbRec({on:true, remaining:rem});
+      }, 500);
+
+      const finish = async ()=>{
+        try{
+          for(const mr of Object.values(mrs)){ try{ mr.stop(); }catch(_){} }
+          // Wait for final dataavailable flushes
+          await new Promise(r=>setTimeout(r, 180));
+          for(const k of Object.keys(streams)){
+            try{
+              if(k==='master') bus.master.disconnect(streams[k]);
+              else if(bus[k+'Bus']) bus[k+'Bus'].disconnect(streams[k]);
+            }catch(_){}
+          }
+          const blobs = {};
+          for(const k of Object.keys(chunks)){
+            blobs[k] = chunks[k].length ? new Blob(chunks[k], {type:'audio/webm'}) : null;
+          }
+          const entry = await billboard.add({
+            title: bbForm.title || 'Untitled '+new Date().toLocaleTimeString(),
+            genre: bbForm.genre,
+            socials: bbForm.socials,
+            master: blobs.master ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+            stems:  {
+              drum: blobs.drum ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+              bass: blobs.bass ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+              mid:  blobs.mid  ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+              lead: blobs.lead ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+            },
+          });
+          bbBlobsRef.current[entry.id] = {
+            master: blobs.master ? URL.createObjectURL(blobs.master) : null,
+            stems: {
+              drum: blobs.drum ? URL.createObjectURL(blobs.drum) : null,
+              bass: blobs.bass ? URL.createObjectURL(blobs.bass) : null,
+              mid:  blobs.mid  ? URL.createObjectURL(blobs.mid)  : null,
+              lead: blobs.lead ? URL.createObjectURL(blobs.lead) : null,
+            },
+            rawBlobs: blobs,
+          };
+          setBbEntries(billboard.entries.slice());
+          setBbRec({on:false, remaining:0});
+          collectiveBrainSave();
+          addLog('[BILLBOARD] Track saved: '+entry.title+' ('+entry.genre+')');
+        }catch(e){
+          console.warn('[billboard] finish failed', e);
+          setBbRec({on:false, remaining:0});
+        }
+      };
+    }catch(err){ addLog('Billboard record error: '+err.message); setBbRec({on:false, remaining:0}); }
+  };
+
+  const rateBillboard = (entryId, voice, stars) => {
+    billboard.rate(entryId, voice, stars);
+    setBbEntries(billboard.entries.slice());
+    collectiveBrainSave();
+  };
+
+  const deleteBillboardEntry = (entryId) => {
+    billboard.remove(entryId);
+    const b = bbBlobsRef.current[entryId];
+    if(b){
+      [b.master, b.stems?.drum, b.stems?.bass, b.stems?.mid, b.stems?.lead]
+        .forEach(u => { try{ if(u) URL.revokeObjectURL(u); }catch(_){} });
+      delete bbBlobsRef.current[entryId];
+    }
+    setBbEntries(billboard.entries.slice());
+    collectiveBrainSave();
+  };
+
+  // "Remix" the #1 champion: loads its stems as drum/mid samples so the user
+  // can jam over them. The user's new recording becomes a competition entry.
+  const remixChampion = (entryId) => {
+    const e = billboard.entries.find(x=>x.id===entryId); if(!e) return;
+    const b = bbBlobsRef.current[entryId]; if(!b){ addLog('[BILLBOARD] Stems unavailable (memory-only).'); return; }
+    (async ()=>{
+      try{
+        const ctx = AR.current.ctx || new (window.AudioContext||window.webkitAudioContext)();
+        const loadTo = async (blob, slot)=>{
+          if(!blob) return;
+          const ab = await ctx.decodeAudioData(await blob.arrayBuffer());
+          setDrumSample(slot, ab);
+        };
+        if(b.rawBlobs){
+          await loadTo(b.rawBlobs.drum, 'kick');   // drop drum stem into kick slot
+          await loadTo(b.rawBlobs.mid,  'mid');
+        }
+        addLog('[BILLBOARD] Remix mode: stems from "'+e.title+'" loaded. Start jamming, record with Record Billboard.');
+      }catch(err){ addLog('Remix load failed: '+err.message); }
+    })();
+  };
+
+  const downloadBillboardBlob = (entryId, voice) => {
+    const b = bbBlobsRef.current[entryId]; if(!b){ addLog('Blob unavailable.'); return; }
+    const url = voice==='master' ? b.master : b.stems?.[voice];
+    if(!url){ addLog('No '+voice+' stem.'); return; }
+    const e = billboard.entries.find(x=>x.id===entryId);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(e?.title||'track').replace(/\s+/g,'_')}-${voice}.webm`;
+    document.body.appendChild(a); a.click(); a.remove();
   };
 
   // -- PHRASE RECORDING -------------------------------------------------------
@@ -7880,6 +8679,10 @@ function App(){
   // -- SCHEDULE NOTE ---------------------------------------------------------
   const scheduleNote=(beat,time)=>{
     const ar=AR.current;const voices=voicesRef.current;
+    // Expose voices globally so stateless synth functions can observe winding
+    // for deepDesign rewards without threading a ref argument through every
+    // call site.
+    if(typeof window!=='undefined') window._bandVoices = voices;
     // Motif phase vars -- used by drums, bass AND mid so must be at function scope
     const motifShape   = ar._motifShape||{densityMod:1,chaosMod:1,leadMod:1};
     const isCall       = ar._motifPhase==='call';
@@ -7913,6 +8716,20 @@ function App(){
 
     if(beat===0){
       ar.measureCount=(ar.measureCount||0)+1;
+      // Grossbeat gate pattern advance -- rotates pattern every bar boundary.
+      try{ if(typeof grossbeat!=='undefined') grossbeat.onBar(); }catch(_){}
+      // Dissonance bank observe: use winding delta from last bar as reward
+      // for the prior chord's interval set. Teaches "good dissonance" vs "bad
+      // dissonance" in the context of this chord type.
+      try{
+        const wNow = (voices.mid?.winding||0) + (voices.lead?.winding||0);
+        const wLast = ar._dbLastWind ?? wNow;
+        const rPc = ((rootMidi%12)+12)%12;
+        const ct0 = CHORDS[ar._dbLastChord||chordType]||CHORDS.maj;
+        dissonanceBank.observe(ar._dbLastChord||chordType, ct0.iv, (wNow-wLast)*0.15, rPc);
+        ar._dbLastWind  = wNow;
+        ar._dbLastChord = chordType;
+      }catch(_){}
       // Per-voice pause system: voices can take 1-2 bars off so the groove
       // can breathe. New rests are seeded sparingly (roughly every 6-10
       // bars per voice) and only when tension is low.
@@ -8194,9 +9011,19 @@ function App(){
         bass_active: !mutes.bass,
         invRadius:   Math.round(60 + (ar.lockedBpm||ar.bpm) * 0.5), // radius hint for sims
       });
+      // Teach dissonance bank the current scale (every chord's intervals get
+      // marked as "in key" for the current root so in-key dissonant picks are
+      // guaranteed to stay on the mode).
+      try{
+        const ct0 = CHORDS[chordType]||CHORDS.maj;
+        const rPc = ((rootMidi%12)+12)%12;
+        for(const iv of ct0.iv) dissonanceBank.markScale(rPc, rPc+iv);
+      }catch(_){}
     }
 
     const bk=beat%stepsPerMeasure;
+    // Grossbeat gate step advance -- drives the master gate pattern.
+    try{ if(typeof grossbeat!=='undefined') grossbeat.onStep(ctx, bk); }catch(_){}
     const hist=ar.rhythmHistory[bk]||{k:false,s:false,h:false,b:false,m:false,l:false};
     // Check rhythm memory for a suggested pattern -- nudges probability
     const rhythmSuggest=rhythmMemory.suggest(chordType,stepsPerMeasure);
@@ -8404,6 +9231,102 @@ function App(){
             dp.s[st] = 0.30;
           }
         }
+
+        // -- DRUM FEEL PASS ---------------------------------------------------
+        // Calm the drummer down. `_drumFeel` is user-settable ('normal' |
+        // 'halftime' | 'doubletime' | 'delta_sparse' | 'ballad' | 'auto').
+        // When auto, pick based on tempo, arc, and user activity so slow
+        // ballads and low-energy arcs auto-thin. Delta-blues feel = many bars
+        // with no drums at all. The drummer can finally chill.
+        (function applyDrumFeel(){
+          const bpmNow = (ar.lockedBpm||ar.bpm)||110;
+          const userFeel = ar._drumFeel || 'auto';
+          const curArcName = (tensionArc.currentArc && tensionArc.currentArc.name) || '';
+          const lowArcs = ['ballad','to_to_pause_from','from_from_from','shock_settle'];
+          let feel = userFeel;
+          if(feel === 'auto'){
+            // Low tempo + low arc + user not drumming = delta sparse
+            const onsetR = ar._onsetRate||0;
+            const lowArc = lowArcs.includes(curArcName);
+            if(bpmNow < 72 && lowArc && onsetR < 1.0 && Math.random()<0.55) feel='delta_sparse';
+            else if(bpmNow < 80 && Math.random()<0.25)                      feel='halftime';
+            else if(bpmNow > 150 && Math.random()<0.15)                     feel='doubletime';
+            else if(lowArc && Math.random()<0.35)                           feel='ballad';
+            else                                                             feel='normal';
+          }
+          ar._drumFeelActive = feel;
+          if(feel === 'normal') return;
+
+          const clearAll = ()=>{
+            for(let st=0;st<16;st++){ dp.k[st]=0; dp.s[st]=0; dp.h[st]=0; dp.hOpen[st]=false; }
+          };
+
+          if(feel === 'halftime'){
+            // Keep kick on 1 only (step 0) and snare on 3 only (step 8).
+            // Hats thin to quarter-note accents. Everything else clears.
+            const k0 = dp.k[0]>0 ? Math.max(0.8, dp.k[0]) : 0.85;
+            const s8 = 0.75;
+            for(let st=0;st<16;st++){
+              dp.k[st] = (st===0) ? k0 : 0;
+              dp.s[st] = (st===8) ? s8 : 0;
+              dp.h[st] = (st%4===0) ? 0.45 : 0;
+              dp.hOpen[st] = false;
+            }
+            return;
+          }
+
+          if(feel === 'doubletime'){
+            // Duplicate kicks on every 2 steps, snare on 4,12 instead of 4,12.
+            // Hats to 16ths. Keep template velocities but densify.
+            const baseK = dp.k.slice(); const baseS = dp.s.slice();
+            for(let st=0;st<16;st++){
+              if(baseK[st]>0){ dp.k[st] = baseK[st]; if(st+2<16 && !baseS[st+2]) dp.k[st+2] = baseK[st]*0.70; }
+              if(baseS[st]>0){ dp.s[st] = baseS[st]; }
+              dp.h[st] = Math.max(dp.h[st], 0.45);
+            }
+            return;
+          }
+
+          if(feel === 'ballad'){
+            // Soft, spacious: kick on 1 and sometimes 9; snare on 9 only.
+            // Hat on every 4th step, ghosts on 7 and 15 at 20%.
+            for(let st=0;st<16;st++){
+              dp.k[st] = (st===0) ? 0.75 : (st===8 && Math.random()<0.45 ? 0.60 : 0);
+              dp.s[st] = (st===8) ? 0.65 : 0;
+              dp.h[st] = (st%4===0) ? 0.40 : 0;
+              dp.hOpen[st] = false;
+            }
+            return;
+          }
+
+          if(feel === 'delta_sparse'){
+            // Delta-blues feel: most bars nearly empty. 45% of bars have
+            // only a single kick on 1. 25% add a lazy snare on 9. 20% play
+            // a shuffled kick-snare on 1 and 9. 10% play NOTHING at all.
+            // Zero hats (or a single tick on 1 at 15% chance).
+            clearAll();
+            const roll = Math.random();
+            if(roll < 0.10){
+              // Rest bar. No drums.
+              return;
+            } else if(roll < 0.55){
+              // Kick on 1 only
+              dp.k[0] = 0.80;
+              if(Math.random()<0.15) dp.h[0] = 0.25;
+            } else if(roll < 0.80){
+              // Kick 1 + snare 9
+              dp.k[0] = 0.80;
+              dp.s[8] = 0.55;
+            } else {
+              // Kick 1 + kick 9 (trudging blues shuffle)
+              dp.k[0] = 0.80;
+              dp.k[8] = 0.60;
+              if(Math.random()<0.30) dp.s[12] = 0.45;
+            }
+            return;
+          }
+        })();
+
         ar._drumPattern = dp;
       }
       const dp=ar._drumPattern||{k:new Array(16).fill(0),s:new Array(16).fill(0),h:new Array(16).fill(0),hOpen:new Array(16).fill(false)};
@@ -9583,7 +10506,7 @@ function App(){
 
     {/* TAB BAR */}
     <div className="flex gap-2">
-      {[['band','BAND'],['improv','IMPROV'],['sim3','SIM3 VIZ']].map(([id,label])=>(
+      {[['band','BAND'],['improv','IMPROV'],['billboard','BILLBOARD']].map(([id,label])=>(
         <button key={id} onClick={()=>setActiveTab(id)}
           className={"px-4 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest border transition-all "+(activeTab===id?'bg-cyan-500/15 text-cyan-300 border-cyan-500/40':'bg-slate-800/40 text-slate-500 border-slate-700 hover:border-slate-500')}>
           {label}
@@ -10121,6 +11044,21 @@ function App(){
           </button>
         </div>
 
+        {/* Drum feel + Grossbeat gate */}
+        <div className="flex items-center gap-1.5">
+          <span className="w-12 text-[9px] uppercase tracking-widest font-bold text-rose-400">Feel</span>
+          <button onClick={()=>{ const n = (typeof cycleDrumFeel==='function') ? cycleDrumFeel() : null; if(n) addLog('[DRUMS] feel='+n); }}
+            title="Cycle drum feel: auto, normal, halftime, doubletime, delta_sparse (lots of empty bars), ballad"
+            className="flex-1 px-2 py-1.5 bg-slate-800/60 hover:bg-rose-500/20 border border-slate-700 rounded text-[9px] font-bold uppercase tracking-widest text-rose-200">
+            {(AR.current._drumFeel||'auto')}
+          </button>
+          <button onClick={()=>{ const on = (typeof grossbeat!=='undefined') ? grossbeat.toggle() : false; addLog('[GATE] grossbeat '+(on?'ON':'OFF')); }}
+            title="Grossbeat-style auto DJ gate: tempo-synced cuts, stutters, and reverse swells rotated every 4 bars"
+            className="px-2 py-1.5 bg-slate-800/60 hover:bg-fuchsia-500/20 border border-slate-700 rounded text-[9px] font-bold uppercase tracking-widest text-fuchsia-200">
+            Gate
+          </button>
+        </div>
+
         {/* Bass row */}
         <div className="flex items-center gap-1.5">
           <span className="w-12 text-[9px] uppercase tracking-widest font-bold text-amber-400">Bass</span>
@@ -10455,6 +11393,136 @@ function App(){
         {isPlaying?'HALT BAND':'START BAND'}
       </button>
 
+    </div>)}
+
+    {/* BILLBOARD TAB -- record a track, capture per-voice stems, rate, and
+        rank into a weekly Top-10 per genre. The #1 per genre each week is
+        featured for the community remix competition. */}
+    {activeTab==='billboard'&&(<div className="space-y-3">
+      <div className="bg-[#0b1120] border border-fuchsia-500/30 rounded-xl p-3 space-y-2">
+        <div className="text-[10px] text-fuchsia-300 uppercase tracking-widest font-bold">Record a Track</div>
+        <div className="grid grid-cols-2 gap-2">
+          <input type="text" placeholder="Track title"
+            value={bbForm.title}
+            onChange={e=>setBbForm(f=>({...f,title:e.target.value}))}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[10px] text-white placeholder-slate-500"/>
+          <input type="text" placeholder="Socials URL (https://...)"
+            value={bbForm.socials}
+            onChange={e=>setBbForm(f=>({...f,socials:e.target.value}))}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[10px] text-white placeholder-slate-500"/>
+        </div>
+        <div className="grid grid-cols-3 gap-2 items-center">
+          <select value={bbForm.genre} onChange={e=>setBbForm(f=>({...f,genre:e.target.value}))}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[10px] text-white">
+            {['pop','jazz','edm','hiphop','westcoast','eastcoast','african','indian'].map(g=>(
+              <option key={g} value={g}>{g.toUpperCase()}</option>
+            ))}
+          </select>
+          <select value={bbForm.duration} onChange={e=>setBbForm(f=>({...f,duration:parseInt(e.target.value)}))}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[10px] text-white">
+            {[15,30,45,60,90].map(d=>(<option key={d} value={d}>{d}s</option>))}
+          </select>
+          <button onClick={startBillboardRecord} disabled={bbRec.on}
+            className={"py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest border transition-all "+
+              (bbRec.on?'bg-rose-500/20 text-rose-300 border-rose-500/50 animate-pulse':'bg-fuchsia-500 text-slate-900 border-fuchsia-400 hover:bg-fuchsia-400')}>
+            {bbRec.on ? ('REC · '+bbRec.remaining+'s') : 'RECORD'}
+          </button>
+        </div>
+        <div className="text-[8px] text-slate-500">Captures master + 4 stems (drum / bass / mid / lead). Stems become rateable and downloadable.</div>
+      </div>
+
+      {/* Genre picker for the top-10 view */}
+      <div className="bg-[#0b1120] border border-slate-800/60 rounded-xl p-3">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-[10px] text-amber-300 uppercase tracking-widest font-bold">
+            Top 10 · {bbViewGenre.toUpperCase()}
+          </div>
+          <select value={bbViewGenre} onChange={e=>setBbViewGenre(e.target.value)}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[9px] text-amber-200">
+            {['pop','jazz','edm','hiphop','westcoast','eastcoast','african','indian'].map(g=>(
+              <option key={g} value={g}>{g.toUpperCase()}</option>
+            ))}
+          </select>
+        </div>
+        {billboard.deepTop(bbViewGenre, 10).length === 0 && (
+          <div className="text-[9px] text-slate-500 py-3 text-center">No tracks yet. Record one above to seed the chart.</div>
+        )}
+        {billboard.deepTop(bbViewGenre, 10).map((e,i)=>{
+          const blobs = bbBlobsRef.current[e.id] || {};
+          const isChamp = i===0 && e.ratingCount>0;
+          return (
+            <div key={e.id} className={"rounded-lg border mb-2 p-2 "+(isChamp?'border-amber-400/60 bg-amber-500/5':'border-slate-700 bg-slate-900/40')}>
+              <div className="flex items-center gap-2 mb-1">
+                <span className={"text-xs font-black w-6 "+(isChamp?'text-amber-300':'text-slate-500')}>#{i+1}</span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[11px] text-white font-bold truncate">{e.title}</div>
+                  <div className="text-[8px] text-slate-500">
+                    {e.genre.toUpperCase()} · {e.ratingCount} rating{e.ratingCount===1?'':'s'} · avg {e.totalRating.toFixed(2)}/5
+                    {e.socials && <> · <a href={e.socials} target="_blank" rel="noreferrer" className="text-cyan-400 hover:underline">socials</a></>}
+                  </div>
+                </div>
+                {isChamp && e.ratingCount>0 && (
+                  <button onClick={()=>remixChampion(e.id)}
+                    className="px-2 py-1 bg-amber-500/20 border border-amber-500/40 rounded text-[8px] font-bold uppercase text-amber-200 hover:bg-amber-500/30">
+                    Remix
+                  </button>
+                )}
+                <button onClick={()=>deleteBillboardEntry(e.id)}
+                  className="px-2 py-1 text-[10px] text-slate-500 hover:text-rose-400">×</button>
+              </div>
+
+              {/* Master playback */}
+              {blobs.master && (
+                <audio controls src={blobs.master} className="w-full h-6 mb-1" style={{height:'24px'}}/>
+              )}
+
+              {/* Per-voice rating + download */}
+              <div className="grid grid-cols-2 gap-1.5 text-[9px]">
+                {['drum','bass','mid','lead'].map(v=>(
+                  <div key={v} className="flex items-center gap-1 bg-slate-900/60 rounded px-1.5 py-1 border border-slate-800">
+                    <span className={"w-10 uppercase tracking-widest font-bold "+(
+                      v==='drum'?'text-rose-400':v==='bass'?'text-amber-400':v==='mid'?'text-violet-400':'text-cyan-400'
+                    )}>{v}</span>
+                    {[1,2,3,4,5].map(s=>(
+                      <button key={s} onClick={()=>rateBillboard(e.id, v, s)}
+                        className={"w-4 h-4 text-[10px] leading-none "+
+                          (s <= Math.round(e.ratings[v]) ? 'text-amber-300' : 'text-slate-700 hover:text-amber-400')}>
+                        ★
+                      </button>
+                    ))}
+                    <span className="text-[8px] text-slate-500 w-6">{e.ratings[v].toFixed(1)}</span>
+                    {blobs.stems?.[v] && (
+                      <button onClick={()=>downloadBillboardBlob(e.id, v)}
+                        title={'Download '+v+' stem'}
+                        className="ml-auto px-1 text-[8px] text-cyan-400 hover:text-cyan-300">⇩</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Weekly champion / competition card */}
+      <div className="bg-[#0b1120] border border-amber-500/30 rounded-xl p-3">
+        <div className="text-[10px] text-amber-300 uppercase tracking-widest font-bold mb-2">Weekly Competition</div>
+        <div className="text-[9px] text-slate-400 leading-relaxed mb-2">
+          Every week the deep-learned #1 per genre is crowned. Tap <span className="text-amber-300 font-bold">Remix</span> on a #1 entry above to load its stems as samples, then jam over them and record your own entry. Top-rated remix next week wins a featured slot with a link to your socials.
+        </div>
+        <div className="grid grid-cols-2 gap-1 text-[9px]">
+          {['pop','jazz','edm','hiphop','westcoast','eastcoast','african','indian'].map(g=>{
+            const top = billboard.deepTop(g, 1)[0];
+            return (
+              <div key={g} className="flex items-center gap-1 bg-slate-900/60 rounded px-2 py-1 border border-slate-800">
+                <span className="uppercase text-amber-400 font-bold w-12 text-[8px]">{g}</span>
+                <span className="text-[9px] text-white truncate flex-1">{top?top.title:'—'}</span>
+                {top && <span className="text-[8px] text-amber-300">{top.totalRating.toFixed(1)}★</span>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
     </div>)}
 
     {/* SIM3 VIZ TAB */}
