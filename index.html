@@ -1134,7 +1134,9 @@ class AudioBus{
         }
       }
       const conv = ctx.createConvolver(); conv.buffer = irBuf;
-      const sendGain = ctx.createGain(); sendGain.gain.value = 0.18;
+      // Bumped to 0.28 -- drums are shorter/drier now so we can afford more
+      // plate for the "wet" snare feel without muddying the mix.
+      const sendGain = ctx.createGain(); sendGain.gain.value = 0.28;
       // Sharp cutoffs: HP at 1.6 kHz so reverb tail isn't boomy, LP at 7 kHz
       // so it isn't hissy. Reverb sits right in the snare's natural body band.
       const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=1600; hp.Q.value=0.8;
@@ -1154,9 +1156,13 @@ class AudioBus{
     this.bassComp.attack.value=0.008;  // 8ms -- preserves attack character
     this.bassComp.release.value=0.20;  // 200ms smooth release
     this.bassComp.connect(masterGain);
-    const bassHPF=ctx.createBiquadFilter();bassHPF.type='highpass';bassHPF.frequency.value=55;bassHPF.Q.value=0.7;
-    const bassLPF=ctx.createBiquadFilter();bassLPF.type='lowpass';bassLPF.frequency.value=600;bassLPF.Q.value=0.5;
-    bassHPF.connect(bassLPF);bassLPF.connect(this.bassComp);
+    const bassHPF=ctx.createBiquadFilter();bassHPF.type='highpass';bassHPF.frequency.value=50;bassHPF.Q.value=0.7;
+    const bassLPF=ctx.createBiquadFilter();bassLPF.type='lowpass';bassLPF.frequency.value=380;bassLPF.Q.value=0.4;
+    // Extra 2 kHz shelf cut so any leftover harmonic fizz gets killed outright
+    // -- bass should be felt, not heard above the chord voice.
+    const bassShelf=ctx.createBiquadFilter(); bassShelf.type='highshelf';
+    bassShelf.frequency.value=1200; bassShelf.gain.value=-14;
+    bassHPF.connect(bassLPF);bassLPF.connect(bassShelf);bassShelf.connect(this.bassComp);
     this.bassBus=ctx.createGain();this.bassBus.gain.value=0.88;
     this.bassBus.connect(bassHPF);
 
@@ -3113,6 +3119,76 @@ const MID_CHARACTERS = {
     chorus:{ delayMs:[16, 22], lfoHz:[0.4, 0.7], mix:0.30 },
     voices:1, detuneCents:[0],
   },
+  // Funky Rhodes -- MK1 with the suitcase-phaser + wah stomped. Heavier
+  // tremolo than the MK2 preset, mild tube drive, open bandpass swept by
+  // a slow LFO for the funk clav/Stevie vibe.
+  'funky-rhodes': {
+    body: { type:'fm-alg5', pairs:[
+      {ratio:14.0, modIdx:[0.55, 0.70], carGain:0.20, modDecay:0.08},   // tine (brighter)
+      {ratio:2.01, modIdx:[0.22, 0.32], carGain:0.25, modDecay:0.30},   // bar
+      {ratio:2.00, modIdx:[0.06, 0.09], carGain:0.11, modDecay:0.55, suboct:true}, // body
+    ]},
+    air: { burst:true, bpCenter:[900, 1800], bpQ:1.1, gain:0.14, durMs:10 },
+    sub: { enabled:false },
+    tail: { resonantPartials:true, durMs:[160, 380] },
+    filter:{ type:'bandpass', cutoff:[1200, 3600], Q:[0.7, 1.4], wah:true, sweep:true, sweepHz:[0.18, 0.45] },
+    attack:{ type:'hammer', peakMs:5, curve:0.7, extraKnock:true },
+    satAmount:1.8,  // gentle tube overdrive
+    trem:{ rateHz:[5.8, 7.5], depth:0.22 },  // deeper suitcase tremolo
+    chorus:{ delayMs:[8, 14], lfoHz:[0.55, 1.10], mix:0.45 },  // phase-shifted short chorus
+    voices:1, detuneCents:[0],
+  },
+  // Trumpet: soft odd-partial brass. Mild breath onset + air bed for
+  // acoustic realism, subtle vibrato, slight saturation for bell buzz.
+  'trumpet': {
+    body: { type:'additive', partials:[
+      {n:1, g:0.32}, {n:2, g:0.22}, {n:3, g:0.16},
+      {n:4, g:0.10}, {n:5, g:0.06}, {n:6, g:0.035}, {n:7, g:0.020},
+    ], inharmonicity:0 },
+    air: { burst:true, hpCenter:[1500, 2400], gain:0.06, durMs:40 },  // breath onset
+    sub: { enabled:false },
+    tail: { durMs:[250, 500] },
+    filter:{ type:'bandpass', cutoff:[1600, 3200], Q:[0.6, 1.1], envMod:true },  // bell emphasis
+    attack:{ type:'medium', peakMs:28, curve:0.7 },
+    satAmount:1.5,
+    trem:{ rateHz:[4.8, 6.2], depth:0.08 },   // slight brass vibrato
+    chorus:null,
+    voices:1, detuneCents:[0],
+  },
+  // Sax (tenor/alto crossover): warmer than trumpet, reedy odd+even partials,
+  // tube-style saturation, medium attack, breath noise burst on onset.
+  'sax': {
+    body: { type:'additive', partials:[
+      {n:1, g:0.34}, {n:2, g:0.14}, {n:3, g:0.18},
+      {n:4, g:0.08}, {n:5, g:0.10}, {n:6, g:0.04}, {n:7, g:0.05},
+    ], inharmonicity:0.0002 },
+    air: { burst:true, hpCenter:[900, 1700], gain:0.09, durMs:34 },   // reed chuff
+    sub: { enabled:false },
+    tail: { durMs:[300, 700] },
+    filter:{ type:'lowpass', cutoff:[1800, 3400], Q:[0.8, 1.3] },
+    attack:{ type:'medium', peakMs:22, curve:0.6 },
+    satAmount:1.8,
+    trem:{ rateHz:[4.5, 5.8], depth:0.12 },   // growl vibrato
+    chorus:null,
+    voices:1, detuneCents:[0],
+  },
+  // Violin: bowed string, even partials, slow attack, rich vibrato, gentle
+  // filter sweep for bow pressure variation.
+  'violin': {
+    body: { type:'additive', partials:[
+      {n:1, g:0.30}, {n:2, g:0.20}, {n:3, g:0.14},
+      {n:4, g:0.09}, {n:5, g:0.06}, {n:6, g:0.04}, {n:7, g:0.025}, {n:8, g:0.018},
+    ], inharmonicity:0.0001 },
+    air: { burst:false, continuousBed:true, gain:0.030, lpCenter:5200 }, // bow hiss
+    sub: { enabled:false },
+    tail: { durMs:[400, 900] },
+    filter:{ type:'lowpass', cutoff:[2200, 4800], Q:[0.4, 1.0], sweep:true, sweepHz:[0.12, 0.30] },
+    attack:{ type:'slow', peakMs:90, curve:0.55 },
+    trem:{ rateHz:[5.5, 7.2], depth:0.18 },    // bowed vibrato
+    chorus:null,
+    bodyResonance:{ peaks:[[290, 5], [460, 4]] },  // violin body modes
+    voices:1, detuneCents:[0],
+  },
 };
 
 // ── STYLE PROFILE: jazz / pop / edm ─────────────────────────────────────────
@@ -3121,7 +3197,7 @@ let kickStyle = 'pop'; // 'jazz' | 'pop' | 'edm'
 
 const STYLE_PROFILES = {
   jazz: {
-    kickF0:[60,120],kickF1:[28,40],kickDecay:[0.28,0.45],kickPunch:[0.45,0.65],kickClick:0.12,kickSub:0.55,
+    kickF0:[60,120],kickF1:[28,40],kickDecay:[0.18,0.28],kickPunch:[0.45,0.65],kickClick:0.12,kickSub:0.55,
     noteLenMult:1.9, microJitter:0.018, microSubdiv:0.35, swingBoost:12, attackMult:2.2,
     bassMode:'upright',  // upright acoustic bass
     midMode:'rhodes',    // Rhodes electric piano
@@ -3131,20 +3207,20 @@ const STYLE_PROFILES = {
     shuffleFeel:true,      // 16th grid swung 2:1 (triplet eighths)
     soloistStyle:'auto',   // Django for pluck leads, Ruben for rhodes/piano
     chromaRate:2,          // 1 chromatic approach every ~2 bars
-    midBank:['grand-piano','rhodes-mk2','vibraphone','nylon-guitar'],
-    leadBank:['bell','pluck','moog'],
+    midBank:['grand-piano','rhodes-mk2','funky-rhodes','vibraphone','nylon-guitar','sax','trumpet'],
+    leadBank:['bell','pluck','moog','sax','trumpet'],
     label:'Jazz',
   },
   pop: {
-    kickF0:[110,200],kickF1:[28,48],kickDecay:[0.18,0.30],kickPunch:[0.70,0.92],kickClick:0.45,kickSub:0.78,
+    kickF0:[110,180],kickF1:[28,42],kickDecay:[0.12,0.22],kickPunch:[0.80,1.00],kickClick:0.30,kickSub:0.78,
     noteLenMult:1.0, microJitter:0.006, microSubdiv:0.12, swingBoost:0, attackMult:1.0,
     bassMode:'electric', // standard electric bass
     midMode:'keys',
     leadMode:'saw',      // classic poly-saw lead
     hatMode:'metallic',  // standard physical cymbal model -- clean, bright
     hatGrooveOffset:0,   // on the grid
-    midBank:['grand-piano','rhodes-mk2','string-ensemble','nylon-guitar'],
-    leadBank:['bell','pluck','moog'],
+    midBank:['grand-piano','rhodes-mk2','string-ensemble','nylon-guitar','funky-rhodes','violin'],
+    leadBank:['bell','pluck','moog','sax'],
     label:'Pop',
   },
   edm: {
@@ -3164,7 +3240,7 @@ const STYLE_PROFILES = {
     label:'Hip-Hop/EDM',
   },
   hiphop: {
-    kickF0:[140,220],kickF1:[30,45],kickDecay:[0.28,0.45],kickPunch:[0.82,1.05],kickClick:0.60,kickSub:1.10,
+    kickF0:[140,200],kickF1:[30,42],kickDecay:[0.18,0.28],kickPunch:[0.90,1.10],kickClick:0.40,kickSub:1.05,
     noteLenMult:0.70, microJitter:0.003, microSubdiv:0.08, swingBoost:8, attackMult:0.65,
     bassMode:'808',
     midMode:'rhodes',
@@ -3174,8 +3250,8 @@ const STYLE_PROFILES = {
     halftimeBias:true,     // snare only on step 12 (beat 4) — J-Dilla halftime
     snareDensity:0.5,      // drop 50% of non-backbeat snare candidates
     tempoBias:{range:[78,92], prob:0.33}, // 33% chance BPM snaps to Dilla pocket
-    midBank:['rhodes-mk2','grand-piano','vibraphone','nylon-guitar'],
-    leadBank:['bell','pluck','moog'],
+    midBank:['rhodes-mk2','funky-rhodes','grand-piano','vibraphone','nylon-guitar','sax'],
+    leadBank:['bell','pluck','moog','sax'],
     label:'Hip-Hop',
   },
   westcoast: {
@@ -3186,8 +3262,8 @@ const STYLE_PROFILES = {
     leadMode:'moog',     // warm analog lead (dropped the dogwhistle)
     hatMode:'tape',      // same tape-sat vibe as hip-hop
     hatGrooveOffset:0.010, // deep pocket -- G-Funk drags hard
-    midBank:['rhodes-mk2','grand-piano','string-ensemble'],
-    leadBank:['bell','pluck','moog'],
+    midBank:['rhodes-mk2','funky-rhodes','grand-piano','string-ensemble','sax'],
+    leadBank:['bell','pluck','moog','sax'],
     label:'West Coast',
   },
   eastcoast: {
@@ -3235,15 +3311,15 @@ const STYLE_PROFILES = {
   rock: {
     // Classic-rock template: Skynyrd / Hendrix / ZZ Top. Strat lead, pick
     // bass for attack, driving kick around 140 Hz with a hard transient.
-    kickF0:[130,200],kickF1:[35,50],kickDecay:[0.22,0.36],kickPunch:[0.82,1.05],kickClick:0.55,kickSub:0.85,
+    kickF0:[130,200],kickF1:[35,50],kickDecay:[0.14,0.24],kickPunch:[0.90,1.15],kickClick:0.45,kickSub:0.82,
     noteLenMult:1.05, microJitter:0.005, microSubdiv:0.10, swingBoost:3, attackMult:0.85,
     bassMode:'pick',     // bright picked electric bass
     midMode:'rhodes',
     leadMode:'strat',    // single-coil saturated lead
     hatMode:'metallic',  // tight rock hats
     hatGrooveOffset:0,
-    midBank:['rhodes-mk2','grand-piano','nylon-guitar','string-ensemble'],
-    leadBank:['strat','saw','moog'],
+    midBank:['rhodes-mk2','funky-rhodes','grand-piano','nylon-guitar','string-ensemble','violin'],
+    leadBank:['strat','saw','moog','sax'],
     label:'Rock',
   },
 };
@@ -3603,11 +3679,14 @@ function kickSineSweep(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
   // transient has a bit of sparkle) then closes to ~180 Hz as the body dies.
   // This is the "high[low]pass to remove highs" the user asked for.
   const lpf=ctx.createBiquadFilter(); lpf.type='lowpass';
-  const lpfOpen = 3200 + punch*1800;            // open on transient
-  const lpfClose = 180 + s.tone*80;             // close to body/sub
+  // Thumpy + wet: LPF opens less (2.1 kHz vs 3.2 kHz) so the transient
+  // doesn't splat, and closes to ~110 Hz in half the decay window -- cuts
+  // the tail dead for a short, chesty kick.
+  const lpfOpen = 2100 + punch*900;
+  const lpfClose = 105 + s.tone*35;
   lpf.frequency.setValueAtTime(lpfOpen,t);
-  lpf.frequency.exponentialRampToValueAtTime(Math.max(80,lpfClose),t+decay*0.75);
-  lpf.Q.value=0.72;
+  lpf.frequency.exponentialRampToValueAtTime(Math.max(70,lpfClose),t+decay*0.50);
+  lpf.Q.value=0.58;
 
   // Volume envelope: fast attack, quick sag, exponential decay.
   const bg=ctx.createGain();
@@ -4116,22 +4195,25 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
   crack.start(t);
   autoClean(crack,ckHpf,cg);
 
-  // Snare-wire tail — skip for ghost (too quiet) and rim (no head contact)
+  // Snare-wire tail — skip for ghost (too quiet) and rim (no head contact).
+  // Halved length + LPF lowered from 8 kHz to 4.5 kHz so the snare thumps
+  // and dies instead of hissing on. Matches the "thumpy wet dies quick"
+  // character the user wanted.
   if(art==='ghost' || art==='rim') return;
-  const tLen=Math.floor(ctx.sampleRate*(0.16+chaos*0.12+s.decay*0.08)/warp);
+  const tLen=Math.floor(ctx.sampleRate*(0.075+chaos*0.05+s.decay*0.04)/warp);
   const tBuf=ctx.createBuffer(2,tLen,ctx.sampleRate);
   for(let ch=0;ch<2;ch++){
     const td=tBuf.getChannelData(ch);
     for(let i=0;i<tLen;i++){
-      td[i]=(Math.random()*2-1)*(ch===0?1+s.color*0.3:1-s.color*0.3);
+      td[i]=(Math.random()*2-1)*(ch===0?1+s.color*0.3:1-s.color*0.3)*Math.pow(1-i/tLen, 1.4);
     }
   }
   const tail=ctx.createBufferSource();tail.buffer=tBuf;
-  const hpf=ctx.createBiquadFilter();hpf.type='highpass';hpf.frequency.value=(1200+chaos*2000+s.color*1200)*warp;
-  const lpf=ctx.createBiquadFilter();lpf.type='lowpass';lpf.frequency.value=(8000+s.click*6000)*warp;
+  const hpf=ctx.createBiquadFilter();hpf.type='highpass';hpf.frequency.value=(900+chaos*900+s.color*800)*warp;
+  const lpf=ctx.createBiquadFilter();lpf.type='lowpass';lpf.frequency.value=(4500+s.click*2000)*warp;
   const tg=ctx.createGain();
-  tg.gain.setValueAtTime(s.tone*0.52*vel,t);
-  tg.gain.linearRampToValueAtTime(0.0001,t+(0.18+s.decay*0.10)/warp);
+  tg.gain.setValueAtTime(s.tone*0.38*vel,t);
+  tg.gain.linearRampToValueAtTime(0.0001,t+(0.085+s.decay*0.04)/warp);
   tail.connect(hpf);hpf.connect(lpf);lpf.connect(tg);tg.connect(dest);
   tail.start(t);
   autoClean(tail,hpf,lpf,tg);
@@ -4685,69 +4767,106 @@ function synthSubBass(ctx, t, note, chaos, warp, windBoost=0, beat=0){
 // ── PER-GENRE BASS SYNTHS ─────────────────────────────────────────────────────
 
 // 808 sub bomb: sine sweep with long tail + pitch envelope + noise transient
+// ── 808 SYNTHESIS RECIPE (hiphop + edm) ──────────────────────────────────
+// User's spec: saw + square + sine layered, dropped an octave, amp/distortion,
+// envelope with a pitch-UP transient that then sustains via replaying a
+// section of the pre-rendered waveform clipped to zero-crossings (no pops).
+// Implementation:
+//   1) Three primary oscillators (saw, square, sine) an octave below the
+//      played note, mixed roughly 0.35/0.25/0.55.
+//   2) Pitch envelope: +12 semitones for 18 ms at the attack, then glides to
+//      the fundamental (this is the "transient pitch-up" they asked for).
+//   3) Waveshaper distortion after the mix for amp grit.
+//   4) Sustain loop: a short (~40 ms) pre-rendered chunk of the fundamental
+//      sine, cropped at zero-crossings, looped through the decay so the
+//      tail doesn't thin out and doesn't click on loop-back.
 function synth808(ctx, t, note, chaos, warp, windBoost=0, destIn=null){
   const dest=destIn||bus.getInput('bass'); if(!dest)return;
-  const baseFreq=440*Math.pow(2,(note-69)/12);
+  // Drop an octave per the user's spec -- 808s sit way down.
+  const noteDown = note - 12;
+  const baseFreq = 440*Math.pow(2,(noteDown-69)/12);
   const s=drumSeed();
-  // Per-note length class: 25% short (stab), 55% medium, 20% long (sub boom).
-  // The old fixed 1.2-2.4 s decay made every 808 ring into the next beat,
-  // which is what the user was complaining about. Now it varies hit-to-hit
-  // and a lot of them are short enough to leave air for the next note.
   const lenRoll = Math.random();
-  const lenClass = lenRoll < 0.25 ? 0.35 : lenRoll < 0.80 ? 0.70 : 1.20;
-  const decay=(lenClass + s.decay*0.25 + windBoost*0.25)/warp;
-  const punch=0.90+s.punch*0.15;
+  const lenClass = lenRoll < 0.25 ? 0.35 : lenRoll < 0.80 ? 0.70 : 1.10;
+  const decay = (lenClass + s.decay*0.20 + windBoost*0.20)/warp;
+  const punch = 0.88 + s.punch*0.15;
 
-  // ── Pitch envelope: drops from 2× to fundamental ──────────────────────────
-  const osc=ctx.createOscillator(); osc.type='sine';
-  osc.frequency.setValueAtTime(baseFreq*2.2,t);
-  osc.frequency.setTargetAtTime(baseFreq,t+0.005,0.03+chaos*0.04);  // portamento
-  osc.frequency.setTargetAtTime(baseFreq*0.985,t+0.2,0.15);         // slight drift
+  // Shared pitch envelope constants -- applied to all three oscs.
+  const blipEnd = t + 0.018;                   // 18 ms pitch-up window
+  const pitchUpFactor = Math.pow(2, 12/12);    // +12 st = ×2
 
-  const gainEnv=ctx.createGain();
-  gainEnv.gain.setValueAtTime(0,t);
-  gainEnv.gain.linearRampToValueAtTime(punch,t+0.003);
-  gainEnv.gain.setValueAtTime(punch*0.95,t+0.010);
-  gainEnv.gain.setTargetAtTime(0.0001,t+0.08,decay*0.38);
-  gainEnv.gain.setValueAtTime(0,t+decay+0.1);
+  const mkBody = (type, gainScale)=>{
+    const osc = ctx.createOscillator(); osc.type = type;
+    osc.frequency.setValueAtTime(baseFreq * pitchUpFactor, t);
+    osc.frequency.exponentialRampToValueAtTime(baseFreq, blipEnd);
+    osc.frequency.setTargetAtTime(baseFreq*0.992, blipEnd+0.08, 0.12);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(punch*gainScale, t+0.002);
+    g.gain.setTargetAtTime(0.0001, t+0.10, decay*0.38);
+    g.gain.setValueAtTime(0, t+decay+0.10);
+    osc.connect(g);
+    osc.start(t); osc.stop(t+decay+0.15);
+    return {osc, g};
+  };
 
-  // ── Saturation: asymmetric waveshaper for harmonic grit ──────────────────
-  const ws=ctx.createWaveShaper();
-  const cv=new Float32Array(512);
-  for(let i=0;i<512;i++){const x=i*2/512-1;cv[i]=x<0?-Math.pow(-x,0.7):Math.pow(x,0.85);}
-  ws.curve=cv; ws.oversample='4x';
+  const sinOsc = mkBody('sine',     0.55);
+  const sawOsc = mkBody('sawtooth', 0.35);
+  const sqrOsc = mkBody('square',   0.25);
 
-  // ── Sub layer: octave below for skull-rattling weight ─────────────────────
-  const sub=ctx.createOscillator(); sub.type='sine';
-  sub.frequency.setValueAtTime(baseFreq,t);
-  sub.frequency.setTargetAtTime(baseFreq*0.5,t+0.008,0.06);
-  const subG=ctx.createGain();
-  subG.gain.setValueAtTime(0,t);
-  subG.gain.linearRampToValueAtTime(0.70+windBoost*0.15,t+0.006);
-  subG.gain.setTargetAtTime(0.0001,t+0.1,decay*0.50);
-  subG.gain.setValueAtTime(0,t+decay+0.15);
+  // Mix bus for the three primary voices, then through the amp/distortion.
+  const mix = ctx.createGain(); mix.gain.value = 1.0;
+  sinOsc.g.connect(mix); sawOsc.g.connect(mix); sqrOsc.g.connect(mix);
 
-  // ── Click transient: snap at the top ──────────────────────────────────────
+  // Amp/distortion -- asymmetric tanh curve gives even harmonics for the
+  // chest/amp feel the user described, not just buzzy clipping.
+  const amp = ctx.createWaveShaper();
+  const N = 1024, crv = new Float32Array(N);
+  const drive = 1.8 + chaos*1.6 + windBoost*1.2 + s.punch*1.0;
+  for(let i=0;i<N;i++){ const x=(i*2/N)-1; crv[i] = Math.tanh(x*drive + 0.15*x*x); }
+  amp.curve = crv; amp.oversample = '4x';
+  // Amp lowpass to roll off the distortion fizz -- keeps it warm, not crunchy.
+  const ampLpf = ctx.createBiquadFilter(); ampLpf.type='lowpass';
+  ampLpf.frequency.value = 420 + chaos*160; ampLpf.Q.value = 0.6;
+  mix.connect(amp); amp.connect(ampLpf); ampLpf.connect(dest);
+
+  // Sustain loop: pre-render ~3 cycles of a pure sine at baseFreq, crop to
+  // an integer number of cycles (guarantees zero-crossing start+end so no
+  // click on loop), then play looped through the decay at low gain. This
+  // replaces the portion that would thin out as individual oscs fade and
+  // gives the body the "replayed at 0dB points" continuity the user asked
+  // for.
+  const SR = ctx.sampleRate;
+  const cycles = 4;
+  const samplesPerCycle = Math.max(8, Math.round(SR / Math.max(1, baseFreq)));
+  const loopLen = samplesPerCycle * cycles;
+  const loopBuf = ctx.createBuffer(1, loopLen, SR);
+  const ld = loopBuf.getChannelData(0);
+  for(let i=0;i<loopLen;i++) ld[i] = Math.sin(2*Math.PI * baseFreq * (i/SR));
+  const loopSrc = ctx.createBufferSource();
+  loopSrc.buffer = loopBuf; loopSrc.loop = true;
+  loopSrc.loopStart = 0;
+  loopSrc.loopEnd = loopLen / SR;
+  const loopG = ctx.createGain();
+  loopG.gain.setValueAtTime(0, t);
+  loopG.gain.linearRampToValueAtTime(punch*0.55+windBoost*0.10, t+0.012);
+  loopG.gain.setTargetAtTime(0.0001, t+0.15, decay*0.50);
+  loopG.gain.setValueAtTime(0, t+decay+0.15);
+  loopSrc.connect(loopG); loopG.connect(dest);
+  loopSrc.start(t); loopSrc.stop(t+decay+0.18);
+
+  // Click transient: crisp snap at t=0, pitched independent of the body.
   const click=ctx.createOscillator(); click.type='square';
-  click.frequency.setValueAtTime(baseFreq*8,t);
-  click.frequency.exponentialRampToValueAtTime(baseFreq*2,t+0.015/warp);
+  click.frequency.setValueAtTime(baseFreq*6,t);
+  click.frequency.exponentialRampToValueAtTime(baseFreq*1.8,t+0.015/warp);
   const cg=ctx.createGain();
-  cg.gain.setValueAtTime(0.55+chaos*0.15,t);
-  cg.gain.linearRampToValueAtTime(0.0001,t+0.025/warp);
-
-  // ── LPF: rolls off highs for boom-y body ──────────────────────────────────
-  const lpf=ctx.createBiquadFilter(); lpf.type='lowpass';
-  lpf.frequency.setValueAtTime(280+chaos*200,t);
-  lpf.frequency.setTargetAtTime(80,t+0.05,0.12);
-  lpf.Q.value=1.5;
-
-  osc.connect(ws); ws.connect(gainEnv); gainEnv.connect(lpf); lpf.connect(dest);
-  sub.connect(subG); subG.connect(dest);
+  cg.gain.setValueAtTime(0.50+chaos*0.15,t);
+  cg.gain.linearRampToValueAtTime(0.0001,t+0.022/warp);
   click.connect(cg); cg.connect(dest);
-  osc.start(t); osc.stop(t+decay+0.2);
-  sub.start(t); sub.stop(t+decay+0.2);
-  click.start(t); click.stop(t+0.035/warp);
-  autoClean(osc,ws,gainEnv,lpf); autoClean(sub,subG); autoClean(click,cg);
+  click.start(t); click.stop(t+0.030/warp);
+
+  autoClean(sinOsc.osc, sinOsc.g, sawOsc.osc, sawOsc.g, sqrOsc.osc, sqrOsc.g,
+            mix, amp, ampLpf, loopSrc, loopG, click, cg);
 }
 
 // Upright/acoustic bass: Karplus-Strong inspired pluck with body resonance
@@ -6282,15 +6401,8 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   g.gain.linearRampToValueAtTime(0.0001, t+decayTime+0.03);
   g.gain.setValueAtTime(0, t+decayTime+0.05);
 
-  // -- GROWL MODE: FM ring mod layer ------------------------------------
-  if(mode==='growl'){
-    const ring=ctx.createOscillator(); ring.type='sine';
-    ring.frequency.value=freq*(1.5+chaos*0.5+nn.subFreqMod*3);
-    const rg=ctx.createGain(); rg.gain.value=freq*(0.08+chaos*0.18+windBoost*0.10);
-    ring.connect(rg); rg.connect(body.frequency);
-    ring.start(t); ring.stop(t+decayTime+0.05);
-    autoClean(ring,rg);
-  }
+  // -- GROWL MODE: ring mod layer was squidward-ish. Disabled outright;
+  // growl now relies on the filter env + saw body for bite, nothing else.
 
   // -- SLAP MODE: transient click layer ---------------------------------
   if(mode==='slap'){
@@ -6336,27 +6448,17 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
     autoClean(ns,nlp,ng);
   }
 
-  // -- PRESENCE HARMONIC: overtone for articulation ----------------------
-  // lMed samples once at trigger time -- brightness drifts across notes
-  // without wobbling within a note (no cartoon effect).
-  const pres=ctx.createOscillator(); pres.type='sine';
-  pres.frequency.value=freq*(2+nn.harmonicMix*0.5);
-  const pg=ctx.createGain();
-  const presAmt = Math.max(0.02, (s.color*0.12+nn.filterCutoff*0.06) * (1 + lMed*0.45));
-  pg.gain.setValueAtTime(presAmt,t);
-  pg.gain.linearRampToValueAtTime(0.0001,t+0.14/warp);
-  pres.connect(pg); pg.connect(dest);
-  pres.start(t); pres.stop(t+0.18/warp);
-  autoClean(pres,pg);
+  // Presence harmonic removed -- was adding the high-end fizz the user
+  // complained about. Bass stays fundamental-only; the body osc plus
+  // filter env carries all the character.
 
-  // -- BASS LFO: gentle filter movement, growl mode only. Tuned WAY down
-  // (max 2.2Hz, max 150Hz depth) so it breathes instead of Squidward-wahing.
-  // Sustain mode is left clean -- long notes don't need a moving filter.
-  if(mode==='growl'){
+  // Bass filter LFO removed too (was the squidward wah). The filter env
+  // in the flt.frequency ramp does the work. No per-note wobble.
+  if(false && mode==='growl'){
     const bassLfo=ctx.createOscillator(); bassLfo.type='sine';
-    bassLfo.frequency.value=0.8+s.color*1.4;      // 0.8-2.2Hz, was 1.5-5Hz
+    bassLfo.frequency.value=0.8+s.color*1.4;
     const bassLfoGain=ctx.createGain();
-    bassLfoGain.gain.value=40+chaos*110;           // max 150Hz, was up to 572Hz
+    bassLfoGain.gain.value=40+chaos*110;
     bassLfo.connect(bassLfoGain); bassLfoGain.connect(flt.frequency);
     bassLfo.start(t); bassLfo.stop(t+decayTime+0.05);
     autoClean(bassLfo,bassLfoGain);
@@ -6374,7 +6476,8 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
         g.gain.cancelScheduledValues(t+decayTime*0.4);
         g.gain.exponentialRampToValueAtTime(0.0001, t+decayTime*0.5);
       } else if(_dd.move==='vibrato'){
-        const [lfo,g2] = expressionFX.vibrato(ctx, body.frequency, freq, 5.2, 15, t, decayTime+0.05);
+        // Very gentle bass vibrato (5 cents max) -- bigger depth reads as squidward.
+        const [lfo,g2] = expressionFX.vibrato(ctx, body.frequency, freq, 4.8, 5, t, decayTime+0.05);
         autoClean(lfo,g2);
       } else if(_dd.move==='tremolo' && (mode==='sustain'||mode==='growl'||mode==='finger')){
         const [lfo,g2] = expressionFX.tremolo(ctx, g.gain, 0.4, 6.5, 0.20, t, decayTime+0.05);
@@ -6531,7 +6634,7 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
   // Per-hit lead mode rotation: style default ~60% of the time, but 40% of
   // hits pick a different lead character (saw / fm / bell / whistle / pluck).
   // Wildcards always rotate. Makes the lead stop sounding like one patch.
-  const LEAD_POOL = ['saw','fm','bell','whistle','pluck','strat'];
+  const LEAD_POOL = ['saw','fm','bell','whistle','pluck','strat','sax','trumpet'];
   const defaultLead = _lStyle.leadMode || 'saw';
   const mode = (s._wild || Math.random() < 0.40)
     ? LEAD_POOL[Math.floor(Math.random()*LEAD_POOL.length)]
@@ -6615,6 +6718,58 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
     master.gain.linearRampToValueAtTime(0.0001,t+durT-0.008);
     master.gain.setValueAtTime(0,t+durT);
     setTimeout(()=>{try{master.disconnect();flt.disconnect();}catch(e){}},Math.ceil((durT+0.05)*1000));
+
+  }else if(mode==='sax' || mode==='trumpet'){
+    // Reed/brass lead: additive odd-partial stack, breath-noise onset, tube
+    // saturation, gentle vibrato. Sax leans on the 3rd+5th partial (reedy);
+    // trumpet boosts the 2nd partial (brassy).
+    const isTrumpet = mode==='trumpet';
+    const partials = isTrumpet
+      ? [[1,0.34],[2,0.28],[3,0.18],[4,0.10],[5,0.05]]
+      : [[1,0.36],[2,0.12],[3,0.22],[4,0.07],[5,0.13],[7,0.05]];
+    const master=ctx.createGain();
+    master.gain.setValueAtTime(0.0001,t);
+    master.gain.linearRampToValueAtTime(vol*1.1, t+0.025);      // medium attack
+    master.gain.setValueAtTime(vol*0.95, t+Math.max(0.05, durT*0.25));
+    master.gain.exponentialRampToValueAtTime(0.0001, t+durT+0.05);
+    // Tube saturation
+    const sat=ctx.createWaveShaper();
+    const crv=new Float32Array(1024);
+    const drive = 1.6 + chaos*0.8 + s.punch*0.7;
+    for(let i=0;i<1024;i++){ const x=(i*2/1024)-1; crv[i]=Math.tanh(x*drive); }
+    sat.curve=crv; sat.oversample='2x';
+    // Band-limit to the instrument range
+    const bp=ctx.createBiquadFilter(); bp.type='lowpass';
+    bp.frequency.value = isTrumpet ? 3800 : 3200; bp.Q.value = 0.6;
+    master.connect(sat); sat.connect(bp); bp.connect(leadDest);
+    // Partials
+    partials.forEach(([n, g])=>{
+      const o=ctx.createOscillator(); o.type='sine';
+      o.frequency.value=freq*n;
+      const og=ctx.createGain(); og.gain.value=g;
+      o.connect(og); og.connect(master);
+      o.start(t); o.stop(t+durT+0.08);
+      autoClean(o,og);
+    });
+    // Breath/chuff onset
+    const brLen=Math.floor(ctx.sampleRate*0.030);
+    const brBuf=ctx.createBuffer(1,brLen,ctx.sampleRate);
+    const bd=brBuf.getChannelData(0);
+    for(let i=0;i<brLen;i++) bd[i]=(Math.random()*2-1)*Math.pow(1-i/brLen, 2.0);
+    const br=ctx.createBufferSource(); br.buffer=brBuf;
+    const brHpf=ctx.createBiquadFilter(); brHpf.type='highpass';
+    brHpf.frequency.value = isTrumpet ? 1600 : 1100;
+    const brG=ctx.createGain(); brG.gain.value = isTrumpet ? 0.06 : 0.08;
+    br.connect(brHpf); brHpf.connect(brG); brG.connect(leadDest);
+    br.start(t);
+    // Vibrato on the master via per-partial freq isn't easy, so apply a
+    // subtle amplitude tremolo for that reed growl.
+    const trem=ctx.createOscillator(); trem.type='sine';
+    trem.frequency.value = isTrumpet ? 5.2 : 4.8;
+    const tg=ctx.createGain(); tg.gain.value = vol*0.08;
+    trem.connect(tg); tg.connect(master.gain);
+    trem.start(t+0.06); trem.stop(t+durT+0.08);
+    autoClean(master, sat, bp, br, brHpf, brG, trem, tg);
 
   }else if(mode==='fm'){
     // 2-op FM stab: carrier + modulator, mod ratio shapes timbre
