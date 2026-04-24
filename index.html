@@ -670,6 +670,8 @@ const collectiveBrainLoad=async()=>{
     if(p.tensionArc) tensionArc.load(p.tensionArc);
     if(p.paramMemory) paramMemory.load(p.paramMemory);
     if(p.autoFx) autoFx.load(p.autoFx);
+    if(p.dissonanceBank) dissonanceBank.load(p.dissonanceBank);
+    if(p.deepDesign) deepDesign.load(p.deepDesign);
     if(p.sessionJudge) sessionJudge.load(p.sessionJudge);
     const voicingCount=Object.values(brain.voicingMem).reduce((s,a)=>s+a.length,0);
     console.log('[GenesisBrain] Loaded -- n:'+brain.n+' phrases:'+motifEng.phrases.length+' voicings:'+voicingCount);
@@ -697,6 +699,8 @@ const collectiveBrainSave=()=>{
         tensionArc:  tensionArc.serialize(),
         paramMemory: paramMemory.serialize(),
         autoFx:      autoFx.serialize(),
+        dissonanceBank: dissonanceBank.serialize(),
+        deepDesign:  deepDesign.serialize(),
         sessionJudge: sessionJudge.serialize(),
         _ts:         Date.now()
       };
@@ -992,7 +996,14 @@ class AudioBus{
     this.limiter.ratio.value=20.0;   // effectively infinite limiting
     this.limiter.attack.value=0.001; // 1ms -- catches fast transients
     this.limiter.release.value=0.05; // 50ms -- quick recovery
-    this.dropFilter.connect(this.limiter);
+    // -- GROSSBEAT GATE: tempo-synced volume automation between dropFilter and
+    // limiter. Always in the path; defaults to gain=1 (transparent). When
+    // grossbeat.active is true the scheduler drives its gain from a 16-step
+    // pattern bank. Wiring the node inline means no disconnects at runtime.
+    this.grossbeatGain=ctx.createGain(); this.grossbeatGain.gain.value=1;
+    this.dropFilter.connect(this.grossbeatGain);
+    this.grossbeatGain.connect(this.limiter);
+    if(typeof grossbeat !== 'undefined') grossbeat.node = this.grossbeatGain;
     this.limiter.connect(ctx.destination);
 
     // -- MASTER BUS COMPRESSOR: glue everything together ------------------
@@ -1855,6 +1866,276 @@ const paramMemory = {
 };
 if(typeof window!=='undefined') window.paramMemory=paramMemory;
 
+// -- DISSONANCE COMPLEXITY BANK --------------------------------------------
+// Logs interval-sets that were played over each chord context and whether
+// they were "good dissonance" (winding went up) or "bad dissonance" (winding
+// dropped or listener tensed up). Separately tracks the in-key scale heard
+// on each root pitch class so we can pick in-key dissonant chords on demand.
+// The "FROM" moments (where the arc wants tension, not resolution) pull an
+// ivSet from the good bank whose notes are ALL in the active scale.
+const dissonanceBank = {
+  scaleMem: {},        // rootPc -> Set of pc's heard in the scale
+  good: {},            // key -> {ivSet, sig, score, uses, ctx, rootPc}
+  bad: {},
+  maxEntries: 48,
+
+  _dissScore(ivSet){
+    if(!ivSet||!ivSet.length) return 0;
+    let n=0;
+    for(const iv of ivSet){
+      const m=((iv%12)+12)%12;
+      if(m===1||m===2||m===6||m===10||m===11) n++;
+    }
+    return n/ivSet.length;
+  },
+
+  markScale(rootPc, pc){
+    rootPc=((rootPc%12)+12)%12; pc=((pc%12)+12)%12;
+    if(!this.scaleMem[rootPc]) this.scaleMem[rootPc]=[];
+    if(!this.scaleMem[rootPc].includes(pc)) this.scaleMem[rootPc].push(pc);
+  },
+  inKey(rootPc, pc){
+    rootPc=((rootPc%12)+12)%12; pc=((pc%12)+12)%12;
+    const s=this.scaleMem[rootPc];
+    if(!s||!s.length) return true; // haven't learned the scale yet -- assume in-key
+    return s.includes(pc);
+  },
+
+  observe(chordCtx, ivSet, windingDelta, rootPc){
+    if(!ivSet||!ivSet.length) return;
+    const diss=this._dissScore(ivSet);
+    if(diss<0.20) return;                // not dissonant enough to log
+    const sig=ivSet.slice().sort((a,b)=>a-b).join(',');
+    const target= windingDelta>0.05 ? this.good : windingDelta<-0.05 ? this.bad : null;
+    if(!target) return;
+    const k=`${chordCtx||'x'}|${sig}`;
+    const e=target[k];
+    if(e){ e.score=Math.min(1, e.score+Math.abs(windingDelta)*0.20); e.uses++; }
+    else{
+      target[k]={ivSet:[...ivSet], sig, score:Math.min(1,Math.abs(windingDelta)), uses:1, ctx:chordCtx, rootPc};
+      const keys=Object.keys(target);
+      if(keys.length>this.maxEntries){
+        keys.map(k2=>({k:k2,s:target[k2].score}))
+          .sort((a,b)=>a.s-b.s).slice(0,keys.length-this.maxEntries)
+          .forEach(o=>delete target[o.k]);
+      }
+    }
+  },
+
+  // Return an in-key dissonant ivSet for a FROM moment. Falls back to a safe
+  // jazz cluster if the good bank hasn't seeded anything for this context.
+  suggestInKey(rootPc, chordCtx){
+    const pool=Object.values(this.good)
+      .filter(e=>e.ctx===chordCtx)
+      .sort((a,b)=>b.score-a.score);
+    for(const e of pool){
+      if(e.ivSet.every(iv=>this.inKey(rootPc, rootPc+iv))) return e.ivSet.slice();
+    }
+    // Fallback: sus2-plus-tritone cluster. Keep only pcs that exist in scale.
+    const fb=[0,2,6,10].filter(iv=>this.inKey(rootPc, rootPc+iv));
+    return fb.length>=2 ? fb : [0,2,7];
+  },
+
+  serialize(){
+    return { scaleMem:{...this.scaleMem}, good:this.good, bad:this.bad };
+  },
+  load(d){
+    if(!d) return;
+    if(d.scaleMem){
+      this.scaleMem={};
+      for(const [k,v] of Object.entries(d.scaleMem)){
+        this.scaleMem[k]= Array.isArray(v) ? v : (v.forEach ? [...v] : []);
+      }
+    }
+    if(d.good) this.good=d.good;
+    if(d.bad)  this.bad =d.bad;
+  },
+};
+if(typeof window!=='undefined') window.dissonanceBank=dissonanceBank;
+
+// -- DEEP DESIGN -----------------------------------------------------------
+// Per-voice Q-learner over live sound-design moves. Each hit can optionally
+// apply one of 10 moves (hpf, lpf_up, drive, detune, harm_boost, fundamental,
+// staccato, vibrato, tremolo, bend). The voice's winding delta since the last
+// choice is the positive reward; an "annoyance" score (clipping + harshness)
+// is subtracted. Moves that keep winning are picked more often.
+const deepDesign = {
+  moves: ['hpf','lpf_up','drive','detune','harm_boost','fundamental','staccato','vibrato','tremolo','bend'],
+  q: { drum:{}, bass:{}, mid:{}, lead:{} },
+  last: { drum:null, bass:null, mid:null, lead:null },
+  lastWinding: { drum:0, bass:0, mid:0, lead:0 },
+  active: true,
+  eps: 0.35,
+
+  _key(ctx){ return `${ctx.chord||'-'}|${ctx.arc||'-'}|${ctx.tBucket||'mid'}`; },
+
+  // Pick 0-1 moves for this hit. Returns {move, ctxKey} or null.
+  pick(voice, ctx){
+    if(!this.active) return null;
+    if(!this.q[voice]) return null;
+    const k=this._key(ctx||{});
+    const tbl=this.q[voice][k]||{};
+    let move;
+    if(Math.random()<this.eps || Object.keys(tbl).length<3){
+      move=this.moves[Math.floor(Math.random()*this.moves.length)];
+    } else {
+      let bs=-1, best=null;
+      for(const m of this.moves){
+        const e=tbl[m]; if(!e) continue;
+        if(e.score>bs){ bs=e.score; best=m; }
+      }
+      move=best||this.moves[Math.floor(Math.random()*this.moves.length)];
+    }
+    this.last[voice]={k,move};
+    return {move, ctxKey:k};
+  },
+
+  // Reward based on winding delta since last pick; annoyance subtracts.
+  observe(voice, windingNow, annoyance){
+    const la=this.last[voice]; if(!la) return;
+    const delta=windingNow - (this.lastWinding[voice]||0);
+    this.lastWinding[voice]=windingNow;
+    const reward=Math.max(-1, Math.min(1, delta*0.7 - (annoyance||0)*1.3));
+    const tbl=this.q[voice]; if(!tbl[la.k]) tbl[la.k]={};
+    const e=tbl[la.k][la.move]||{score:0.5, uses:0};
+    e.score=Math.max(0, Math.min(1, e.score*0.88 + (0.5+reward*0.5)*0.12));
+    e.uses=(e.uses||0)+1;
+    tbl[la.k][la.move]=e;
+    this.eps=Math.max(0.08, 0.35 - Object.keys(tbl).length*0.002);
+  },
+
+  serialize(){ return {q:this.q, eps:this.eps, active:this.active}; },
+  load(d){ if(!d) return; if(d.q) this.q=d.q; if(typeof d.eps==='number') this.eps=d.eps; if(typeof d.active==='boolean') this.active=d.active; },
+};
+if(typeof window!=='undefined') window.deepDesign=deepDesign;
+
+// -- EXPRESSION FX ---------------------------------------------------------
+// Stateless helpers for live sound-design moves. Callers wire the returned
+// LFO nodes into their own autoClean lists.
+const expressionFX = {
+  // Vibrato: sine LFO modulates a freq AudioParam ~25 cents default depth.
+  vibrato(ctx, freqParam, freqHz, rateHz=5.5, depthCents=25, t=0, dur=1){
+    const lfo=ctx.createOscillator(); lfo.type='sine';
+    lfo.frequency.value=Math.max(0.1, rateHz);
+    const g=ctx.createGain();
+    g.gain.value=Math.max(0, freqHz)*(depthCents/1200);
+    lfo.connect(g); g.connect(freqParam);
+    lfo.start(t); lfo.stop(t+dur+0.02);
+    return [lfo,g];
+  },
+  // Tremolo: sine LFO modulates a gain AudioParam.
+  tremolo(ctx, gainParam, baseGain=0.3, rateHz=6.0, depth=0.25, t=0, dur=1){
+    const lfo=ctx.createOscillator(); lfo.type='sine';
+    lfo.frequency.value=Math.max(0.1, rateHz);
+    const g=ctx.createGain();
+    g.gain.value=Math.max(0, baseGain)*Math.max(0,Math.min(1,depth));
+    lfo.connect(g); g.connect(gainParam);
+    lfo.start(t); lfo.stop(t+dur+0.02);
+    return [lfo,g];
+  },
+  // Exponential pitch bend between two frequencies on a freq AudioParam.
+  pitchBend(freqParam, startHz, endHz, t, bendDur){
+    try{
+      freqParam.setValueAtTime(Math.max(1,startHz), t);
+      freqParam.exponentialRampToValueAtTime(Math.max(1,endHz), t+Math.max(0.005, bendDur));
+    }catch(_){}
+  },
+  // Staccato scale factor on a note length. 0.45 is a tight jazzy pluck.
+  staccatoFactor(){ return 0.45; },
+};
+if(typeof window!=='undefined') window.expressionFX=expressionFX;
+
+// -- DRUM KEY TRACKER ------------------------------------------------------
+// Maps the kick fundamental to the track's root pitch class (2 octaves below)
+// and snaps the snare body's center freq to a perfect 5th above root. Makes
+// drums musically coherent with the key instead of floating as pure noise.
+const drumKeyTracker = {
+  mode: 'root',   // 'root' | 'fifth' | 'off'
+  kickFreqFor(rootMidi){
+    if(this.mode==='off' || typeof rootMidi!=='number' || !isFinite(rootMidi)) return null;
+    const pc=((rootMidi%12)+12)%12;
+    const midi=24 + pc + (this.mode==='fifth' ? 7 : 0);
+    let freq=440*Math.pow(2,(midi-69)/12);
+    while(freq<40) freq*=2;
+    while(freq>95) freq*=0.5;
+    return freq;
+  },
+  snareBodyFor(rootMidi){
+    if(this.mode==='off' || typeof rootMidi!=='number' || !isFinite(rootMidi)) return null;
+    const pc=((rootMidi%12)+12)%12;
+    let freq=440*Math.pow(2, ((48 + pc + 7) - 69)/12);
+    while(freq<150) freq*=2;
+    while(freq>280) freq*=0.5;
+    return freq;
+  },
+};
+if(typeof window!=='undefined') window.drumKeyTracker=drumKeyTracker;
+
+// -- GROSSBEAT GATE --------------------------------------------------------
+// Tempo-synced volume automation on a dedicated master-adjacent gain node.
+// Pattern bank of 16-step gate maps; pattern rotates every `barsPerPattern`
+// bars. Auto-DJ cut/transition feel. Wired in at AudioBus.init().
+const grossbeat = {
+  active: false,
+  node: null,
+  patterns: {
+    straight:      [1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1],
+    chop:          [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0],
+    stutter:       [1,1,0,1, 0,0,1,1, 0,1,0,0, 1,1,1,0],
+    half_mute:     [1,1,1,1, 1,1,1,1, 0,0,0,0, 0,0,0,0],
+    reverse_swell: [0.10,0.15,0.22,0.30, 0.40,0.50,0.62,0.74, 0.84,0.92,0.97,1.0, 1.0,1.0,1.0,1.0],
+    off_beat:      [0.25,1,0.25,1, 0.25,1,0.25,1, 0.25,1,0.25,1, 0.25,1,0.25,1],
+    sidechain_pump:[0.20,0.35,0.55,0.75, 0.88,0.95,1.0,1.0, 0.20,0.35,0.55,0.75, 0.88,0.95,1.0,1.0],
+    quarter_ghost: [1,0.20,0.20,0.20, 1,0.20,0.20,0.20, 1,0.20,0.20,0.20, 1,0.20,0.20,0.20],
+    reverse_chop:  [1,1,1,1, 0,0,0,0, 1,1,1,1, 0,0,0,0],
+    dj_build:      [0.60,0.65,0.70,0.75, 0.80,0.85,0.90,0.95, 1.0,0.30,1.0,0.30, 1.0,0.0,1.0,0.0],
+  },
+  order: ['straight','chop','stutter','half_mute','reverse_swell','off_beat','sidechain_pump','quarter_ghost','reverse_chop','dj_build'],
+  current: 'straight',
+  barIdx: 0,
+  barsPerPattern: 4,
+
+  attach(ctx, input, output){
+    if(this.node || !ctx || !input || !output) return;
+    this.node=ctx.createGain(); this.node.gain.value=1;
+    input.connect(this.node); this.node.connect(output);
+  },
+
+  onStep(ctx, stepIdx){
+    if(!this.active || !this.node || !ctx) return;
+    const pat=this.patterns[this.current]||this.patterns.straight;
+    const v=Math.max(0, Math.min(1, pat[((stepIdx%16)+16)%16]));
+    const tNow=ctx.currentTime;
+    try{
+      this.node.gain.cancelScheduledValues(tNow);
+      this.node.gain.setTargetAtTime(v, tNow, 0.008);
+    }catch(_){}
+  },
+
+  onBar(){
+    if(!this.active) return;
+    this.barIdx=(this.barIdx|0)+1;
+    if(this.barIdx % this.barsPerPattern === 0){
+      const idx=this.order.indexOf(this.current);
+      let next=idx;
+      while(next===idx && this.order.length>1) next=Math.floor(Math.random()*this.order.length);
+      this.current=this.order[next];
+    }
+  },
+
+  toggle(){
+    this.active=!this.active;
+    if(!this.active && this.node){
+      try{
+        this.node.gain.cancelScheduledValues(0);
+        this.node.gain.setTargetAtTime(1,0,0.01);
+      }catch(_){}
+    }
+    return this.active;
+  },
+};
+if(typeof window!=='undefined') window.grossbeat=grossbeat;
+
 // -- AUTO FX: Q-learner that picks reverb/delay/chorus/fuzz combinations ----
 // Keyed on (style × chord × arc × tension-bucket). Each context remembers the
 // best mask it has tried. Rewarded when the mid/lead voice winding rises
@@ -2019,15 +2300,31 @@ function humanizedSeed(name, amount){
 if(typeof window!=='undefined'){window._drumKit=_drumKit;window.reseedDrum=reseedDrum;window._drumRecipes=_drumRecipes;}
 
 // Locked bass kit: reseeding flips the bass character to a different mode.
-// 'auto' = neural-picked (legacy), other modes FORCE that character so the
-// user can kill the Squidward wobble and get a clean/locked tone.
+// 'auto' = neural-picked, other modes FORCE that character so the user can
+// kill the Squidward reece-bass wobble and get a cleaner/warmer tone.
+// 'upright' / 'acoustic' delegate to synthUprightBass for a real acoustic
+// bass feel independent of style; 'finger' and 'pick' are softer/brighter
+// variants of the electric bass.
 const _bassKit = {mode:'auto'};
-const BASS_MODE_CYCLE = ['auto','clean','pluck','slap','sustain','growl'];
+const BASS_MODE_CYCLE = ['auto','finger','pick','clean','pluck','slap','sustain','growl','upright','acoustic'];
 let reseedBassKit = function(){
   const i = BASS_MODE_CYCLE.indexOf(_bassKit.mode);
   _bassKit.mode = BASS_MODE_CYCLE[(i+1) % BASS_MODE_CYCLE.length];
 };
 if(typeof window!=='undefined'){window._bassKit=_bassKit;window.reseedBassKit=reseedBassKit;}
+
+// Drum feel cycle: user-overridable rhythmic feel applied AFTER pattern gen.
+// Auto lets the scheduler pick based on tempo + arc + user activity.
+const DRUM_FEEL_CYCLE = ['auto','normal','halftime','doubletime','delta_sparse','ballad'];
+let cycleDrumFeel = function(){
+  if(typeof window==='undefined' || !window._bandAR) return null;
+  const cur = window._bandAR._drumFeel || 'auto';
+  const i = DRUM_FEEL_CYCLE.indexOf(cur);
+  const next = DRUM_FEEL_CYCLE[(i+1) % DRUM_FEEL_CYCLE.length];
+  window._bandAR._drumFeel = next;
+  return next;
+};
+if(typeof window!=='undefined') window.cycleDrumFeel = cycleDrumFeel;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DRUM-RULES PATTERN ENGINE
@@ -2876,12 +3173,47 @@ function styleLerp(range, seed){ return range[0] + seed*(range[1]-range[0]); }
 // sine-sweep is still the most common, but fm and noise-body variants
 // genuinely pop up 30-40% of the time and change the timbre.
 function kickSineSweep(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
-  // Existing sine-sweep body (what we had). Carrier sweeps exponentially
-  // from f0 down to f1 over `decay`. Optional 200Hz EQ thump for hip-hop/edm.
+  // Sine-sweep kick with the "chesty 150 Hz bump + lowpass to kill highs +
+  // transient envelope on pitch/volume/decay" character the user wanted.
+  //
+  // Signal chain:   body osc -> 150Hz peak -> LPF (enveloped) -> gain env -> dest
+  // Parallel: short filtered click transient, independently enveloped.
+  //
+  // If drumKeyTracker is on, f0/f1 are re-anchored to the track's key root
+  // so the kick fundamental sits on the tonic (or the 5th) instead of floating.
+  const rootMidi = (typeof window!=='undefined' && window._bandAR) ? (window._bandAR.lockedRoot ?? window._bandAR.rootMidi) : null;
+  const keyKickF = (typeof drumKeyTracker!=='undefined') ? drumKeyTracker.kickFreqFor(rootMidi) : null;
+  if(keyKickF){
+    // Blend 60% toward the key-anchored fundamental so style range still breathes.
+    f0 = f0*0.4 + keyKickF*1.55*0.6;      // start ~1.5× the fundamental
+    f1 = f1*0.3 + keyKickF*0.7;           // land just below the fundamental
+  }
+
   const body=ctx.createOscillator(); body.type='sine';
   body.frequency.setValueAtTime(f0,t);
+  // Transient pitch blip: a quarter-ms hold at the very top makes the attack
+  // read as "struck", then the sweep continues. Separate from the body sweep.
   body.frequency.setValueAtTime(f0*(kickStyle==='jazz'?0.88:0.92),t+0.002);
-  body.frequency.exponentialRampToValueAtTime(f1,t+decay);
+  body.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+decay);
+
+  // 150 Hz bump for chest thump. Always-on at +4 dB (+6 on EDM), a bit wider
+  // than the old 200Hz bump so the warmth is felt, not just heard.
+  const eq150=ctx.createBiquadFilter(); eq150.type='peaking';
+  eq150.frequency.value=148 + s.tone*12;     // 148..160
+  eq150.Q.value=1.1 + s.punch*0.3;
+  eq150.gain.value=(kickStyle==='edm'?6.5:kickStyle==='jazz'?2.8:4.2);
+
+  // LPF with envelope to remove highs. Opens briefly on the hit (so the
+  // transient has a bit of sparkle) then closes to ~180 Hz as the body dies.
+  // This is the "high[low]pass to remove highs" the user asked for.
+  const lpf=ctx.createBiquadFilter(); lpf.type='lowpass';
+  const lpfOpen = 3200 + punch*1800;            // open on transient
+  const lpfClose = 180 + s.tone*80;             // close to body/sub
+  lpf.frequency.setValueAtTime(lpfOpen,t);
+  lpf.frequency.exponentialRampToValueAtTime(Math.max(80,lpfClose),t+decay*0.75);
+  lpf.Q.value=0.72;
+
+  // Volume envelope: fast attack, quick sag, exponential decay.
   const bg=ctx.createGain();
   bg.gain.setValueAtTime(0,t);
   const attackT = kickStyle==='jazz'?0.008:kickStyle==='edm'?0.0005:0.003;
@@ -2889,17 +3221,34 @@ function kickSineSweep(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
   bg.gain.setValueAtTime(punch*(0.88+s.punch*0.08), t+attackT*3);
   bg.gain.linearRampToValueAtTime(0.0001, t+decay+(kickStyle==='edm'?0.12:0.04));
   bg.gain.setValueAtTime(0, t+decay+(kickStyle==='edm'?0.14:0.06));
-  if(kickStyle==='edm'||kickStyle==='hiphop'||kickStyle==='westcoast'||kickStyle==='eastcoast'){
-    const eq200=ctx.createBiquadFilter(); eq200.type='peaking';
-    eq200.frequency.value=200; eq200.Q.value=1.4;
-    eq200.gain.value=(kickStyle==='edm'?6:kickStyle==='westcoast'?5:4);
-    body.connect(eq200); eq200.connect(bg); bg.connect(dest);
-    autoClean(eq200);
-  }else{
-    body.connect(bg); bg.connect(dest);
-  }
+
+  body.connect(eq150); eq150.connect(lpf); lpf.connect(bg); bg.connect(dest);
   body.start(t); body.stop(t+decay+(kickStyle==='edm'?0.16:0.08));
-  autoClean(body,bg);
+  autoClean(body,eq150,lpf,bg);
+
+  // Transient-shaping click: short filtered noise burst at ~1.2 kHz band,
+  // separately enveloped so volume/decay/pitch move independently of the body.
+  // This is the "transient filter applied to pitch, volume, and decay" layer.
+  if(s.click > 0.05){
+    const clLen=Math.max(2, Math.floor(ctx.sampleRate*0.018));
+    const clBuf=ctx.createBuffer(1,clLen,ctx.sampleRate);
+    const cd=clBuf.getChannelData(0);
+    for(let i=0;i<clLen;i++) cd[i]=(Math.random()*2-1)*Math.pow(1-i/clLen,1.8);
+    const cl=ctx.createBufferSource(); cl.buffer=clBuf;
+    const clBp=ctx.createBiquadFilter(); clBp.type='bandpass';
+    clBp.frequency.setValueAtTime(1200+s.click*900, t);
+    clBp.frequency.exponentialRampToValueAtTime(260, t+0.020);
+    clBp.Q.value=1.5;
+    const clHpf=ctx.createBiquadFilter(); clHpf.type='highpass';
+    clHpf.frequency.value=60;   // kill any sub mud in the click tail
+    const clG=ctx.createGain();
+    clG.gain.setValueAtTime(0, t);
+    clG.gain.linearRampToValueAtTime(s.click*0.55*(kickStyle==='edm'?1.2:0.9), t+0.001);
+    clG.gain.exponentialRampToValueAtTime(0.0001, t+0.012+s.click*0.010);
+    cl.connect(clBp); clBp.connect(clHpf); clHpf.connect(clG); clG.connect(dest);
+    cl.start(t); cl.stop(t+0.030);
+    autoClean(cl,clBp,clHpf,clG);
+  }
 }
 function kickFM(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
   // FM kick: carrier at f0 is frequency-modulated by a sine at f0*ratio.
@@ -3309,7 +3658,11 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
   // Reseed cycles classic / fm / clap for real topology changes.
   // Articulation shapes velocity; the kit character stays constant per reseed.
   const vel = art==='ghost' ? 0.30 : art==='rimshot' ? 1.15 : art==='rim' ? 0.85 : 1.0;
-  const bodyFreq=(155+s.pitch*90+inputTight*50)*warp * (art==='rim'?1.45:1.0);
+  // Key-track body freq to the perfect 5th above root if the tracker is on.
+  const _rm = (typeof window!=='undefined' && window._bandAR) ? (window._bandAR.lockedRoot ?? window._bandAR.rootMidi) : null;
+  const _keyBody = (typeof drumKeyTracker!=='undefined') ? drumKeyTracker.snareBodyFor(_rm) : null;
+  const bodyFreqBase = _keyBody != null ? _keyBody : (155+s.pitch*90+inputTight*50);
+  const bodyFreq=bodyFreqBase*warp * (art==='rim'?1.45:1.0);
 
   // Body recipe: skip for rim (that's a pure stick hit). Ghost/rim always use
   // the quiet classic body so the subtle articulations stay readable.
@@ -5418,15 +5771,27 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   const nn=bassBrain.infer(inputs);
 
   // Select synthesis mode. Bass kit can override the neural pick so the
-  // user's reseed actually changes the bass character. 'clean' is a new
-  // mode: pure pulse through a gentle LPF, zero LFO/wobble, no ring mod --
-  // specifically for when the other modes feel Squidward-ish.
+  // user's reseed actually changes the bass character. 'clean' / 'finger' /
+  // 'pick' / 'upright' / 'acoustic' give varieties beyond the reece-ish
+  // growl/sustain modes.
   let mode;
   if(_bassKit.mode === 'auto'){
+    // Tilt auto selection toward the gentler modes; growl only at high chaos.
     const modeVal=(nn.harmonicMix + chaos*0.3 + windBoost*0.2 + pcMod*0.15) % 1.0;
-    mode = modeVal<0.28?'pluck':modeVal<0.52?'slap':modeVal<0.76?'sustain':'growl';
+    if(chaos < 0.25 && windBoost < 0.35) mode = 'finger';
+    else if(modeVal<0.22)               mode = 'pluck';
+    else if(modeVal<0.42)               mode = 'finger';
+    else if(modeVal<0.60)               mode = 'pick';
+    else if(modeVal<0.78)               mode = 'sustain';
+    else if(modeVal<0.90)               mode = 'slap';
+    else                                mode = 'growl';
   } else {
     mode = _bassKit.mode;
+  }
+  // Delegate upright/acoustic to the dedicated pluck-with-body synth.
+  if(mode==='upright' || mode==='acoustic'){
+    synthUprightBass(ctx, t, note, chaos, warp, windBoost, dest);
+    return;
   }
 
   const _styleLen=styleP().noteLenMult;
@@ -5454,8 +5819,10 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   // Envelope tween: scale decay by the slow-moving envelope target for bass.
   // Tight (low env) = shorter/punchier. Open (high env) = longer, breathier.
   const _bassEnv = motionTween.envFor('bass');
-  const decayTime={pluck:0.22*_styleLen,slap:0.18*_styleLen,sustain:0.55*_styleLen,growl:0.40*_styleLen}[mode]/warp * (0.6 + _bassEnv*0.8);
-  const bodyType={pluck:'triangle',slap:'square',sustain:'sawtooth',growl:'sawtooth'}[mode];
+  const _DT = {pluck:0.22,slap:0.18,sustain:0.55,growl:0.40,finger:0.28,pick:0.20};
+  const _BT = {pluck:'triangle',slap:'square',sustain:'sawtooth',growl:'sawtooth',finger:'triangle',pick:'sawtooth'};
+  const decayTime=(_DT[mode] ?? 0.28)*_styleLen/warp * (0.6 + _bassEnv*0.8);
+  const bodyType=_BT[mode] || 'triangle';
 
   // -- BODY OSCILLATOR ---------------------------------------------------
   const body=ctx.createOscillator(); body.type=bodyType;
@@ -5465,21 +5832,25 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
 
   // -- RESONANT FILTER: neural cutoff + mode-specific envelope ----------
   const flt=ctx.createBiquadFilter(); flt.type='lowpass';
-  const baseQ={pluck:4.5,slap:6.0,sustain:2.5,growl:8.0}[mode];
-  flt.Q.value=baseQ+chaos*8+nn.filterCutoff*5+s.punch*3;
+  const _BQ={pluck:4.5,slap:6.0,sustain:2.5,growl:8.0,finger:1.8,pick:3.2};
+  const baseQ=_BQ[mode] ?? 2.5;
+  flt.Q.value=baseQ+chaos*(mode==='finger'?2:8)+nn.filterCutoff*5+s.punch*3;
 
   // Filter envelope: each mode has distinct shape. Keep LFO contribution
   // tiny and SLOW only -- enough to make consecutive hits differ, not enough
   // to modulate the cutoff audibly within a note.
-  const fOpen={pluck:800,slap:2200,sustain:600,growl:1400}[mode];
-  const fClose={pluck:80,slap:120,sustain:180,growl:60}[mode];
+  const _FO={pluck:800,slap:2200,sustain:600,growl:1400,finger:900,pick:1800};
+  const _FC={pluck:80,slap:120,sustain:180,growl:60,finger:220,pick:260};
+  const fOpen=_FO[mode] ?? 800;
+  const fClose=_FC[mode] ?? 150;
   const lfoCutoff = lSlow*45;
   flt.frequency.setValueAtTime(Math.max(80,(fOpen+windBoost*400+inputChar*600+chaos*1200+pcMod*300+lfoCutoff)*warp), t);
   flt.frequency.exponentialRampToValueAtTime(Math.max(40,(fClose+pcMod*30)*warp), t+decayTime);
 
   // -- GAIN ENVELOPE -----------------------------------------------------
   const _atk=styleP().attackMult;
-  const attackT={pluck:0.003*_atk,slap:0.001*_atk,sustain:0.020*_atk,growl:0.008*_atk}[mode];
+  const _AT={pluck:0.003,slap:0.001,sustain:0.020,growl:0.008,finger:0.006,pick:0.0015};
+  const attackT=(_AT[mode] ?? 0.008)*_atk;
   const g=ctx.createGain();
   g.gain.setValueAtTime(0,t);
   g.gain.linearRampToValueAtTime(0.80+windBoost*0.12+pcMod*0.05, t+attackT);
@@ -5507,6 +5878,37 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
     click.connect(cg); cg.connect(dest);
     click.start(t); click.stop(t+0.03/warp);
     autoClean(click,cg);
+  }
+
+  // -- PICK MODE: bright filtered click that reads as a pick-attack -----
+  if(mode==='pick'){
+    const click=ctx.createOscillator(); click.type='triangle';
+    click.frequency.setValueAtTime(freq*5.5,t);
+    click.frequency.exponentialRampToValueAtTime(freq*2,t+0.008/warp);
+    const cg=ctx.createGain();
+    cg.gain.setValueAtTime(s.punch*0.40,t);
+    cg.gain.linearRampToValueAtTime(0.0001,t+0.014/warp);
+    click.connect(cg); cg.connect(dest);
+    click.start(t); click.stop(t+0.02/warp);
+    autoClean(click,cg);
+  }
+
+  // -- FINGER MODE: no click, a soft flesh-on-string thump via a short
+  // lowpassed noise burst. Very gentle, warm, "real bass" feel.
+  if(mode==='finger'){
+    const nLen=Math.floor(ctx.sampleRate*0.018);
+    const nBuf=ctx.createBuffer(1,nLen,ctx.sampleRate);
+    const nd=nBuf.getChannelData(0);
+    for(let i=0;i<nLen;i++) nd[i]=(Math.random()*2-1)*Math.pow(1-i/nLen,2.0);
+    const ns=ctx.createBufferSource(); ns.buffer=nBuf;
+    const nlp=ctx.createBiquadFilter(); nlp.type='lowpass';
+    nlp.frequency.value=Math.min(900, freq*3.5); nlp.Q.value=0.6;
+    const ng=ctx.createGain();
+    ng.gain.setValueAtTime(0.22+s.punch*0.10,t);
+    ng.gain.exponentialRampToValueAtTime(0.0001,t+0.020);
+    ns.connect(nlp); nlp.connect(ng); ng.connect(dest);
+    ns.start(t); ns.stop(t+0.025);
+    autoClean(ns,nlp,ng);
   }
 
   // -- PRESENCE HARMONIC: overtone for articulation ----------------------
@@ -7913,6 +8315,8 @@ function App(){
 
     if(beat===0){
       ar.measureCount=(ar.measureCount||0)+1;
+      // Grossbeat gate pattern advance -- rotates pattern every bar boundary.
+      try{ if(typeof grossbeat!=='undefined') grossbeat.onBar(); }catch(_){}
       // Per-voice pause system: voices can take 1-2 bars off so the groove
       // can breathe. New rests are seeded sparingly (roughly every 6-10
       // bars per voice) and only when tension is low.
@@ -8194,9 +8598,19 @@ function App(){
         bass_active: !mutes.bass,
         invRadius:   Math.round(60 + (ar.lockedBpm||ar.bpm) * 0.5), // radius hint for sims
       });
+      // Teach dissonance bank the current scale (every chord's intervals get
+      // marked as "in key" for the current root so in-key dissonant picks are
+      // guaranteed to stay on the mode).
+      try{
+        const ct0 = CHORDS[chordType]||CHORDS.maj;
+        const rPc = ((rootMidi%12)+12)%12;
+        for(const iv of ct0.iv) dissonanceBank.markScale(rPc, rPc+iv);
+      }catch(_){}
     }
 
     const bk=beat%stepsPerMeasure;
+    // Grossbeat gate step advance -- drives the master gate pattern.
+    try{ if(typeof grossbeat!=='undefined') grossbeat.onStep(ctx, bk); }catch(_){}
     const hist=ar.rhythmHistory[bk]||{k:false,s:false,h:false,b:false,m:false,l:false};
     // Check rhythm memory for a suggested pattern -- nudges probability
     const rhythmSuggest=rhythmMemory.suggest(chordType,stepsPerMeasure);
@@ -8404,6 +8818,102 @@ function App(){
             dp.s[st] = 0.30;
           }
         }
+
+        // -- DRUM FEEL PASS ---------------------------------------------------
+        // Calm the drummer down. `_drumFeel` is user-settable ('normal' |
+        // 'halftime' | 'doubletime' | 'delta_sparse' | 'ballad' | 'auto').
+        // When auto, pick based on tempo, arc, and user activity so slow
+        // ballads and low-energy arcs auto-thin. Delta-blues feel = many bars
+        // with no drums at all. The drummer can finally chill.
+        (function applyDrumFeel(){
+          const bpmNow = (ar.lockedBpm||ar.bpm)||110;
+          const userFeel = ar._drumFeel || 'auto';
+          const curArcName = (tensionArc.currentArc && tensionArc.currentArc.name) || '';
+          const lowArcs = ['ballad','to_to_pause_from','from_from_from','shock_settle'];
+          let feel = userFeel;
+          if(feel === 'auto'){
+            // Low tempo + low arc + user not drumming = delta sparse
+            const onsetR = ar._onsetRate||0;
+            const lowArc = lowArcs.includes(curArcName);
+            if(bpmNow < 72 && lowArc && onsetR < 1.0 && Math.random()<0.55) feel='delta_sparse';
+            else if(bpmNow < 80 && Math.random()<0.25)                      feel='halftime';
+            else if(bpmNow > 150 && Math.random()<0.15)                     feel='doubletime';
+            else if(lowArc && Math.random()<0.35)                           feel='ballad';
+            else                                                             feel='normal';
+          }
+          ar._drumFeelActive = feel;
+          if(feel === 'normal') return;
+
+          const clearAll = ()=>{
+            for(let st=0;st<16;st++){ dp.k[st]=0; dp.s[st]=0; dp.h[st]=0; dp.hOpen[st]=false; }
+          };
+
+          if(feel === 'halftime'){
+            // Keep kick on 1 only (step 0) and snare on 3 only (step 8).
+            // Hats thin to quarter-note accents. Everything else clears.
+            const k0 = dp.k[0]>0 ? Math.max(0.8, dp.k[0]) : 0.85;
+            const s8 = 0.75;
+            for(let st=0;st<16;st++){
+              dp.k[st] = (st===0) ? k0 : 0;
+              dp.s[st] = (st===8) ? s8 : 0;
+              dp.h[st] = (st%4===0) ? 0.45 : 0;
+              dp.hOpen[st] = false;
+            }
+            return;
+          }
+
+          if(feel === 'doubletime'){
+            // Duplicate kicks on every 2 steps, snare on 4,12 instead of 4,12.
+            // Hats to 16ths. Keep template velocities but densify.
+            const baseK = dp.k.slice(); const baseS = dp.s.slice();
+            for(let st=0;st<16;st++){
+              if(baseK[st]>0){ dp.k[st] = baseK[st]; if(st+2<16 && !baseS[st+2]) dp.k[st+2] = baseK[st]*0.70; }
+              if(baseS[st]>0){ dp.s[st] = baseS[st]; }
+              dp.h[st] = Math.max(dp.h[st], 0.45);
+            }
+            return;
+          }
+
+          if(feel === 'ballad'){
+            // Soft, spacious: kick on 1 and sometimes 9; snare on 9 only.
+            // Hat on every 4th step, ghosts on 7 and 15 at 20%.
+            for(let st=0;st<16;st++){
+              dp.k[st] = (st===0) ? 0.75 : (st===8 && Math.random()<0.45 ? 0.60 : 0);
+              dp.s[st] = (st===8) ? 0.65 : 0;
+              dp.h[st] = (st%4===0) ? 0.40 : 0;
+              dp.hOpen[st] = false;
+            }
+            return;
+          }
+
+          if(feel === 'delta_sparse'){
+            // Delta-blues feel: most bars nearly empty. 45% of bars have
+            // only a single kick on 1. 25% add a lazy snare on 9. 20% play
+            // a shuffled kick-snare on 1 and 9. 10% play NOTHING at all.
+            // Zero hats (or a single tick on 1 at 15% chance).
+            clearAll();
+            const roll = Math.random();
+            if(roll < 0.10){
+              // Rest bar. No drums.
+              return;
+            } else if(roll < 0.55){
+              // Kick on 1 only
+              dp.k[0] = 0.80;
+              if(Math.random()<0.15) dp.h[0] = 0.25;
+            } else if(roll < 0.80){
+              // Kick 1 + snare 9
+              dp.k[0] = 0.80;
+              dp.s[8] = 0.55;
+            } else {
+              // Kick 1 + kick 9 (trudging blues shuffle)
+              dp.k[0] = 0.80;
+              dp.k[8] = 0.60;
+              if(Math.random()<0.30) dp.s[12] = 0.45;
+            }
+            return;
+          }
+        })();
+
         ar._drumPattern = dp;
       }
       const dp=ar._drumPattern||{k:new Array(16).fill(0),s:new Array(16).fill(0),h:new Array(16).fill(0),hOpen:new Array(16).fill(false)};
@@ -10118,6 +10628,21 @@ function App(){
           <button onClick={()=>reseedInstrument('hat')}    title="Reseed just the hat"
             className="px-2 py-1.5 bg-slate-800/60 hover:bg-rose-500/20 border border-slate-700 rounded text-[9px] uppercase tracking-widest text-slate-300">
             Hat
+          </button>
+        </div>
+
+        {/* Drum feel + Grossbeat gate */}
+        <div className="flex items-center gap-1.5">
+          <span className="w-12 text-[9px] uppercase tracking-widest font-bold text-rose-400">Feel</span>
+          <button onClick={()=>{ const n = (typeof cycleDrumFeel==='function') ? cycleDrumFeel() : null; if(n) addLog('[DRUMS] feel='+n); }}
+            title="Cycle drum feel: auto, normal, halftime, doubletime, delta_sparse (lots of empty bars), ballad"
+            className="flex-1 px-2 py-1.5 bg-slate-800/60 hover:bg-rose-500/20 border border-slate-700 rounded text-[9px] font-bold uppercase tracking-widest text-rose-200">
+            {(AR.current._drumFeel||'auto')}
+          </button>
+          <button onClick={()=>{ const on = (typeof grossbeat!=='undefined') ? grossbeat.toggle() : false; addLog('[GATE] grossbeat '+(on?'ON':'OFF')); }}
+            title="Grossbeat-style auto DJ gate: tempo-synced cuts, stutters, and reverse swells rotated every 4 bars"
+            className="px-2 py-1.5 bg-slate-800/60 hover:bg-fuchsia-500/20 border border-slate-700 rounded text-[9px] font-bold uppercase tracking-widest text-fuchsia-200">
+            Gate
           </button>
         </div>
 
