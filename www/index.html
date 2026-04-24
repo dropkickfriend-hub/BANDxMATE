@@ -1176,9 +1176,16 @@ class AudioBus{
     this.subComp.attack.value=0.020; // 20ms -- slow, preserves sub bloom
     this.subComp.release.value=0.35; // 350ms -- long release, sub decays slowly
     this.subComp.connect(masterGain);
-    const subLPF=ctx.createBiquadFilter();subLPF.type='lowpass';subLPF.frequency.value=120;subLPF.Q.value=0.4;
-    const subLPF2=ctx.createBiquadFilter();subLPF2.type='lowpass';subLPF2.frequency.value=120;subLPF2.Q.value=0.4;
-    subLPF.connect(subLPF2);subLPF2.connect(this.subComp); // double LP for steep rolloff
+    // SUB BUS — strict low-end only. User asked to kill all the high end
+    // and raise pitch up an octave, so we cap at 90 Hz with triple LP stack
+    // and add a hard high-shelf cut at 150 Hz so NOTHING above the sub
+    // register leaks through.
+    const subLPF=ctx.createBiquadFilter();subLPF.type='lowpass';subLPF.frequency.value=90;subLPF.Q.value=0.5;
+    const subLPF2=ctx.createBiquadFilter();subLPF2.type='lowpass';subLPF2.frequency.value=90;subLPF2.Q.value=0.5;
+    const subLPF3=ctx.createBiquadFilter();subLPF3.type='lowpass';subLPF3.frequency.value=90;subLPF3.Q.value=0.5;
+    const subShelf=ctx.createBiquadFilter();subShelf.type='highshelf';
+    subShelf.frequency.value=150; subShelf.gain.value=-30;
+    subLPF.connect(subLPF2);subLPF2.connect(subLPF3);subLPF3.connect(subShelf);subShelf.connect(this.subComp);
     this.subBus=ctx.createGain();this.subBus.gain.value=1.0;
     this.subBus.connect(subLPF);
 
@@ -3661,69 +3668,60 @@ function kickSineSweep(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
     f1 = f1*0.3 + keyKickF*0.7;           // land just below the fundamental
   }
 
-  const body=ctx.createOscillator(); body.type='sine';
-  body.frequency.setValueAtTime(f0,t);
-  // Transient pitch blip: a quarter-ms hold at the very top makes the attack
-  // read as "struck", then the sweep continues. Separate from the body sweep.
-  body.frequency.setValueAtTime(f0*(kickStyle==='jazz'?0.88:0.92),t+0.002);
-  body.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+decay);
+  // TRANSIENT-ONLY KICK per user request: "make the kick drum only transient,
+  // let the bass give it body and allow them to play at the same time."
+  //
+  // The kick is now purely the attack -- a fast filtered noise click + a
+  // very short 150 Hz thump. No sustained body osc. Bass/sub handle the
+  // low-end body and they're free to fire on the same beat. Total audible
+  // duration about 35 ms, which is what makes it read as a drum hit rather
+  // than a tonal note.
+  //
+  // Signal:
+  //   (A) noise click  -> bandpass sweep -> HPF -> short gain env -> dest
+  //   (B) 150Hz thump  -> fast decay sine -> tiny 60Hz HPF cut -> dest
+  //   (optional) pitched blip at 85Hz for EDM/hiphop chest, even shorter
+  const isHard = kickStyle==='edm' || kickStyle==='hiphop' || kickStyle==='westcoast' || kickStyle==='eastcoast' || kickStyle==='rock';
 
-  // 150 Hz bump for chest thump. Always-on at +4 dB (+6 on EDM), a bit wider
-  // than the old 200Hz bump so the warmth is felt, not just heard.
-  const eq150=ctx.createBiquadFilter(); eq150.type='peaking';
-  eq150.frequency.value=148 + s.tone*12;     // 148..160
-  eq150.Q.value=1.1 + s.punch*0.3;
-  eq150.gain.value=(kickStyle==='edm'?6.5:kickStyle==='jazz'?2.8:4.2);
+  // -- A: filtered noise click (the main audible hit) ---------------------
+  const clLen = Math.max(2, Math.floor(ctx.sampleRate * 0.028));
+  const clBuf = ctx.createBuffer(1, clLen, ctx.sampleRate);
+  const cd = clBuf.getChannelData(0);
+  for(let i=0;i<clLen;i++) cd[i] = (Math.random()*2-1) * Math.pow(1 - i/clLen, 1.6);
+  const cl = ctx.createBufferSource(); cl.buffer = clBuf;
+  const clBp = ctx.createBiquadFilter(); clBp.type='bandpass';
+  clBp.frequency.setValueAtTime(1100 + s.click*900 + (isHard?300:0), t);
+  clBp.frequency.exponentialRampToValueAtTime(220, t + 0.025);
+  clBp.Q.value = 1.3;
+  // HPF so the click never leaks any thud into the sub-bass band.
+  const clHpf = ctx.createBiquadFilter(); clHpf.type='highpass';
+  clHpf.frequency.value = 140;
+  const clG = ctx.createGain();
+  const clickVol = (0.55 + s.click*0.30 + punch*0.25) * (isHard?1.15:0.95);
+  clG.gain.setValueAtTime(0, t);
+  clG.gain.linearRampToValueAtTime(clickVol, t + 0.0008);
+  clG.gain.exponentialRampToValueAtTime(0.0001, t + 0.024 + s.click*0.010);
+  cl.connect(clBp); clBp.connect(clHpf); clHpf.connect(clG); clG.connect(dest);
+  cl.start(t); cl.stop(t + 0.035);
+  autoClean(cl, clBp, clHpf, clG);
 
-  // LPF with envelope to remove highs. Opens briefly on the hit (so the
-  // transient has a bit of sparkle) then closes to ~180 Hz as the body dies.
-  // This is the "high[low]pass to remove highs" the user asked for.
-  const lpf=ctx.createBiquadFilter(); lpf.type='lowpass';
-  // Thumpy + wet: LPF opens less (2.1 kHz vs 3.2 kHz) so the transient
-  // doesn't splat, and closes to ~110 Hz in half the decay window -- cuts
-  // the tail dead for a short, chesty kick.
-  const lpfOpen = 2100 + punch*900;
-  const lpfClose = 105 + s.tone*35;
-  lpf.frequency.setValueAtTime(lpfOpen,t);
-  lpf.frequency.exponentialRampToValueAtTime(Math.max(70,lpfClose),t+decay*0.50);
-  lpf.Q.value=0.58;
-
-  // Volume envelope: fast attack, quick sag, exponential decay.
-  const bg=ctx.createGain();
-  bg.gain.setValueAtTime(0,t);
-  const attackT = kickStyle==='jazz'?0.008:kickStyle==='edm'?0.0005:0.003;
-  bg.gain.linearRampToValueAtTime(punch, t+attackT);
-  bg.gain.setValueAtTime(punch*(0.88+s.punch*0.08), t+attackT*3);
-  bg.gain.linearRampToValueAtTime(0.0001, t+decay+(kickStyle==='edm'?0.12:0.04));
-  bg.gain.setValueAtTime(0, t+decay+(kickStyle==='edm'?0.14:0.06));
-
-  body.connect(eq150); eq150.connect(lpf); lpf.connect(bg); bg.connect(dest);
-  body.start(t); body.stop(t+decay+(kickStyle==='edm'?0.16:0.08));
-  autoClean(body,eq150,lpf,bg);
-
-  // Transient-shaping click: short filtered noise burst at ~1.2 kHz band,
-  // separately enveloped so volume/decay/pitch move independently of the body.
-  // This is the "transient filter applied to pitch, volume, and decay" layer.
-  if(s.click > 0.05){
-    const clLen=Math.max(2, Math.floor(ctx.sampleRate*0.018));
-    const clBuf=ctx.createBuffer(1,clLen,ctx.sampleRate);
-    const cd=clBuf.getChannelData(0);
-    for(let i=0;i<clLen;i++) cd[i]=(Math.random()*2-1)*Math.pow(1-i/clLen,1.8);
-    const cl=ctx.createBufferSource(); cl.buffer=clBuf;
-    const clBp=ctx.createBiquadFilter(); clBp.type='bandpass';
-    clBp.frequency.setValueAtTime(1200+s.click*900, t);
-    clBp.frequency.exponentialRampToValueAtTime(260, t+0.020);
-    clBp.Q.value=1.5;
-    const clHpf=ctx.createBiquadFilter(); clHpf.type='highpass';
-    clHpf.frequency.value=60;   // kill any sub mud in the click tail
-    const clG=ctx.createGain();
-    clG.gain.setValueAtTime(0, t);
-    clG.gain.linearRampToValueAtTime(s.click*0.55*(kickStyle==='edm'?1.2:0.9), t+0.001);
-    clG.gain.exponentialRampToValueAtTime(0.0001, t+0.012+s.click*0.010);
-    cl.connect(clBp); clBp.connect(clHpf); clHpf.connect(clG); clG.connect(dest);
-    cl.start(t); cl.stop(t+0.030);
-    autoClean(cl,clBp,clHpf,clG);
-  }
+  // -- B: very short pitched thump at ~150 Hz (chest impact, not body) ----
+  // Length clamped to 22 ms so there's no "tone" to compete with the bass
+  // note playing on the same beat.
+  const thump = ctx.createOscillator(); thump.type='sine';
+  thump.frequency.setValueAtTime(Math.max(120, f0*0.9), t);
+  thump.frequency.exponentialRampToValueAtTime(Math.max(55, f1*1.1), t + 0.022);
+  const thumpEq = ctx.createBiquadFilter(); thumpEq.type='peaking';
+  thumpEq.frequency.value = 148 + s.tone*10;
+  thumpEq.Q.value = 1.1;
+  thumpEq.gain.value = (isHard ? 5.5 : 3.2);
+  const thumpG = ctx.createGain();
+  thumpG.gain.setValueAtTime(0, t);
+  thumpG.gain.linearRampToValueAtTime(punch * (isHard?0.75:0.60), t + 0.002);
+  thumpG.gain.exponentialRampToValueAtTime(0.0001, t + 0.028);
+  thump.connect(thumpEq); thumpEq.connect(thumpG); thumpG.connect(dest);
+  thump.start(t); thump.stop(t + 0.035);
+  autoClean(thump, thumpEq, thumpG);
 }
 function kickFM(ctx,t,warp,dest,f0,f1,decay,punch,s,sp){
   // FM kick: carrier at f0 is frequency-modulated by a sine at f0*ratio.
@@ -3796,6 +3794,22 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   s._wild = false;                 // drums never go wildcard
   const sp=styleP(); // current style profile
 
+  // HIP-HOP: the 808 replaces both the kick drum AND the sub bass. We call
+  // synth808 with the current root pitch and return -- no kick body is
+  // rendered at all in this style. The rest of the scheduler skips the
+  // sub bass voice for hip-hop (see sub-bass routing).
+  if(kickStyle === 'hiphop'){
+    const rm = (typeof window!=='undefined' && window._bandAR)
+      ? (window._bandAR.lockedRoot ?? window._bandAR.rootMidi ?? 36)
+      : 36;
+    // Pitch the 808 to the root an octave below the track root so it sits
+    // in the sub register. synth808 will drop it another octave internally.
+    if(typeof synth808 === 'function'){
+      synth808(ctx, t, rm, 0.5, warp, inputEnergy*0.4, dest);
+    }
+    return;
+  }
+
   // Per-hit articulation (drummer behaviour, not randomness):
   //   80% regular · 12% soft (ghost kick) · 8% accent (louder, longer).
   // Scales input energy and decay so ghost hits are short thuds and
@@ -3848,25 +3862,10 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
     autoClean(dropBody, dbg, dropEq, dropEq2);
   }
 
-  // ── 808-STYLE SUB: classic deep-pitch-glide layer for hiphop/edm/
-  // westcoast/eastcoast kick styles. Long sine that glides from ~90Hz down
-  // to ~40Hz over decay*4, driven into saturation so it hits chest-level.
-  if(kickStyle==='edm'||kickStyle==='hiphop'||kickStyle==='westcoast'||kickStyle==='eastcoast'){
-    const sub808 = ctx.createOscillator(); sub808.type='sine';
-    sub808.frequency.setValueAtTime(90*warp, t);
-    sub808.frequency.exponentialRampToValueAtTime(Math.max(35, 42*warp), t + decay*3.5);
-    const sat = ctx.createWaveShaper();
-    const sc = new Float32Array(512);
-    for(let i=0;i<512;i++){ const x=i*2/512-1; sc[i]=Math.tanh(x*2.2); }
-    sat.curve = sc;
-    const sg = ctx.createGain();
-    sg.gain.setValueAtTime(0, t);
-    sg.gain.linearRampToValueAtTime(punch*0.85, t+0.003);
-    sg.gain.exponentialRampToValueAtTime(0.0001, t + decay*4 + 0.05);
-    sub808.connect(sat); sat.connect(sg); sg.connect(dest);
-    sub808.start(t); sub808.stop(t + decay*4 + 0.08);
-    autoClean(sub808, sat, sg);
-  }
+  // Old 808-style sub layer inside the kick removed -- it generated the
+  // bloomy bass the user complained about. Hip-hop now gets a real synth808
+  // earlier in this function, and other styles rely on the sub-bass voice
+  // + the bass voice playing simultaneously for low-end body.
 
   // ── EDM extra: pre-kick click burst (the "knock") ────────────────────
   // Shared across recipes -- it's a style cue, not a body character.
@@ -3880,53 +3879,9 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
     autoClean(knock,kg);
   }
 
-  // ── SUB LAYER: style-weighted ─────────────────────────────────────────
-  const subFreq=(22+s.pitch*14)*warp;
-  // EDM gets a 4th subharmonic layer for massive low end
-  const subLayers=kickStyle==='edm'?3:2;
-  const subFreqs=[subFreq, subFreq*1.5, subFreq*0.5]; // fund, 3rd harmonic, sub-octave
-  const subGains=[s.sub*sp.kickSub*0.65*punch, s.color*sp.kickSub*0.30*punch, sp.kickSub*0.45*punch];
-  const subDecays=[decay*1.4, decay*0.85, decay*1.8];
-  for(let i=0;i<subLayers;i++){
-    const osc=ctx.createOscillator(); osc.type='sine'; osc.frequency.value=subFreqs[i];
-    const sg=ctx.createGain();
-    sg.gain.setValueAtTime(subGains[i],t);
-    sg.gain.linearRampToValueAtTime(0.0001,t+subDecays[i]);
-    sg.gain.setValueAtTime(0,t+subDecays[i]+0.01);
-    osc.connect(sg); sg.connect(dest);
-    osc.start(t); osc.stop(t+subDecays[i]+0.02);
-    autoClean(osc,sg);
-  }
-  // Soft saturation on sub mix for warmth (EDM gets harder clip)
-  const dist=ctx.createWaveShaper();
-  const drive=kickStyle==='edm'?3.5:kickStyle==='jazz'?1.1:1.5;
-  const cv=new Float32Array(512);for(let i=0;i<512;i++){const x=i*2/512-1;cv[i]=Math.tanh(x*drive);}
-  dist.curve=cv;
-  // (sub layers connect directly for simplicity, dist applied via body path)
-
-  // ── CLICK TRANSIENT: style-shaped ────────────────────────────────────
-  const ckVol = s.click * sp.kickClick;
-  if(ckVol > 0.05){
-    const ckFreq=(kickStyle==='jazz'?160:kickStyle==='edm'?350:220)+s.click*280;
-    const click=ctx.createOscillator(); click.type='square';
-    click.frequency.setValueAtTime(ckFreq*warp,t);
-    click.frequency.exponentialRampToValueAtTime(ckFreq*warp*0.18,t+0.038/warp);
-    const cg=ctx.createGain();
-    cg.gain.setValueAtTime(ckVol,t);
-    cg.gain.linearRampToValueAtTime(0.0001,t+(0.030+s.click*0.025)/warp);
-    click.connect(cg); cg.connect(dest); click.start(t); click.stop(t+0.065/warp);
-    autoClean(click,cg);
-    // EDM: noise burst layered over click for extra snap
-    if(kickStyle==='edm'){
-      const buf=ctx.createBuffer(1,Math.floor(ctx.sampleRate*0.02),ctx.sampleRate);
-      const d=buf.getChannelData(0); for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
-      const ns=ctx.createBufferSource(); ns.buffer=buf;
-      const nhpf=ctx.createBiquadFilter(); nhpf.type='highpass'; nhpf.frequency.value=4000;
-      const ng=ctx.createGain(); ng.gain.setValueAtTime(0.35,t); ng.gain.linearRampToValueAtTime(0.0001,t+0.018);
-      ns.connect(nhpf); nhpf.connect(ng); ng.connect(dest); ns.start(t);
-      autoClean(ns,nhpf,ng);
-    }
-  }
+  // Bottom sub layers + ckVol click removed. The transient-only kick recipe
+  // above already includes the click and the 150 Hz bump; adding those sub
+  // sines here was what made the kick compete with the bass for body.
 }
 
 // -- SNARE RECIPE BANK -------------------------------------------------------
@@ -4644,10 +4599,11 @@ const bassBrain={
 
 function synthSubBass(ctx, t, note, chaos, warp, windBoost=0, beat=0){
   const dest=bus.getInput('sub'); if(!dest)return;
-  // Clamp note to true sub register: C0-C2 (12-36 MIDI)
+  // Clamp note to sub register raised one octave per user request: C1-C3
+  // (24-48 MIDI). Old range was C0-C2 -- way too low.
   let subNote=note;
-  while(subNote>36)subNote-=12;
-  while(subNote<12)subNote+=12;
+  while(subNote>48)subNote-=12;
+  while(subNote<24)subNote+=12;
   const freq=440*Math.pow(2,(subNote-69)/12)*warp;
   const s=drumSeed();
   const pc=((subNote%12)+12)%12; const pcMod=pc/12;
@@ -4671,12 +4627,11 @@ function synthSubBass(ctx, t, note, chaos, warp, windBoost=0, beat=0){
   g1.gain.linearRampToValueAtTime(0.0001, t+holdTime);
   g1.gain.setValueAtTime(0, t+holdTime+0.003);
 
-  // LAYER 2: 2nd harmonic -- exact 2x, no beating
+  // LAYER 2 harmonic removed -- user asked for all high end out of sub.
   const osc2=ctx.createOscillator(); osc2.type='sine'; osc2.frequency.value=f1*2;
   const g2=ctx.createGain();
-  g2.gain.setValueAtTime((nn.harmonicMix||0.2)*0.28+s.color*0.08,t+attackT*0.5);
-  g2.gain.linearRampToValueAtTime(0.0001,t+holdTime*0.7);
-  g2.gain.setValueAtTime(0,t+holdTime*0.72);
+  g2.gain.setValueAtTime(0, t);       // muted
+  g2.gain.linearRampToValueAtTime(0, t+0.01);
 
   // Shaper + filters
   const satCurve=new Float32Array(512);
@@ -4684,8 +4639,10 @@ function synthSubBass(ctx, t, note, chaos, warp, windBoost=0, beat=0){
   const tanhSat=Math.tanh(sat)||1;
   for(let si=0;si<512;si++){const x=si*2/512-1; satCurve[si]=Math.tanh(x*sat)/tanhSat;}
   const shaper=ctx.createWaveShaper(); shaper.curve=satCurve;
-  const lpf1=ctx.createBiquadFilter(); lpf1.type='lowpass'; lpf1.frequency.value=110+windBoost*20; lpf1.Q.value=0.5;
-  const lpf2=ctx.createBiquadFilter(); lpf2.type='lowpass'; lpf2.frequency.value=110+windBoost*20; lpf2.Q.value=0.5;
+  // LPF tightened to 90 Hz (was 110) so ANY harmonic content from the shaper
+  // gets killed before it leaves the voice -- keeps sub a pure fundamental.
+  const lpf1=ctx.createBiquadFilter(); lpf1.type='lowpass'; lpf1.frequency.value=90+windBoost*10; lpf1.Q.value=0.5;
+  const lpf2=ctx.createBiquadFilter(); lpf2.type='lowpass'; lpf2.frequency.value=90+windBoost*10; lpf2.Q.value=0.5;
 
   // -- LFO 1: filter cutoff wobble -- slow, gives sub organic movement
   // Rate: 0.3-1.8Hz so it's felt as breath, not vibrato
@@ -7692,12 +7649,23 @@ function App(){
           Object.keys(brain.q).forEach(k=>{ if(k.indexOf(prefix)===0) brain.q[k]=brain.q[k]*0.25; });
         }
       }catch(_){}
-      // Bass gets an actual NEW SOUND on reseed -- cycle the synthesis mode
-      // through auto / clean / pluck / slap / sustain / growl so the voice
-      // genuinely changes character, not just its phrase memory.
+      // Bass / mid / lead reseeds also advance the live timbre so the user
+      // hears a different instrument immediately, not just fresh vocab.
       if(which==='bass' && typeof reseedBassKit === 'function'){
         reseedBassKit();
         addLog(`[RESEED] BASS mode -> ${_bassKit.mode}`);
+      } else if(which==='mid' && typeof bumpMidCharacter === 'function'){
+        bumpMidCharacter();
+        const sp = (typeof styleP==='function') ? styleP() : null;
+        const bank = (sp && sp.midBank) || ['grand-piano'];
+        const idx = Math.abs((Math.floor((AR.current.measureCount||0)/4)+_midCharBump)) % bank.length;
+        addLog(`[RESEED] MID character -> ${bank[idx]}`);
+      } else if(which==='lead' && typeof bumpLeadMode === 'function'){
+        bumpLeadMode();
+        const sp = (typeof styleP==='function') ? styleP() : null;
+        const bank = (sp && sp.leadBank) || [sp?.leadMode || 'saw'];
+        const idx = Math.abs((Math.floor((AR.current.measureCount||0)/4)+_leadModeBump)) % bank.length;
+        addLog(`[RESEED] LEAD mode -> ${bank[idx]}`);
       } else {
         addLog(`[RESEED] ${which.toUpperCase()} vocabulary shuffled.`);
       }
@@ -8255,16 +8223,16 @@ function App(){
           events.push({t,type:'crash',v:0.7});
       }
 
-      // Sub bass on downbeats
+      // Sub bass on downbeats -- raised one octave per user request (C2-C4).
       if(!simMutes.bass&&(beat===0||(beat===8&&Math.random()<0.75))){
         const subPC=((simRoot)%12+12)%12;
-        let sn=24+subPC; while(sn<24)sn+=12; while(sn>36)sn-=12;
+        let sn=36+subPC; while(sn<36)sn+=12; while(sn>48)sn-=12;
         events.push({t,type:'sub',note:sn,chordType:simChordType});
       }
-      // Bass (simplified -- pitch class + register)
+      // Bass (simplified -- pitch class + register). Raised one octave.
       if(!simMutes.bass&&(beat===0||beat===4||beat===8||beat===12||Math.random()<density*0.3)){
         const bassPC=((simRoot+choose('bass',[0,5,7],chaos,simChordType))%12+12)%12;
-        let n=24+bassPC; while(n<28)n+=12; while(n>52)n-=12;
+        let n=36+bassPC; while(n<40)n+=12; while(n>64)n-=12;
         events.push({t,type:'bass',note:n,chordType:simChordType,bassMode:styleP().bassMode,prevNote:simVoices.bass.last||n});
         simVoices.bass.last=n;
       }
@@ -9969,13 +9937,12 @@ function App(){
     if(!sup.bass&&!mutes.bass&&!ar._introActive&&bassOpts.length){
       const iv=brain.choose(userRole,bassOpts,chaos,effectiveChord);
       (ar._recentPicks ||= []).push({role:'bass', iv, chord:effectiveChord});
-      // Force bass into bass register: E1-E3 (28-52)
-      // Take root pitch class + iv, find correct octave
+      // Force bass into bass register: E2-E4 (40-64), raised an octave from
+      // the old E1-E3 range per user request ("raise sub and bass one octave").
       const bassPC=((rootMidi+iv)%12+12)%12;
-      let baseNote=24+bassPC; // start at C1 + pitch class
-      // Step up octaves until in bass range (28-52)
-      while(baseNote<28)baseNote+=12;
-      while(baseNote>52)baseNote-=12;
+      let baseNote=36+bassPC;                // start at C2 + pitch class
+      while(baseNote<40)baseNote+=12;
+      while(baseNote>64)baseNote-=12;
 
       // Sub bass: plays on beat 0 and beat bb (half note positions).
       // On DROP bar: force sub+bass to ALL fire at beat 0 with the kick so
@@ -9987,7 +9954,9 @@ function App(){
       const _dpKick = (typeof _drumKitPattern!=='undefined' && _drumKitPattern) ? _drumKitPattern : null;
       const _kickHere = _dpKick && _dpKick.k && !!_dpKick.k[beat%16];
       const isSubBeat = !ar._quietBar && (beat===0 || _kickHere || (beat===bb && Math.random()<0.55));
-      if(isSubBeat&&!mutes.sub){
+      // Hip-hop: the 808 fired from synthKick covers the sub, so skip the
+      // dedicated sub voice to avoid two subs stacking.
+      if(isSubBeat&&!mutes.sub && kickStyle !== 'hiphop'){
         synthSubBass(ctx,time,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,beat);
         voices.bass.play();voices.bass.lastNote=baseNote;
         if(deafModeRef.current||hapticModeRef.current==='bass')hap.subBass(ar.lockedBpm||ar.bpm);
@@ -10025,7 +9994,7 @@ function App(){
         const pickupT = time + stepSec0*0.75;   // 3/4 of a step in = lands just before beat 0
         const pickupIv = brain.choose(userRole, bassOpts, chaos, effectiveChord);
         const pickupPC = ((rootMidi+pickupIv)%12+12)%12;
-        let pn = 24+pickupPC; while(pn<28)pn+=12; while(pn>52)pn-=12;
+        let pn = 36+pickupPC; while(pn<40)pn+=12; while(pn>64)pn-=12;
         const _bDest = bus.getInput('bass');
         const _bm = styleP().bassMode || 'electric';
         const w = voices.bass.winding*0.08;
@@ -10038,10 +10007,19 @@ function App(){
         else                                synthBass(ctx,pickupT,pn,chaos,warpMultiplier,w,ie,beat,_bDest);
         voices.bass.lastNote = pn;
       }
-      const isBassBeat = !bassIsResting && beat!==0&&beat!==bb&&(
-        beat===Math.floor(bb/2)||beat===Math.floor(bb*1.5)||
-        (isTurnaround&&beat===stepsPerMeasure-2)||
-        Math.random()<density*bassDensityMod*0.55*(hist.b?0.08:1.5)
+      // Bass body follows the kick: now that kick is transient-only, bass
+      // must fire on every kick step so the low end is audible underneath.
+      // Still respects resting/user-supply. Also fires on the snare and on
+      // mid/off-beats per the density/chaos roll.
+      const _kickStepNow = _dpKick && _dpKick.k && (_dpKick.k[beat%16] > 0);
+      const isBassBeat = !bassIsResting && (
+        _kickStepNow ||
+        beat===0 ||
+        (!sup.bass && (
+          beat===Math.floor(bb/2) || beat===Math.floor(bb*1.5) ||
+          (isTurnaround && beat===stepsPerMeasure-2) ||
+          Math.random() < density*bassDensityMod*0.55*(hist.b?0.08:1.5)
+        ))
       );
       if(isBassBeat){
         const _bm=styleP().bassMode||'electric';
