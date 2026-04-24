@@ -674,6 +674,7 @@ const collectiveBrainLoad=async()=>{
     if(p.deepDesign) deepDesign.load(p.deepDesign);
     if(p.billboard) billboard.load(p.billboard);
     if(p.genreFavorites) genreFavorites.load(p.genreFavorites);
+    if(p.soundCompat) soundCompat.load(p.soundCompat);
     if(p.sessionJudge) sessionJudge.load(p.sessionJudge);
     const voicingCount=Object.values(brain.voicingMem).reduce((s,a)=>s+a.length,0);
     console.log('[GenesisBrain] Loaded -- n:'+brain.n+' phrases:'+motifEng.phrases.length+' voicings:'+voicingCount);
@@ -705,6 +706,7 @@ const collectiveBrainSave=()=>{
         deepDesign:  deepDesign.serialize(),
         billboard:   billboard.serialize(),
         genreFavorites: genreFavorites.serialize(),
+        soundCompat:    soundCompat.serialize(),
         sessionJudge: sessionJudge.serialize(),
         _ts:         Date.now()
       };
@@ -2731,6 +2733,85 @@ const grooveField = {
 };
 if(typeof window!=='undefined') window.grooveField = grooveField;
 
+// -- SOUND COMPATIBILITY ---------------------------------------------------
+// Tags every mid character and lead mode with a spectral role, then scores
+// pairs by complement (bright+warm good, bright+bright clash, plucky+wash
+// good, etc). When the mid picker rotates, it biases toward pairs that
+// currently score high against the active lead -- and vice versa. User
+// ratings in the Billboard (paramMemory.n) also nudge scores up/down.
+const soundCompat = {
+  // Spectral role tags per character
+  roles: {
+    'grand-piano':     ['warm','wide'],
+    'rhodes-mk2':      ['warm','elec'],
+    'funky-rhodes':    ['warm','elec','growl'],
+    'wurlitzer-200':   ['warm','elec','growl'],
+    'clavinet-d6':     ['plucky','elec','bright'],
+    'vibraphone':      ['bright','bell','wash'],
+    'nylon-guitar':    ['plucky','warm'],
+    'string-ensemble': ['wash','bright'],
+    'analog-brass':    ['bright','growl'],
+    'mellotron-tape':  ['wash','warm'],
+    'prophet-pad':     ['wash','bright'],
+    'trumpet':         ['bright','reed'],
+    'sax':             ['warm','reed','growl'],
+    'violin':          ['bright','reed','wash'],
+    // Lead modes (subset)
+    'saw':             ['bright','growl'],
+    'fm':              ['bright','bell'],
+    'bell':            ['bell','bright'],
+    'pluck':           ['plucky'],
+    'whistle':         ['bright','thin'],
+    'moog':            ['warm','growl'],
+    'strat':           ['bright','growl'],
+  },
+
+  // Pairwise score [-1..+1]. Positive = complement; negative = clash.
+  // Driven by overlap / complement of role tags.
+  pairScore(a, b){
+    const ra = this.roles[a] || ['warm'];
+    const rb = this.roles[b] || ['warm'];
+    let score = 0;
+    // Complement rules -- warm pairs with bright, wash pairs with plucky.
+    if(ra.includes('warm')   && rb.includes('bright')) score += 0.35;
+    if(ra.includes('bright') && rb.includes('warm'))   score += 0.35;
+    if(ra.includes('wash')   && rb.includes('plucky')) score += 0.30;
+    if(ra.includes('plucky') && rb.includes('wash'))   score += 0.30;
+    if(ra.includes('bell')   && rb.includes('warm'))   score += 0.15;
+    // Clash rules -- too much of the same top-end.
+    if(ra.includes('bright') && rb.includes('bright')) score -= 0.35;
+    if(ra.includes('thin')   && rb.includes('thin'))   score -= 0.30;
+    if(ra.includes('growl')  && rb.includes('growl'))  score -= 0.20;  // stacked grit tires ears
+    // Reeds together can sound muddy (sax + trumpet + violin)
+    const reedCount = (ra.includes('reed')?1:0) + (rb.includes('reed')?1:0);
+    if(reedCount===2) score -= 0.15;
+    // Persistent learning: look up user rating if we stored one.
+    const key = `${a}|${b}`;
+    if(this.userRatings[key]) score += (this.userRatings[key] - 0.5)*0.5;
+    return Math.max(-1, Math.min(1, score));
+  },
+
+  userRatings: {},   // "a|b" -> 0..1 average user rating from Billboard
+
+  // Given a bank of candidate names and a counterpart (the active other
+  // voice), return weights so the picker can sample by compat. Higher
+  // weight = better complement. Always positive; floored at 0.05.
+  weights(bank, counterpart){
+    return bank.map(name => Math.max(0.05, 0.5 + this.pairScore(name, counterpart)));
+  },
+
+  recordPair(a, b, rating01){
+    const key = `${a}|${b}`;
+    const r = Math.max(0, Math.min(1, rating01));
+    const prev = this.userRatings[key];
+    this.userRatings[key] = prev == null ? r : prev*0.8 + r*0.2;
+  },
+
+  serialize(){ return {userRatings:this.userRatings}; },
+  load(d){ if(d && d.userRatings) this.userRatings = d.userRatings; },
+};
+if(typeof window!=='undefined') window.soundCompat = soundCompat;
+
 // Encode an AudioBuffer-like {ch,sr,data:Float32Array[]} into a 16-bit WAV Blob.
 function _bbEncodeWav(ab){
   if(!ab || !ab.data || !ab.data.length) return null;
@@ -3514,33 +3595,47 @@ const STYLE_PROFILES = {
     label:'East Coast',
   },
   african: {
-    kickF0:[80,140],kickF1:[30,45],kickDecay:[0.14,0.22],kickPunch:[0.60,0.85],kickClick:0.20,kickSub:0.90,
-    noteLenMult:0.65, microJitter:0.012, microSubdiv:0.45, swingBoost:6, attackMult:0.80,
+    // African tribal: small, high-pitched djembe/talking-drum hand drum
+    // (kickMode 'bongo' routes to that), elephant-bellyflop sub bass
+    // (afrosub with way more weight), polyrhythmic hand-tapped wood in
+    // 5/4 over a 4/4 grid for several bars (woodPerc + woodPolyrhythm),
+    // pentatonic-minor leans.
+    kickF0:[160,260],kickF1:[70,110],kickDecay:[0.08,0.16],kickPunch:[0.70,0.95],kickClick:0.35,kickSub:0.45,
+    noteLenMult:0.65, microJitter:0.018, microSubdiv:0.55, swingBoost:8, attackMult:0.70,
     bassMode:'afrosub',
     midMode:'keys',
-    leadMode:'fm',       // bright FM stabs for highlife
-    hatMode:'shaker',    // shaker/cabasa -- granular burst, organic texture
-    kickMode:'bongo',    // call-response bongo (low/high) instead of 909-style kick
+    leadMode:'pluck',             // Kora/mbira-ish pluck
+    hatMode:'shaker',             // shaker/cabasa
+    kickMode:'bongo',              // talking-drum hand drum recipe
     woodPerc:true,
+    woodPolyrhythm:{num:5, den:4, bars:4, gain:0.50},  // 5-over-4 wood clave, 4 bars long
+    elephantSub:true,              // synthAfroSub ×2 weight, longer decay
     padSustain:true,
     hatGrooveOffset:0.005,
-    midBank:['vibraphone','nylon-guitar','grand-piano'],
-    leadBank:['bell','pluck','moog'],
+    midBank:['vibraphone','nylon-guitar','grand-piano','funky-rhodes'],
+    leadBank:['pluck','bell','moog'],
     label:'African',
   },
   indian: {
-    kickF0:[70,120],kickF1:[28,40],kickDecay:[0.12,0.20],kickPunch:[0.55,0.75],kickClick:0.15,kickSub:0.85,
-    noteLenMult:1.40, microJitter:0.015, microSubdiv:0.50, swingBoost:10, attackMult:1.50,
+    // Indian classical: pitched dha/tin tabla percussion, constant drone
+    // tanpura bass (no tonic change -- drone holds), raga scale-biased
+    // lead (sitar pluck with slide pitch bends), teentaal 7/4 or 5/4 feel.
+    // woodPolyrhythm here plays 7-over-4 tabla cross-rhythm.
+    kickF0:[140,220],kickF1:[60,90],kickDecay:[0.08,0.14],kickPunch:[0.55,0.78],kickClick:0.30,kickSub:0.70,
+    noteLenMult:1.40, microJitter:0.015, microSubdiv:0.55, swingBoost:10, attackMult:1.50,
     bassMode:'tanpura',
     midMode:'keys',
-    leadMode:'bell',     // bell/sitar-like FM for Indian feel
-    hatMode:'tabla',     // tabla-inspired high percussion -- pitched, resonant
-    kickMode:'bayan',    // bass tabla with pitch bend down (dhol/bayan)
+    leadMode:'pluck',              // sitar-like pluck (Karplus-Strong)
+    hatMode:'tabla',               // pitched tabla dha/tin
+    kickMode:'bayan',              // bayan (low tabla with pitch-bend)
     woodPerc:true,
+    woodPolyrhythm:{num:7, den:4, bars:2, gain:0.35},  // 7-over-4 tabla cross
+    droneTanpura:true,             // synthTanpuraBass holds continuous drone
     padSustain:true,
     hatGrooveOffset:0.007,
-    midBank:['nylon-guitar','grand-piano','string-ensemble','vibraphone'],
-    leadBank:['bell','pluck','moog'],
+    ragaBias:true,                 // lead uses pentatonic/raga scale pool
+    midBank:['nylon-guitar','vibraphone','grand-piano','string-ensemble'],
+    leadBank:['pluck','bell','moog'],
     label:'Indian',
   },
   rock: {
@@ -3578,7 +3673,7 @@ const STYLE_PROFILES = {
     // reese bass + growl.
     kickF0:[150,240],kickF1:[35,50],kickDecay:[0.22,0.34],kickPunch:[1.00,1.25],kickClick:0.65,kickSub:1.25,
     noteLenMult:0.80, microJitter:0.002, microSubdiv:0.06, swingBoost:0, attackMult:0.55,
-    bassMode:'growl',    // wobble bass is the genre
+    bassMode:'dubwobble',    // reese + sub + tempo-synced filter LFO
     midMode:'keys',
     leadMode:'fm',
     hatMode:'digital',
@@ -5015,6 +5110,68 @@ function synthSubBass(ctx, t, note, chaos, warp, windBoost=0, beat=0){
 //   4) Sustain loop: a short (~40 ms) pre-rendered chunk of the fundamental
 //      sine, cropped at zero-crossings, looped through the decay so the
 //      tail doesn't thin out and doesn't click on loop-back.
+// ── DUBSTEP WOBBLE BASS ────────────────────────────────────────────────
+// Skrillex / Rusko signature: reese-bass fed through a resonant LPF whose
+// cutoff is swung by an LFO at 1/8 or 1/4 notes. Layered sub under the
+// wobble. Tempo-synced so the wobble lands on-grid. Kept short per-hit
+// so patterns can re-trigger cleanly.
+function synthDubstepWobble(ctx, t, note, chaos, warp, windBoost=0, destIn=null){
+  const dest=destIn||bus.getInput('bass'); if(!dest)return;
+  // Drop an octave so the wobble sits in the sub-bass register.
+  const freq=440*Math.pow(2,((note-12)-69)/12)*warp;
+  const s=drumSeed();
+  const decay=(0.42 + s.decay*0.25 + windBoost*0.15)/warp;
+
+  // Reese bass: two detuned saws + one slightly sharp saw for PWM-like
+  // beating.
+  const saw1=ctx.createOscillator(); saw1.type='sawtooth'; saw1.frequency.value=freq;
+  const saw2=ctx.createOscillator(); saw2.type='sawtooth'; saw2.frequency.value=freq;
+  const saw3=ctx.createOscillator(); saw3.type='sawtooth'; saw3.frequency.value=freq*1.002;
+  saw1.detune.value = -12;  saw2.detune.value = +12;  saw3.detune.value = 0;
+  const sawMix=ctx.createGain(); sawMix.gain.value=0.55;
+  saw1.connect(sawMix); saw2.connect(sawMix); saw3.connect(sawMix);
+
+  // Sub sine under the reese.
+  const sub=ctx.createOscillator(); sub.type='sine'; sub.frequency.value=freq*0.5;
+  const subG=ctx.createGain(); subG.gain.value=0.50;
+  sub.connect(subG);
+
+  // Resonant LPF with tempo-synced LFO on cutoff.
+  const flt=ctx.createBiquadFilter(); flt.type='lowpass';
+  flt.frequency.value = 380;
+  flt.Q.value = 12 + chaos*6 + s.punch*6;
+  // Wobble LFO: 1/4-note rate from BPM (beats per second = bpm/60). 2× for
+  // 1/8-note feel. Depth is multiplicative via a gain node on the freq param.
+  const bpm = (typeof window!=='undefined' && window._bandAR) ? (window._bandAR.lockedBpm||window._bandAR.bpm||140) : 140;
+  const wobbleRate = (bpm/60) * (s.color>0.55 ? 2 : 1);   // 1/8 or 1/4
+  const lfo=ctx.createOscillator(); lfo.type='sine';
+  lfo.frequency.value = wobbleRate;
+  const lfoDepth=ctx.createGain(); lfoDepth.gain.value = 950 + chaos*600; // Hz swing
+  lfo.connect(lfoDepth); lfoDepth.connect(flt.frequency);
+  lfo.start(t); lfo.stop(t+decay+0.05);
+
+  // Post-LPF tanh saturation for the classic growl bite.
+  const drive=ctx.createWaveShaper();
+  const N=1024, c=new Float32Array(N);
+  for(let i=0;i<N;i++){ const x=(i*2/N)-1; c[i]=Math.tanh(x*(2.2+chaos*1.8)); }
+  drive.curve=c; drive.oversample='4x';
+
+  // Amp env -- relatively fast so wobble phrases re-trigger cleanly.
+  const amp=ctx.createGain();
+  amp.gain.setValueAtTime(0, t);
+  amp.gain.linearRampToValueAtTime(0.85+windBoost*0.15, t+0.008);
+  amp.gain.setTargetAtTime(0.0001, t+0.12, decay*0.35);
+  amp.gain.setValueAtTime(0, t+decay+0.10);
+
+  sawMix.connect(flt); subG.connect(flt);
+  flt.connect(drive); drive.connect(amp); amp.connect(dest);
+
+  const stopT = t+decay+0.12;
+  saw1.start(t); saw2.start(t); saw3.start(t); sub.start(t);
+  saw1.stop(stopT); saw2.stop(stopT); saw3.stop(stopT); sub.stop(stopT);
+  autoClean(saw1,saw2,saw3,sawMix,sub,subG,flt,lfo,lfoDepth,drive,amp);
+}
+
 function synth808(ctx, t, note, chaos, warp, windBoost=0, destIn=null){
   const dest=destIn||bus.getInput('bass'); if(!dest)return;
   // Drop an octave per the user's spec -- 808s sit way down.
@@ -5213,12 +5370,35 @@ function synthBoomBapBass(ctx, t, note, chaos, warp, windBoost=0, destIn=null){
   autoClean(osc,ws,lpf,g);
 }
 
-// African clay/wood sub: resonant wood body, deep sub, very dynamic velocity
+// African clay/wood sub: resonant wood body + elephant-bellyflop deep sub.
+// User spec: "bass drum needs to sound like an elephant just did a
+// bellyflop super heavy bass." Sub layer at -24 st from the played note
+// with 2× decay, fed through soft saturation for body mass.
 function synthAfroSub(ctx, t, note, chaos, warp, velocity=0.7, windBoost=0, destIn=null){
   const dest=destIn||bus.getInput('bass'); if(!dest)return;
   const freq=440*Math.pow(2,(note-69)/12)*warp;
   const s=drumSeed();
-  const decay=(0.18+s.decay*0.14+windBoost*0.08)/warp;
+  const decay=(0.36+s.decay*0.22+windBoost*0.12)/warp;   // longer -- elephant
+
+  // ELEPHANT sub: pitch-bend from +2 st down to -24 st below the note over
+  // 80 ms. Feeds through soft saturation so the sub has harmonics under the
+  // main body and you feel it in your chest.
+  const eleph = ctx.createOscillator(); eleph.type='sine';
+  const elephFreq = freq * 0.25;                          // -24 st
+  eleph.frequency.setValueAtTime(elephFreq * 1.122, t);  // +2 st start
+  eleph.frequency.exponentialRampToValueAtTime(elephFreq, t + 0.080);
+  eleph.frequency.setTargetAtTime(elephFreq * 0.96, t + 0.12, 0.20);
+  const elephSat = ctx.createWaveShaper();
+  const eN = 512, eC = new Float32Array(eN);
+  for(let i=0;i<eN;i++){ const x=(i*2/eN)-1; eC[i]=Math.tanh(x*1.8); }
+  elephSat.curve = eC; elephSat.oversample = '4x';
+  const elephG = ctx.createGain();
+  elephG.gain.setValueAtTime(0, t);
+  elephG.gain.linearRampToValueAtTime(velocity*0.95+windBoost*0.2, t+0.008);
+  elephG.gain.exponentialRampToValueAtTime(0.0001, t+decay*2.2);
+  eleph.connect(elephSat); elephSat.connect(elephG); elephG.connect(dest);
+  eleph.start(t); eleph.stop(t+decay*2.4+0.05);
+  autoClean(eleph, elephSat, elephG);
 
   // Sub sine: clay resonator body
   const sub=ctx.createOscillator(); sub.type='sine';
@@ -6437,12 +6617,26 @@ if(typeof window!=='undefined'){
   window.bumpLeadMode = bumpLeadMode;
 }
 
-function pickMidSynthName(ar){
+function pickMidSynthName(ar, raw){
   const sp = (typeof styleP==='function')?styleP():null;
   const bank = (sp && sp.midBank) || [sp && sp.midMode || 'keys'];
   const barIdx = Math.floor(((ar&&ar.measureCount)||0) / 4);
-  const idx = ((barIdx + _midCharBump) % bank.length + bank.length) % bank.length;
-  return bank[idx];
+  const rawIdx = ((barIdx + _midCharBump) % bank.length + bank.length) % bank.length;
+  if(raw) return bank[rawIdx];
+  // Sound-compat bias against the CURRENT lead mode so mid + lead never
+  // stack into a clashing pair (two bright, two reeds, two growls).
+  try{
+    const curLead = (typeof pickLeadMode === 'function') ? pickLeadMode(ar, true) : (sp?.leadMode || 'saw');
+    if(typeof soundCompat !== 'undefined'){
+      const weights = soundCompat.weights(bank, curLead);
+      const maxW = Math.max(...weights);
+      for(let off=0; off<bank.length; off++){
+        const i = (rawIdx + off) % bank.length;
+        if(weights[i] >= maxW * 0.75) return bank[i];
+      }
+    }
+  }catch(_){}
+  return bank[rawIdx];
 }
 // Legacy-name → new-character aliases so existing midBank arrays keep working
 // while we migrate. Each old name maps to its closest new character profile.
@@ -6511,12 +6705,25 @@ function runMidSynth(name, ctx, t, notes, chordType, chaos, warp, dest, windBoos
 // LEAD mode rotation: picks a name out of styleP().leadBank; synthLead reads
 // the mode via _overrideLeadMode if we set it, otherwise styleP().leadMode.
 let _overrideLeadMode = null;
-function pickLeadMode(ar){
+function pickLeadMode(ar, raw){
   const sp = (typeof styleP==='function')?styleP():null;
   const bank = (sp && sp.leadBank) || [sp && sp.leadMode || 'saw'];
   const barIdx = Math.floor(((ar&&ar.measureCount)||0) / 4);
-  const idx = ((barIdx + _leadModeBump) % bank.length + bank.length) % bank.length;
-  return bank[idx];
+  const rawIdx = ((barIdx + _leadModeBump) % bank.length + bank.length) % bank.length;
+  if(raw) return bank[rawIdx];
+  // Compat bias against the current mid character.
+  try{
+    const curMid = (typeof pickMidSynthName === 'function') ? pickMidSynthName(ar, true) : (sp?.midMode || 'grand-piano');
+    if(typeof soundCompat !== 'undefined'){
+      const weights = soundCompat.weights(bank, curMid);
+      const maxW = Math.max(...weights);
+      for(let off=0; off<bank.length; off++){
+        const i = (rawIdx + off) % bank.length;
+        if(weights[i] >= maxW * 0.75) return bank[i];
+      }
+    }
+  }catch(_){}
+  return bank[rawIdx];
 }
 
 function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0, destIn=null){
@@ -8657,6 +8864,7 @@ function App(){
           const _bm=ev.bassMode||styleP().bassMode||'electric';
           const _bd=offBus.getInput('bass');
           if(_bm==='808')         synth808(offCtx,t,ev.note,chaos,warp,0.05,_bd);
+          else if(_bm==='dubwobble')synthDubstepWobble(offCtx,t,ev.note,chaos,warp,0.05,_bd);
           else if(_bm==='upright')synthUprightBass(offCtx,t,ev.note,chaos,warp,0.05,_bd);
           else if(_bm==='gfunk')  synthGFunkBass(offCtx,t,ev.note,chaos,warp,0.05,ev.prevNote||ev.note,_bd);
           else if(_bm==='boombap')synthBoomBapBass(offCtx,t,ev.note,chaos,warp,0.05,_bd);
@@ -8964,6 +9172,7 @@ function App(){
           const _bm=ev.bassMode||styleP().bassMode||'electric';
           const _bd=offBus.getInput('bass');
           if(_bm==='808')         synth808(offCtx,t,ev.note,chaos,warp,0.05,_bd);
+          else if(_bm==='dubwobble')synthDubstepWobble(offCtx,t,ev.note,chaos,warp,0.05,_bd);
           else if(_bm==='upright')synthUprightBass(offCtx,t,ev.note,chaos,warp,0.05,_bd);
           else if(_bm==='gfunk')  synthGFunkBass(offCtx,t,ev.note,chaos,warp,0.05,ev.prevNote||ev.note,_bd);
           else if(_bm==='boombap')synthBoomBapBass(offCtx,t,ev.note,chaos,warp,0.05,_bd);
@@ -10306,6 +10515,33 @@ function App(){
       if(beat===bb && voices.drum.winding>0.5){
         bandTaste.reinforceArchetype(groove, voices.drum.winding);
       }
+
+      // POLYRHYTHMIC WOOD CLAVE (African=5/4, Indian=7/4). Cross-rhythm
+      // floating over the 4/4 kick grid. Pattern covers `bars` bars then
+      // rests `bars` bars so it groups in blocks. User spec for African:
+      // "hands polyrhythmically tapping wood in rhythm to ~5/4 for like
+      // 4 measures or longer".
+      try{
+        const _sp = styleP();
+        const poly = _sp && _sp.woodPolyrhythm;
+        if(poly && !ar._quietBar){
+          const mc = ar.measureCount || 0;
+          if((mc % (poly.bars*2)) < poly.bars){    // active window
+            // Precomputed hit positions: `poly.num` hits evenly spaced
+            // across 16 steps, rounded to integers.
+            const hits = new Set();
+            for(let i=0;i<poly.num;i++) hits.add(Math.round(i * 16 / poly.num));
+            if(hits.has(beat%16)){
+              const _wdest = bus.getInput('drum');
+              const _wpitch = 1.25 + Math.random()*0.5;          // high-pitched hand-wood
+              const _wvel   = (poly.gain || 0.5) * (0.85 + Math.random()*0.25);
+              // Slightly-late micro-timing so it feels like human hands.
+              const _humanT = time + (Math.random()*0.006);
+              synthWoodPerc(ctx, _humanT, _wvel, _wpitch, warpMultiplier, _wdest);
+            }
+          }
+        }
+      }catch(_){}
     }
 
     // -- EXCLUSION PRINCIPLE -----------------------------------------------
@@ -10380,6 +10616,7 @@ function App(){
         const _bm = styleP().bassMode || 'electric';
         const w = voices.bass.winding*0.08 + 0.15;   // extra impact
         if(_bm==='808'||_bm==='hiphop')   synth808(ctx,time,baseNote,chaos,warpMultiplier,w,_bDest);
+        else if(_bm==='dubwobble')         synthDubstepWobble(ctx,time,baseNote,chaos,warpMultiplier,w,_bDest);
         else if(_bm==='upright')           synthUprightBass(ctx,time,baseNote,chaos,warpMultiplier,w,_bDest);
         else if(_bm==='gfunk')             synthGFunkBass(ctx,time,baseNote,chaos,warpMultiplier,w,voices.bass.lastNote||baseNote,_bDest);
         else if(_bm==='boombap')           synthBoomBapBass(ctx,time,baseNote,chaos,warpMultiplier,w,_bDest);
@@ -10409,6 +10646,7 @@ function App(){
         const _bm = styleP().bassMode || 'electric';
         const w = voices.bass.winding*0.08;
         if(_bm==='808'||_bm==='hiphop')   synth808(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
+        else if(_bm==='dubwobble')         synthDubstepWobble(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
         else if(_bm==='upright')           synthUprightBass(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
         else if(_bm==='gfunk')             synthGFunkBass(ctx,pickupT,pn,chaos,warpMultiplier,w,voices.bass.lastNote||pn,_bDest);
         else if(_bm==='boombap')           synthBoomBapBass(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
@@ -10440,6 +10678,7 @@ function App(){
         const _bt=time+(Math.random()-0.5)*styleP().microJitter*0.7 + _arcR*0.024*_arcDir + _bassSwing;
         const _bDest=bus.getInput('bass');
         if(_bm==='808'||_bm==='hiphop')      synth808(_bt!==undefined?ctx:ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
+        else if(_bm==='dubwobble')            synthDubstepWobble(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
         else if(_bm==='upright')              synthUprightBass(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
         else if(_bm==='gfunk')                synthGFunkBass(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,voices.bass.lastNote||baseNote,_bDest);
         else if(_bm==='boombap')              synthBoomBapBass(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
