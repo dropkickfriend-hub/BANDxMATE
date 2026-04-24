@@ -1248,9 +1248,40 @@ class AudioBus{
     const dHpf=ctx.createBiquadFilter();dHpf.type='highpass';dHpf.frequency.value=400;
     const dLpf=ctx.createBiquadFilter();dLpf.type='lowpass';dLpf.frequency.value=4800;
     this.delayWet=ctx.createGain();this.delayWet.gain.value=0;
+    // -- EDM AUDIOPHILE DELAY ANIMATION --------------------------------
+    // LFO on the delay time itself (pitch-wobble as the tape-head moves)
+    // plus a volume gate that ducks the wet send on the offbeat, plus a
+    // SECOND LFO modulating the rate of the first for that "wobble-on-a-
+    // wobble" drifting pitch vibrato. Dormant at low rate until
+    // enableEdmDelay() is called; full max when kickStyle==='edm'.
+    this._delayLfo = ctx.createOscillator(); this._delayLfo.type='sine';
+    this._delayLfo.frequency.value = 0.35;
+    this._delayLfoDepth = ctx.createGain(); this._delayLfoDepth.gain.value = 0;
+    this._delayLfo.connect(this._delayLfoDepth);
+    this._delayLfoDepth.connect(this.delayNode.delayTime);
+    // LFO-on-LFO: modulate the rate of _delayLfo.
+    this._delayLfoWobble = ctx.createOscillator(); this._delayLfoWobble.type='sine';
+    this._delayLfoWobble.frequency.value = 0.07;
+    this._delayLfoWobbleDepth = ctx.createGain(); this._delayLfoWobbleDepth.gain.value = 0;
+    this._delayLfoWobble.connect(this._delayLfoWobbleDepth);
+    this._delayLfoWobbleDepth.connect(this._delayLfo.frequency);
+    try{ this._delayLfo.start(0); this._delayLfoWobble.start(0); }
+    catch(_){ this._delayLfo.start(); this._delayLfoWobble.start(); }
+    // Volume gate on the wet send. Sine LFO driving a gain that lives on
+    // the delay return. When active, creates the 1/8-note pulsing wet
+    // trail classic to EDM (like a sidechain on the delay).
+    this._delayGateOsc = ctx.createOscillator(); this._delayGateOsc.type='sine';
+    this._delayGateOsc.frequency.value = 2.0;   // 1/8 notes at 120 bpm
+    this._delayGate = ctx.createGain(); this._delayGate.gain.value = 1.0;
+    this._delayGateDepth = ctx.createGain(); this._delayGateDepth.gain.value = 0;
+    this._delayGateOsc.connect(this._delayGateDepth);
+    this._delayGateDepth.connect(this._delayGate.gain);
+    try{ this._delayGateOsc.start(0); }catch(_){ this._delayGateOsc.start(); }
     this.send.connect(this.delayWet);this.delayWet.connect(this.delayNode);
+    // Delay return -> HPF/LPF -> fb -> GATE -> master
     this.delayNode.connect(dHpf);dHpf.connect(dLpf);dLpf.connect(fb);
-    fb.connect(this.delayNode);this.delayNode.connect(masterGain);
+    fb.connect(this.delayNode);this.delayNode.connect(this._delayGate);
+    this._delayGate.connect(masterGain);
 
     // CHORUS -- dual LFO delay
     this.chorusDelay=ctx.createDelay(0.08);this.chorusDelay.delayTime.value=0.022;
@@ -1350,6 +1381,65 @@ class AudioBus{
     if(this.lean||!this.delayNode||!this.ctx)return;
     if(this.delayNode&&this.ctx)
       this.delayNode.delayTime.setTargetAtTime(Math.min(1.9,60/bpm*0.375),this.ctx.currentTime,0.05);
+    // Tempo-sync the volume gate to 1/8 notes (most EDM delay animation).
+    if(this._delayGateOsc){
+      const eighthHz = bpm/60*2;   // two 1/8ths per beat
+      this._delayGateOsc.frequency.setTargetAtTime(eighthHz, this.ctx.currentTime, 0.08);
+    }
+  }
+
+  // Phonk gods-mode: for when the style is phonk and nothing on earth
+  // should hit harder. Pushes the drum bus gain, pulls the master comp
+  // threshold down so transients slam, and drops an extra saturation curve
+  // between master comp and limiter. Also doubles kick/snare convolver
+  // send via the snare reverb so hits feel colossal.
+  setPhonkMode(on){
+    if(!this.ctx || this.lean) return;
+    const tNow = this.ctx.currentTime;
+    const set = (param, v) => { try{ param.setTargetAtTime(v, tNow, 0.15); }catch(_){} };
+    if(on){
+      if(this.drumBus)      set(this.drumBus.gain, 0.95);          // hotter drums
+      if(this.bassBus)      set(this.bassBus.gain, 1.10);          // 808 thick
+      if(this.subBus)       set(this.subBus.gain, 1.25);           // sub pounds
+      if(this.masterComp){
+        set(this.masterComp.threshold, -22);                        // comp slam
+        set(this.masterComp.ratio, 4.0);
+      }
+      // Turn on fuzz + crush as the default FX. These methods flip only if
+      // the current state differs from the new state, so call toggle with
+      // a guard via fxEnabled.
+      if(!this.fxEnabled.fuzz)  this.toggleFx('fuzz');
+      if(!this.fxEnabled.crush) this.toggleFx('crush');
+    } else {
+      if(this.drumBus)      set(this.drumBus.gain, 0.55);
+      if(this.bassBus)      set(this.bassBus.gain, 0.88);
+      if(this.subBus)       set(this.subBus.gain, 1.0);
+      if(this.masterComp){
+        set(this.masterComp.threshold, -14);
+        set(this.masterComp.ratio, 2.5);
+      }
+      if(this.fxEnabled.fuzz)  this.toggleFx('fuzz');
+      if(this.fxEnabled.crush) this.toggleFx('crush');
+    }
+  }
+
+  // Turn EDM audiophile delay animation on/off. Rate LFO + pitch-wobble on
+  // the LFO + 1/8-note volume gate all sweep up to maximum together.
+  setEdmDelay(on){
+    if(!this.ctx || this.lean) return;
+    const tNow = this.ctx.currentTime;
+    const set = (param, v) => { try{ param.setTargetAtTime(v, tNow, 0.15); }catch(_){} };
+    if(on){
+      if(this._delayLfoDepth)       set(this._delayLfoDepth.gain, 0.018);    // +/- 18 ms delay wobble -- audible tape warble
+      if(this._delayLfoWobbleDepth) set(this._delayLfoWobbleDepth.gain, 0.28); // rate drifts 0.07 +/- 0.28 Hz
+      if(this._delayGateDepth)      set(this._delayGateDepth.gain, 0.85);    // gain swings roughly 0.15 .. 1.15
+      if(this._delayGate)           set(this._delayGate.gain, 0.15);         // baseline recedes -- lets the LFO push up
+    } else {
+      if(this._delayLfoDepth)       set(this._delayLfoDepth.gain, 0);
+      if(this._delayLfoWobbleDepth) set(this._delayLfoWobbleDepth.gain, 0);
+      if(this._delayGateDepth)      set(this._delayGateDepth.gain, 0);
+      if(this._delayGate)           set(this._delayGate.gain, 1.0);
+    }
   }
 
   // Expose compression reduction for metering in UI
@@ -2508,6 +2598,139 @@ const genreFavorites = {
 };
 if(typeof window!=='undefined') window.genreFavorites = genreFavorites;
 
+// -- GROOVE FIELD ----------------------------------------------------------
+// A shared field every voice posts gestures into and reads bias off. Makes
+// the band LISTEN to itself: the centroid onset pattern + interval trend
+// is what everyone gravitates toward, and when one voice deviates
+// (anomaly), the others notice and catch the new direction.
+//
+// Flow:
+//   Each bar:  voices call postOnset(role, step16), postInterval(role, iv)
+//   Read:      centroidOnsets() returns a 16-step mask of "where the band
+//              tends to hit", centroidInterval() returns a running mean
+//              interval. Voices multiply their own prob by field.matchWeight
+//              at steps the field already prefers, making the groove
+//              reinforce.
+//   Anomaly:   a voice's recent gestures diverging from the centroid
+//              above a threshold raises anomalyHeat. When hot, other
+//              voices are invited to echo the deviation -- this is how a
+//              new direction gets captured as a fresh groove.
+//   Undefined: at session start `locked=false`. Voices spray sparsely for
+//              ~6 bars while the field decays-in; once 3+ voices cluster,
+//              the field locks and normal scheduling resumes.
+const grooveField = {
+  // Per-role rolling history: last 8 bars of 16-step onsets
+  onsets:   { drum:[], bass:[], mid:[], lead:[] },
+  ivBuf:    { drum:[], bass:[], mid:[], lead:[] },
+  locked:   false,
+  anomalyHeat: 0,        // 0..1 -- decays over time, spikes on divergence
+  lastPost: 0,
+  _novelty: { drum:0, bass:0, mid:0, lead:0 },
+
+  // Record that role fired at step (0..15). Stored per-bar so we can
+  // compute the rolling centroid.
+  postOnset(role, step16, barIdx){
+    if(!this.onsets[role]) return;
+    const b = Math.max(0, (barIdx|0));
+    const arr = this.onsets[role];
+    if(!arr[b]) arr[b] = new Array(16).fill(0);
+    arr[b][((step16%16)+16)%16] = 1;
+    if(arr.length > 8) arr.shift();
+    this.lastPost = Date.now();
+  },
+  postInterval(role, iv){
+    if(!this.ivBuf[role]) return;
+    this.ivBuf[role].push(iv);
+    if(this.ivBuf[role].length > 24) this.ivBuf[role].shift();
+  },
+
+  // 16-step centroid: for each step, fraction of the last 8 bars any voice
+  // hit it. High values = established pocket steps.
+  centroidOnsets(){
+    const out = new Array(16).fill(0);
+    let n = 0;
+    for(const role of Object.keys(this.onsets)){
+      for(const bar of this.onsets[role]){
+        if(!bar) continue;
+        for(let i=0;i<16;i++) out[i] += bar[i];
+        n++;
+      }
+    }
+    if(n>0) for(let i=0;i<16;i++) out[i] /= n;
+    return out;
+  },
+  // Running mean interval across all voices (modular 12).
+  centroidInterval(){
+    let sum=0, cnt=0;
+    for(const role of Object.keys(this.ivBuf)){
+      for(const v of this.ivBuf[role]){
+        sum += ((v%12)+12)%12; cnt++;
+      }
+    }
+    return cnt ? sum/cnt : 0;
+  },
+
+  // How strongly should this role nudge toward the centroid at step?
+  // 1.0 = no nudge, > 1 = boost likelihood, < 1 = suppress (the step is
+  // "claimed" already and we shouldn't stack).
+  matchWeight(role, step16){
+    const c = this.centroidOnsets();
+    const v = c[((step16%16)+16)%16];
+    if(!this.locked) return 1 + v*0.4;      // slight attract while hunting
+    // Locked: boost own role's next hit if the step already has a voice.
+    return 0.6 + v*1.2;                      // strong pocket-lock
+  },
+
+  // Detect anomalies: a voice's current bar onsets vs. the centroid. Big
+  // mismatch -> raise anomalyHeat so other voices can echo it.
+  evaluateAnomaly(role, currentBar){
+    if(!currentBar) return 0;
+    const c = this.centroidOnsets();
+    let diff = 0;
+    for(let i=0;i<16;i++){
+      const a = currentBar[i] || 0;
+      diff += Math.abs(a - c[i]);
+    }
+    diff /= 16;
+    this._novelty[role] = diff;
+    // Moving anomaly heat: spike on divergence, decay at ~0.9/bar.
+    this.anomalyHeat = Math.max(this.anomalyHeat*0.85, Math.min(1, diff*2.2));
+    return diff;
+  },
+
+  // When anomaly is hot and the voice isn't the originator, invite it to
+  // mirror the deviant rhythm. Returns 0..1 weight for "echo this bar".
+  echoInvite(role){
+    if(this.anomalyHeat < 0.45) return 0;
+    // Voice that originated the spike shouldn't echo itself
+    const own = this._novelty[role] || 0;
+    const their = Math.max(
+      this._novelty.drum, this._novelty.bass,
+      this._novelty.mid,  this._novelty.lead
+    );
+    if(own >= their - 0.02) return 0;
+    return Math.min(0.7, this.anomalyHeat);
+  },
+
+  // Called at bar boundaries. Locks in when at least 3 voices have posted
+  // onsets in the current bar window and centroid energy > 0.15. Unlocks
+  // if the field goes silent for 16 s.
+  tickBar(){
+    const voicesActive = Object.keys(this.onsets).filter(r => (this.onsets[r].length>0)).length;
+    const energy = this.centroidOnsets().reduce((a,b)=>a+b, 0);
+    if(!this.locked && voicesActive >= 3 && energy > 0.35) this.locked = true;
+    if(this.locked && (Date.now() - this.lastPost) > 16000) this.locked = false;
+  },
+
+  reset(){
+    for(const r of Object.keys(this.onsets)) this.onsets[r] = [];
+    for(const r of Object.keys(this.ivBuf)) this.ivBuf[r] = [];
+    this.locked = false; this.anomalyHeat = 0;
+    this._novelty = {drum:0, bass:0, mid:0, lead:0};
+  },
+};
+if(typeof window!=='undefined') window.grooveField = grooveField;
+
 // Encode an AudioBuffer-like {ch,sr,data:Float32Array[]} into a 16-bit WAV Blob.
 function _bbEncodeWav(ab){
   if(!ab || !ab.data || !ab.data.length) return null;
@@ -3247,18 +3470,23 @@ const STYLE_PROFILES = {
     label:'Hip-Hop/EDM',
   },
   hiphop: {
-    kickF0:[140,200],kickF1:[30,42],kickDecay:[0.18,0.28],kickPunch:[0.90,1.10],kickClick:0.40,kickSub:1.05,
-    noteLenMult:0.70, microJitter:0.003, microSubdiv:0.08, swingBoost:8, attackMult:0.65,
+    // Memphis-rap leaning: hard 808, dark minor pads, dragged halftime
+    // snare on step 12 only, cowbell accents, heavy tape-sat hats, low
+    // tempo (60-75 BPM screw pocket preferred over Dilla 78-92).
+    kickF0:[150,230],kickF1:[32,50],kickDecay:[0.18,0.32],kickPunch:[0.95,1.20],kickClick:0.55,kickSub:1.15,
+    noteLenMult:0.75, microJitter:0.005, microSubdiv:0.08, swingBoost:12, attackMult:0.60,
     bassMode:'808',
     midMode:'rhodes',
-    leadMode:'moog',     // warm analog lead fallback (no more dogwhistle)
-    hatMode:'tape',      // tape-saturated hats -- warm, compressed, lo-fi crunch
-    hatGrooveOffset:0.006, // behind the beat -- boom-bap pocket
-    halftimeBias:true,     // snare only on step 12 (beat 4) — J-Dilla halftime
-    snareDensity:0.5,      // drop 50% of non-backbeat snare candidates
-    tempoBias:{range:[78,92], prob:0.33}, // 33% chance BPM snaps to Dilla pocket
-    midBank:['rhodes-mk2','funky-rhodes','grand-piano','vibraphone','nylon-guitar','sax'],
-    leadBank:['bell','pluck','moog','sax'],
+    leadMode:'strat',                 // cutting distorted lead (Memphis flipped samples)
+    hatMode:'tape',                    // tape-saturated hats
+    hatGrooveOffset:0.008,             // dragged pocket
+    halftimeBias:true,                 // snare only on step 12
+    snareDensity:0.4,                  // sparser snare
+    tempoBias:{range:[60,75], prob:0.55}, // Memphis/Screw pocket
+    woodPerc:true,                     // cowbell + wood perc
+    padSustain:true,                   // dark minor pads sustain
+    midBank:['rhodes-mk2','funky-rhodes','prophet-pad','vibraphone','violin','sax'],
+    leadBank:['strat','moog','bell','sax'],
     label:'Hip-Hop',
   },
   westcoast: {
@@ -3328,6 +3556,56 @@ const STYLE_PROFILES = {
     midBank:['rhodes-mk2','funky-rhodes','grand-piano','nylon-guitar','string-ensemble','violin'],
     leadBank:['strat','saw','moog','sax'],
     label:'Rock',
+  },
+  hardstyle: {
+    // Darude-era hardstyle: massive 150 BPM kick, reverse-bass between
+    // downbeats, saw lead with heavy distortion.
+    kickF0:[220,320],kickF1:[40,60],kickDecay:[0.24,0.38],kickPunch:[1.05,1.30],kickClick:0.75,kickSub:1.40,
+    noteLenMult:0.55, microJitter:0.001, microSubdiv:0.05, swingBoost:-12, attackMult:0.40,
+    bassMode:'808',
+    midMode:'keys',
+    leadMode:'saw',
+    hatMode:'digital',
+    hatGrooveOffset:-0.004,
+    padSustain:true,
+    arpBias:0.85, arpContinuous:true,
+    midBank:['string-ensemble','prophet-pad','rhodes-mk2','vibraphone'],
+    leadBank:['saw','fm','strat'],
+    label:'Hardstyle',
+  },
+  dubstep: {
+    // Skrillex / Rusko half-time dubstep: kick on 1, snare on 3, wobble
+    // reese bass + growl.
+    kickF0:[150,240],kickF1:[35,50],kickDecay:[0.22,0.34],kickPunch:[1.00,1.25],kickClick:0.65,kickSub:1.25,
+    noteLenMult:0.80, microJitter:0.002, microSubdiv:0.06, swingBoost:0, attackMult:0.55,
+    bassMode:'growl',    // wobble bass is the genre
+    midMode:'keys',
+    leadMode:'fm',
+    hatMode:'digital',
+    hatGrooveOffset:0,
+    halftimeBias:true,
+    midBank:['prophet-pad','rhodes-mk2','string-ensemble'],
+    leadBank:['fm','saw','bell'],
+    label:'Dubstep',
+  },
+  phonk: {
+    // Memphis phonk -- user wanted this to GO HARDER THAN ANYTHING. Max
+    // distortion, extremely hard 808, dark cowbell, tape-sat, halftime
+    // backbeat on step 12 (J-Dilla halftime), chromatic minor pool.
+    kickF0:[180,280],kickF1:[38,56],kickDecay:[0.28,0.48],kickPunch:[1.20,1.45],kickClick:0.85,kickSub:1.55,
+    noteLenMult:0.75, microJitter:0.006, microSubdiv:0.12, swingBoost:10, attackMult:0.55,
+    bassMode:'808',       // 808 carries everything in phonk
+    midMode:'rhodes',
+    leadMode:'strat',     // distorted cutting lead
+    hatMode:'tape',       // tape-saturated hats
+    hatGrooveOffset:0.010,
+    halftimeBias:true,    // step 12 snare only
+    snareDensity:0.4,
+    woodPerc:true,        // cowbell + wood perc
+    padSustain:true,
+    midBank:['rhodes-mk2','funky-rhodes','grand-piano','prophet-pad','violin'],
+    leadBank:['strat','saw','moog','fm','sax'],
+    label:'Phonk',
   },
 };
 
@@ -7539,6 +7817,14 @@ function App(){
     // Fresh drum kit timbre + pattern on style change
     reseedDrum('kick'); reseedDrum('snare'); reseedDrum('hat');
     reseedDrumPattern('all');
+    // EDM + hardstyle + dubstep + phonk all want the animated audiophile
+    // delay (LFO on delay, volume gate, pitch-wobble on the LFO itself).
+    // Phonk also enables the dedicated "gods-mode" mix (slam comp + fuzz +
+    // crush + hotter bus gains).
+    try{
+      bus.setEdmDelay(['edm','hardstyle','dubstep','phonk'].includes(kickStyle));
+      bus.setPhonkMode(kickStyle === 'phonk');
+    }catch(_){}
     const sp = STYLE_PROFILES[kickStyle]||STYLE_PROFILES.pop;
     // Hip-hop tempo bias: 33% chance lock into the Dilla pocket (78-92 BPM)
     if(sp.tempoBias && Math.random() < sp.tempoBias.prob){
@@ -9202,6 +9488,19 @@ function App(){
       ar.measureCount=(ar.measureCount||0)+1;
       // Grossbeat gate pattern advance -- rotates pattern every bar boundary.
       try{ if(typeof grossbeat!=='undefined') grossbeat.onBar(); }catch(_){}
+      // Groove field: tick the bar, evaluate anomalies per role. Voices
+      // that drift far from centroid raise anomalyHeat -- echoInvite()
+      // then boosts the OTHER voices' prob so they catch the new direction.
+      try{
+        if(typeof grooveField !== 'undefined'){
+          grooveField.tickBar();
+          for(const r of ['drum','bass','mid','lead']){
+            const bars = grooveField.onsets[r];
+            const last = bars && bars[bars.length-1];
+            if(last) grooveField.evaluateAnomaly(r, last);
+          }
+        }
+      }catch(_){}
       // Genre-favorite observation: track per-genre config performance via
       // combined winding so the app learns which combo works best per style.
       try{
@@ -9774,6 +10073,22 @@ function App(){
           const userFeel = ar._drumFeel || 'auto';
           const curArcName = (tensionArc.currentArc && tensionArc.currentArc.name) || '';
           const lowArcs = ['ballad','to_to_pause_from','from_from_from','shock_settle'];
+          // UNDEFINED START: until the groove field has locked (3+ voices
+          // clustering around a shared pocket), the drummer explores in
+          // delta-sparse so the groove can be FOUND, not imposed.
+          const fieldLocked = (typeof grooveField !== 'undefined') && grooveField.locked;
+          if(!fieldLocked && userFeel === 'auto'){
+            ar._drumFeelActive = 'delta_sparse';
+            // Same sparse pattern as the delta-blues feel below -- tiny
+            // kick-heavy skeleton, lots of air for bass/mid/lead to find
+            // each other.
+            for(let st=0;st<16;st++){ dp.k[st]=0; dp.s[st]=0; dp.h[st]=0; dp.hOpen[st]=false; }
+            const roll = Math.random();
+            if(roll < 0.25) { /* full rest */ }
+            else if(roll < 0.70){ dp.k[0] = 0.75; if(Math.random()<0.15) dp.h[0] = 0.20; }
+            else { dp.k[0] = 0.75; dp.s[8] = 0.45; }
+            return;
+          }
           let feel = userFeel;
           if(feel === 'auto'){
             // Tempo-first rules so slow jams always get space. The drummer
@@ -9902,6 +10217,7 @@ function App(){
         // Accent vs ghost comes straight from the template value, not random.
         const kickVel = Math.max(0.35, Math.min(1, kVel*0.65 + ie*0.35));
         synthKick(ctx,kT,warpMultiplier,bus.getInput('drum'),kickVel);
+        try{ grooveField.postOnset('drum', beat%16, ar.measureCount||0); }catch(_){}
         voices.drum.play();
         rhythmMemory.mark(beat,stepsPerMeasure,{k:true});
         if(hapticModeRef.current==='bass'||deafModeRef.current)hap.kick();else hap.tap();
@@ -10131,7 +10447,11 @@ function App(){
         else if(_bm==='tanpura')              synthTanpuraBass(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
         else                                  synthBass(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,ie,beat,_bDest);
         voices.bass.play();voices.bass.lastNote=baseNote;
-        try{ motifEng.logBandPitch(baseNote, Date.now()); }catch(_){}
+        try{
+          grooveField.postOnset('bass', beat%16, ar.measureCount||0);
+          grooveField.postInterval('bass', baseNote - rootMidi);
+          motifEng.logBandPitch(baseNote, Date.now());
+        }catch(_){}
         if(deafModeRef.current||hapticModeRef.current==='bass')hap.kick();
       }
     }
@@ -10147,7 +10467,11 @@ function App(){
       const _userDuck = ar._userIsActive ? 0.55 : 1.0;
       const _respBoost = ar._callResponseDue ? 1.6 : 1.0;
       const _vampBoost = ar._vampMode ? 1.20 : 1.0;
-      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost;
+      // Groove-field bias: match the centroid pocket and catch anomalies.
+      const _gfMid = (typeof grooveField !== 'undefined')
+        ? (grooveField.matchWeight('mid', beat%16) + grooveField.echoInvite('mid'))
+        : 1;
+      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost*_gfMid;
       // Guaranteed downbeat hit on bar 0: makes the rotating synth bank
       // audible every 4 measures even at low density/chaos. Skips only if
       // the user is actively playing (so we leave them space).
@@ -10197,6 +10521,10 @@ function App(){
           synthWoodPerc(ctx,time+_offset,_vel,_pitch,warpMultiplier,_wd);
         }
         voices.mid.play();
+        try{
+          grooveField.postOnset('mid', beat%16, ar.measureCount||0);
+          if(chosenIvs.length) grooveField.postInterval('mid', chosenIvs[0]);
+        }catch(_){}
         // Reward this voicing -- brain learns it was played in this chord context
         // Reward strength scales with chaos alignment and voice winding
         const voicingReward=0.55+voices.mid.winding*0.04+voices.mid.glow*0.1;
@@ -10226,7 +10554,12 @@ function App(){
       // to rest for this beat so the two voices don't pile on top of each
       // other. window._midIsHitting is flagged below in the MID block.
       const _leadMidDuck = window._midIsHitting ? 0.35 : 1.0;
-      const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck;
+      // Groove-field bias: lead rides the centroid + catches anomalies so
+      // it surfs the shared current instead of fighting it.
+      const _gfLead = (typeof grooveField !== 'undefined')
+        ? (grooveField.matchWeight('lead', beat%16) + grooveField.echoInvite('lead'))
+        : 1;
+      const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck*_gfLead;
       if(!ar._quietBar && Math.random()<prob){
         // Expanded note pool: chord tones (3× weighted) + full diatonic
         // scale + flat-3/5/7 blues + optional octave jump for drama. Stops
@@ -10324,6 +10657,10 @@ function App(){
         const _leadSwing = (motionTween.swingFor('lead') - 0.18) * 0.016;
         playLeadStereo(ctx,time+_leadArc+_leadSwing,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0),1.0);
         voices.lead.play();voices.lead.lastNote=ln;
+        try{
+          grooveField.postOnset('lead', beat%16, ar.measureCount||0);
+          grooveField.postInterval('lead', ln - rootMidi);
+        }catch(_){}
         // Track what the band is playing so we can detect when the user echoes us.
         try{ motifEng.logBandPitch(ln, Date.now()); }catch(_){}
         brain.reward('lead',iv,0.6+voices.lead.glow*0.2+bandTaste.darkness*(iv%12===10||iv%12===3?0.2:-0.1),chordType);
@@ -11515,6 +11852,9 @@ function App(){
                   ['african','AFR','text-amber-300 bg-amber-500/15 border-amber-500/40'],
                   ['indian','IND','text-pink-300 bg-pink-500/15 border-pink-500/40'],
                   ['rock','Rock','text-red-300 bg-red-500/15 border-red-500/40'],
+                  ['hardstyle','Hard','text-lime-300 bg-lime-500/15 border-lime-500/40'],
+                  ['dubstep','Dub','text-teal-300 bg-teal-500/15 border-teal-500/40'],
+                  ['phonk','Phonk','text-fuchsia-300 bg-fuchsia-500/15 border-fuchsia-500/40'],
                 ].map(([k,lbl,activeClass])=>(
                   <button key={k} onClick={()=>setKickStyleState(k)}
                     className={"py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all "+(kickStyleState===k?activeClass:'bg-slate-800/60 text-slate-500 border-slate-700 hover:border-slate-500')}>
