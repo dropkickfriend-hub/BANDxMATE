@@ -1275,6 +1275,64 @@ class MotifEngine{
     this.reharmonizations=[];
     this.keyHistory=[];
     this.timeSignatures=[];   // detected per-phrase time sigs
+    this.bandRecent=[];       // last ~8 midi notes the BAND played -- used
+                              // so we can detect when the user echoes us
+    this.lastUserEchoScore=0; // exposed for UI / logging
+  }
+
+  // Called whenever a melodic voice (lead/mid/bass) fires. Stores the midi
+  // note so we can compare later to the user's contour.
+  logBandPitch(midi, t){
+    if(typeof midi !== 'number' || !isFinite(midi)) return;
+    this.bandRecent.push({midi, t:t||Date.now()});
+    if(this.bandRecent.length > 10) this.bandRecent.shift();
+  }
+
+  // Compare the user's most-recent 4-note contour to the band's most-recent
+  // 4-note contour. Returns 0..1 for how much the interval pattern matches
+  // (same direction, within ~2 semitones per interval). Above ~0.65 and
+  // we call it an echo.
+  userEchoScore(){
+    const u = this.pitchBuf.slice(-5).map(p=>p.midi);
+    const b = this.bandRecent.slice(-5).map(p=>p.midi);
+    if(u.length < 3 || b.length < 3) return 0;
+    const uI = u.slice(1).map((n,i)=>n-u[i]);
+    const bI = b.slice(1).map((n,i)=>n-b[i]);
+    const n = Math.min(uI.length, bI.length);
+    if(n < 2) return 0;
+    let match = 0;
+    for(let i=0; i<n; i++){
+      if(Math.sign(uI[i]) === Math.sign(bI[i]) && Math.abs(uI[i]-bI[i]) <= 2) match++;
+    }
+    return match/n;
+  }
+
+  // Generate an answering motif from the user's current phrase --
+  // contour inversion so the band PROPOSES vs the user's STATEMENT.
+  generateResponse(){
+    if(!this.currentPhrase || this.currentPhrase.pitches.length < 2){
+      // Fall back to recent buffered pitches if no active phrase
+      const recent = this.pitchBuf.slice(-5).map(p=>p.midi);
+      if(recent.length < 2) return null;
+      const ivs = recent.slice(1).map((n,i)=>n-recent[i]);
+      return {ivs: ivs.map(v=>-v), root: recent[recent.length-1]};
+    }
+    const p = this.currentPhrase.pitches.slice(-5);
+    const ivs = p.slice(1).map((n,i)=>n-p[i]);
+    return {ivs: ivs.map(v=>-v), root: p[p.length-1]};
+  }
+
+  // Pick a duet harmony for a user note. In a minor chord, 3rd above sounds
+  // sweet; in major, major 3rd; on dominant chords, 5th below feels grounded.
+  harmonizeNote(userMidi, chordType){
+    if(typeof userMidi !== 'number') return null;
+    const ct = (chordType||'').toLowerCase();
+    let interval;
+    if(ct.indexOf('min')===0 || ct==='dim')       interval = 3;   // minor 3rd above
+    else if(ct.indexOf('maj')===0 || ct==='lydian') interval = 4; // major 3rd above
+    else if(ct.indexOf('dom')===0)                interval = -5;  // 4th below
+    else                                           interval = 5;   // default 4th above
+    return userMidi + interval;
   }
 
   // Called when user taps to START a phrase
@@ -6675,6 +6733,15 @@ function App(){
     const result=motifEng.endPhrase();
     setPhraseRecording(false);
     if(!result){addLog('[REC] Too short -- sing at least 3 notes');return;}
+    // Echo detection: how much does the user's phrase match what the band
+    // was just playing? >= 0.65 = clear echo.
+    try{
+      const echoScore = motifEng.userEchoScore();
+      motifEng.lastUserEchoScore = echoScore;
+      if(echoScore >= 0.65){
+        addLog(`[ECHO] User echoed the band (${Math.round(echoScore*100)}%)`);
+      }
+    }catch(_){}
     setLastPhrase(result);
     setCompletedPhrases(p=>[result,...p].slice(0,8));
     improvState.phrases.push(result);
@@ -8562,6 +8629,7 @@ function App(){
         else if(_bm==='tanpura')              synthTanpuraBass(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,_bDest);
         else                                  synthBass(ctx,_bt,baseNote,chaos,warpMultiplier,voices.bass.winding*0.08,ie,beat,_bDest);
         voices.bass.play();voices.bass.lastNote=baseNote;
+        try{ motifEng.logBandPitch(baseNote, Date.now()); }catch(_){}
         if(deafModeRef.current||hapticModeRef.current==='bass')hap.kick();
       }
     }
@@ -8672,6 +8740,19 @@ function App(){
 
         let iv=brain.choose(userRole,finalOpts,chaos,effectiveChord);
         (ar._recentPicks ||= []).push({role:'lead', iv, chord:effectiveChord});
+        // RESPONSE: if we're in the response phase AND the user has recently
+        // played a motif, answer them with a contour-inverted version of
+        // their phrase instead of a pure brain-picked note. The band
+        // literally replies to what the user just said.
+        if(isResponse && motifEng.bandRecent){
+          const resp = motifEng.generateResponse();
+          if(resp && resp.ivs && resp.ivs.length > 0){
+            // Take the first inverted interval from root + place inside leadOpts range
+            const target = (resp.ivs[0] + 12 + 144) % 12;
+            const candidate = finalOpts.find(v => (((v%12)+12)%12) === target);
+            if(candidate != null) iv = candidate;
+          }
+        }
         // Melodic direction: bias toward stepwise motion (like a real musician)
         // 60% of time, prefer notes close to the last note played
         if(voices.lead.lastNote!=null && Math.random()<0.6){
@@ -8719,6 +8800,8 @@ function App(){
         const _leadSwing = (motionTween.swingFor('lead') - 0.18) * 0.016;
         playLeadStereo(ctx,time+_leadArc+_leadSwing,ln,chaos,warpMultiplier,bus.getInput('lead'),voices.lead.winding*0.07*(ar._breathLead||1.0),1.0);
         voices.lead.play();voices.lead.lastNote=ln;
+        // Track what the band is playing so we can detect when the user echoes us.
+        try{ motifEng.logBandPitch(ln, Date.now()); }catch(_){}
         brain.reward('lead',iv,0.6+voices.lead.glow*0.2+bandTaste.darkness*(iv%12===10||iv%12===3?0.2:-0.1),chordType);
       }
     }
@@ -8989,7 +9072,31 @@ function App(){
               AR.current.rootMidi=midi;prevRootRef.current=midi;
             }
             const pc=midi%12;pitchHistRef.current[pc]+=0.06;
-            if(isOnset)motifEng.addPitch(midi,now2);
+            if(isOnset){
+              motifEng.addPitch(midi,now2);
+              // DUET ON TURNAROUND: when the band is in turnaround phase and
+              // the user sings a pitch, the lead fires a harmony note (3rd
+              // or 4th depending on chord quality) so the two voices are
+              // singing together rather than the band watching silently.
+              try{
+                if(AR.current._motifPhase === 'turnaround' && !mutesRef.current.lead && AR.current.ctx){
+                  const harmMidi = motifEng.harmonizeNote(midi, AR.current.chordType);
+                  if(typeof harmMidi === 'number' && harmMidi >= 48 && harmMidi <= 96){
+                    // Schedule at the next audio-context tick so we ride the
+                    // user's attack rather than racing ahead.
+                    const dT = Math.max(0.003, AR.current.ctx.currentTime);
+                    if(typeof playLeadStereo === 'function'){
+                      playLeadStereo(AR.current.ctx, dT, harmMidi, 0.3,
+                        AR.current.warpMultiplier||1, bus.getInput('lead'), 0.18, 0.8);
+                    } else if(typeof synthLead === 'function'){
+                      synthLead(AR.current.ctx, dT, harmMidi, 0.3,
+                        AR.current.warpMultiplier||1, bus.getInput('lead'), 0.18);
+                    }
+                    motifEng.logBandPitch(harmMidi, Date.now());
+                  }
+                }
+              }catch(_){}
+            }
             if(frame%8===0){setDMidi(midi);const c=Math.round(maxVal/255*100);setConf(c);confidenceRef.current=c;}
           }
         }else if(frame%8===0){setConf(0);confidenceRef.current=0;}
