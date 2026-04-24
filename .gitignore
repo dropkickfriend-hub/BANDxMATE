@@ -9,3 +9,5 @@ ios/
 .DS_Store
 cloud/progressions.json
 cloud/venv/
+cloud/__pycache__/
+__pycache__/
