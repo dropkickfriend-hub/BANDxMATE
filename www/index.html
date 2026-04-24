@@ -2238,9 +2238,13 @@ const billboard = {
     return e.totalRating;
   },
 
+  // Always work off a real array; old payloads could leave .entries as an
+  // object map or undefined, which crashes .filter/.slice at render time.
+  _arr(){ return Array.isArray(this.entries) ? this.entries : (this.entries = []); },
+
   // Top-N per genre, ranked by totalRating * log(ratingCount+1)
   topN(genre, n=10){
-    return this.entries
+    return this._arr()
       .filter(e => (genre ? e.genre===genre : true))
       .map(e => ({...e, rank: e.totalRating * Math.log2((e.ratingCount||0)+2)}))
       .sort((a,b)=>b.rank - a.rank)
@@ -2250,7 +2254,7 @@ const billboard = {
   // The deep-learned top-10: entries whose voices have the highest learned
   // scores across paramMemory + user ratings. Updated weekly.
   deepTop(genre, n=10){
-    return this.entries
+    return this._arr()
       .filter(e => (genre ? e.genre===genre : true))
       .map(e => {
         const ageHrs = (Date.now() - e.ts)/3.6e6;
@@ -2364,9 +2368,13 @@ const billboard = {
   },
   load(d){
     if(!d) return;
+    // Accept arrays; accept objects keyed by id (old format); coerce anything
+    // else to empty so downstream .slice/.filter/.find never blow up.
     if(Array.isArray(d.entries)) this.entries = d.entries;
-    if(d.weeklyChamps) this.weeklyChamps = d.weeklyChamps;
-    if(d.currentWeek)  this.currentWeek  = d.currentWeek;
+    else if(d.entries && typeof d.entries === 'object') this.entries = Object.values(d.entries);
+    else this.entries = [];
+    this.weeklyChamps = (d.weeklyChamps && typeof d.weeklyChamps === 'object') ? d.weeklyChamps : {};
+    this.currentWeek  = (typeof d.currentWeek === 'string') ? d.currentWeek : null;
     const wkNow = this._weekId(Date.now());
     if(this.currentWeek && this.currentWeek !== wkNow) this.updateWeeklyChamps();
   },
@@ -7071,7 +7079,7 @@ function App(){
   // -- COLLECTIVE BRAIN LOAD on mount ----------------------------------------
   useEffect(()=>{collectiveBrainLoad().then(()=>{
     // Re-render billboard list once the brain load finishes.
-    setBbEntries(billboard.entries.slice());
+    setBbEntries(Array.isArray(billboard.entries)?billboard.entries.slice():[]);
   });},[]);
 
   // Refresh the cross-user Top-10 from the cloud worker when the user opens
@@ -7080,7 +7088,7 @@ function App(){
   useEffect(()=>{
     if(activeTab!=='billboard') return;
     billboard.cloudFetchTop(bbViewGenre, 10).then(data=>{
-      if(data) setBbEntries(billboard.entries.slice());
+      if(data) setBbEntries(Array.isArray(billboard.entries)?billboard.entries.slice():[]);
     });
   },[activeTab, bbViewGenre]);
 
@@ -7552,7 +7560,7 @@ function App(){
             },
             rawBlobs: blobs,
           };
-          setBbEntries(billboard.entries.slice());
+          setBbEntries(Array.isArray(billboard.entries)?billboard.entries.slice():[]);
           setBbRec({on:false, remaining:0});
           collectiveBrainSave();
           // Opt-in cloud sync: if bandx.cloudUrl is set, upload metadata to
@@ -7571,7 +7579,7 @@ function App(){
 
   const rateBillboard = (entryId, voice, stars) => {
     billboard.rate(entryId, voice, stars);
-    setBbEntries(billboard.entries.slice());
+    setBbEntries(Array.isArray(billboard.entries)?billboard.entries.slice():[]);
     collectiveBrainSave();
     billboard.cloudRate(entryId, voice, stars);
   };
@@ -7584,7 +7592,7 @@ function App(){
         .forEach(u => { try{ if(u) URL.revokeObjectURL(u); }catch(_){} });
       delete bbBlobsRef.current[entryId];
     }
-    setBbEntries(billboard.entries.slice());
+    setBbEntries(Array.isArray(billboard.entries)?billboard.entries.slice():[]);
     collectiveBrainSave();
   };
 
