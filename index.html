@@ -1886,8 +1886,30 @@ function drumSeed(){
 // Locked drum kit: timbre stays identical across every hit within one session / reseed.
 // Reseed a single drum via reseedDrum('kick'|'snare'|'hat'). Velocity + timing still vary per hit.
 const _drumKit={kick:drumSeed(),snare:drumSeed(),hat:drumSeed()};
+// Each voice's synthesis RECIPE (topology, not just params). Cycling this on
+// reseed is what actually changes the SOUND of the kit -- reseeding only the
+// seed leaves the same instrument with different values, which is why reseed
+// didn't feel like anything changed. Now reseed moves to the next recipe so
+// the kick goes sineSweep -> fm -> noiseBody -> ... back.
+const _drumRecipes={kick:'sineSweep', snare:'classic', hat:'metallic'};
+const KICK_RECIPE_CYCLE = ['sineSweep','fm','noiseBody'];
+const SNARE_RECIPE_CYCLE = ['classic','fm','clap'];
+const HAT_MODE_CYCLE = ['metallic','brush','digital','tape','vinyl','shaker','tabla'];
 function drumSeedFor(name){return _drumKit[name]||drumSeed();}
-let reseedDrum=function(name){if(_drumKit[name]!==undefined){_drumKit[name]=drumSeed();}};
+let reseedDrum=function(name){
+  if(_drumKit[name]!==undefined){_drumKit[name]=drumSeed();}
+  // Cycle recipe for a genuinely different-sounding instrument.
+  if(name==='kick'){
+    const i = KICK_RECIPE_CYCLE.indexOf(_drumRecipes.kick);
+    _drumRecipes.kick = KICK_RECIPE_CYCLE[(i+1) % KICK_RECIPE_CYCLE.length];
+  } else if(name==='snare'){
+    const i = SNARE_RECIPE_CYCLE.indexOf(_drumRecipes.snare);
+    _drumRecipes.snare = SNARE_RECIPE_CYCLE[(i+1) % SNARE_RECIPE_CYCLE.length];
+  } else if(name==='hat'){
+    const i = HAT_MODE_CYCLE.indexOf(_drumRecipes.hat);
+    _drumRecipes.hat = HAT_MODE_CYCLE[(i+1) % HAT_MODE_CYCLE.length];
+  }
+};
 
 // Sample slots: when a user drops a WAV/MP3 onto the kick / snare / hat
 // slot in the UI, we decode it into an AudioBuffer and park it here. The
@@ -1936,7 +1958,18 @@ function humanizedSeed(name, amount){
     color: Math.max(0, Math.min(1, b.color + (Math.random()-0.5)*a*0.3)),
   };
 }
-if(typeof window!=='undefined'){window._drumKit=_drumKit;window.reseedDrum=reseedDrum;}
+if(typeof window!=='undefined'){window._drumKit=_drumKit;window.reseedDrum=reseedDrum;window._drumRecipes=_drumRecipes;}
+
+// Locked bass kit: reseeding flips the bass character to a different mode.
+// 'auto' = neural-picked (legacy), other modes FORCE that character so the
+// user can kill the Squidward wobble and get a clean/locked tone.
+const _bassKit = {mode:'auto'};
+const BASS_MODE_CYCLE = ['auto','clean','pluck','slap','sustain','growl'];
+let reseedBassKit = function(){
+  const i = BASS_MODE_CYCLE.indexOf(_bassKit.mode);
+  _bassKit.mode = BASS_MODE_CYCLE[(i+1) % BASS_MODE_CYCLE.length];
+};
+if(typeof window!=='undefined'){window._bassKit=_bassKit;window.reseedBassKit=reseedBassKit;}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DRUM-RULES PATTERN ENGINE
@@ -2877,7 +2910,7 @@ function pickKickRecipe(s){
 }
 
 function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
-  const s=drumSeed();
+  const s=humanizedSeed('kick', 0.06);   // uses the locked kit, humanized
   s._wild = false;                 // drums never go wildcard
   const sp=styleP(); // current style profile
 
@@ -2897,8 +2930,16 @@ function synthKick(ctx,t,warp,dest,inputEnergy=0.5){
   const decay = styleLerp(sp.kickDecay, s.decay+inputEnergy*0.2) * decayMul / warp;
   const punch = styleLerp(sp.kickPunch, s.punch) * (0.8+inputEnergy*0.2);
 
-  // Always the classic sine-sweep body. No recipe rotation on drums.
-  kickSineSweep(ctx, t, warp, dest, f0, f1, decay, punch, s, sp);
+  // Body recipe from the locked kit -- reseedDrum('kick') cycles this
+  // between sineSweep / fm / noiseBody for genuinely different sounds.
+  const recipe = _drumRecipes.kick;
+  if(recipe === 'fm' && typeof kickFM === 'function'){
+    kickFM(ctx, t, warp, dest, f0, f1, decay, punch, s, sp);
+  } else if(recipe === 'noiseBody' && typeof kickNoiseBody === 'function'){
+    kickNoiseBody(ctx, t, warp, dest, f0, f1, decay, punch, s, sp);
+  } else {
+    kickSineSweep(ctx, t, warp, dest, f0, f1, decay, punch, s, sp);
+  }
 
   // DROP MODE: when beatDropEngine says this is the drop bar, stack the
   // kick much heavier. Extra 200Hz EQ bump, longer decay, extra 808 layer.
@@ -3206,24 +3247,37 @@ function synthSnare(ctx,t,chaos,warp,dest,inputTight=0.5,articulation){
     return;
   }
 
-  // Acoustic path: classic sine/triangle body + snare-wire tail. Articulation
-  // shapes velocity; the kit character stays constant.
+  // Acoustic path: body recipe from the locked kit (_drumRecipes.snare).
+  // Reseed cycles classic / fm / clap for real topology changes.
+  // Articulation shapes velocity; the kit character stays constant per reseed.
   const vel = art==='ghost' ? 0.30 : art==='rimshot' ? 1.15 : art==='rim' ? 0.85 : 1.0;
   const bodyFreq=(155+s.pitch*90+inputTight*50)*warp * (art==='rim'?1.45:1.0);
 
-  // Body + ring (skip body for rim — that's a rim-shot on the edge only)
+  // Body recipe: skip for rim (that's a pure stick hit). Ghost/rim always use
+  // the quiet classic body so the subtle articulations stay readable.
   if(art!=='rim'){
-    const body=ctx.createOscillator();
-    body.type=s.color>0.5?'triangle':'sine';
-    body.frequency.setValueAtTime(bodyFreq,t);
-    body.frequency.exponentialRampToValueAtTime(bodyFreq*(0.55+s.tone*0.2),t+0.09/warp);
-    const bg=ctx.createGain();
-    bg.gain.setValueAtTime(s.punch*0.62*vel,t);
-    bg.gain.linearRampToValueAtTime(0.0001,t+(0.13+s.decay*0.08)/warp);
-    bg.gain.setValueAtTime(0,t+(0.14+s.decay*0.08)/warp);
-    body.connect(bg);bg.connect(dest);
-    body.start(t);body.stop(t+(0.15+s.decay*0.08)/warp);
-    autoClean(body,bg);
+    const snareRecipe = (art==='ghost') ? 'classic' : _drumRecipes.snare;
+    const sForBody = {...s, punch: s.punch*vel};   // velocity bakes into punch
+    if(snareRecipe === 'fm' && typeof snareFM === 'function'){
+      snareFM(ctx, t, bodyFreq, warp, dest, sForBody);
+    } else if(snareRecipe === 'clap' && typeof snareClap === 'function'){
+      snareClap(ctx, t, bodyFreq, warp, dest, sForBody);
+    } else if(typeof snareClassic === 'function'){
+      snareClassic(ctx, t, bodyFreq, warp, dest, sForBody);
+    } else {
+      // Fallback: inline legacy body (in case recipe helpers aren't defined)
+      const body=ctx.createOscillator();
+      body.type=s.color>0.5?'triangle':'sine';
+      body.frequency.setValueAtTime(bodyFreq,t);
+      body.frequency.exponentialRampToValueAtTime(bodyFreq*(0.55+s.tone*0.2),t+0.09/warp);
+      const bg=ctx.createGain();
+      bg.gain.setValueAtTime(s.punch*0.62*vel,t);
+      bg.gain.linearRampToValueAtTime(0.0001,t+(0.13+s.decay*0.08)/warp);
+      bg.gain.setValueAtTime(0,t+(0.14+s.decay*0.08)/warp);
+      body.connect(bg);bg.connect(dest);
+      body.start(t);body.stop(t+(0.15+s.decay*0.08)/warp);
+      autoClean(body,bg);
+    }
   }
   if(s.color>0.3){
     const ring=ctx.createOscillator();ring.type='sine';
@@ -3290,7 +3344,9 @@ function synthHat(ctx,t,open,chaos,warp,dest,inputBright=0.5,velocity=0.7,durMul
   }
   const s=humanizedSeed('hat', 0.07);
   const cymType = open ? 'open' : 'closed';
-  const hatMode = styleP().hatMode || 'metallic';
+  // Locked-kit hatMode -- reseedDrum('hat') cycles through metallic / brush /
+  // digital / tape / vinyl / shaker / tabla for a new cymbal character.
+  const hatMode = _drumRecipes.hat || styleP().hatMode || 'metallic';
   // Per-hit brightness wobble — real hi-hats open/close slightly with foot pressure
   const brJit = inputBright * (1 + (Math.random()-0.5)*0.25);
   synthCymbal(ctx, t, cymType, s, warp, dest, brJit, velocity, hatMode, durMult);
@@ -5303,12 +5359,40 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   const inputs=bassBrain.update(windBoost*10, chaos, pcMod, beat);
   const nn=bassBrain.infer(inputs);
 
-  // Select synthesis mode from neural output + chaos
-  // 0=pluck 1=slap 2=sustain 3=growl
-  const modeVal=(nn.harmonicMix + chaos*0.3 + windBoost*0.2 + pcMod*0.15) % 1.0;
-  const mode=modeVal<0.28?'pluck':modeVal<0.52?'slap':modeVal<0.76?'sustain':'growl';
+  // Select synthesis mode. Bass kit can override the neural pick so the
+  // user's reseed actually changes the bass character. 'clean' is a new
+  // mode: pure pulse through a gentle LPF, zero LFO/wobble, no ring mod --
+  // specifically for when the other modes feel Squidward-ish.
+  let mode;
+  if(_bassKit.mode === 'auto'){
+    const modeVal=(nn.harmonicMix + chaos*0.3 + windBoost*0.2 + pcMod*0.15) % 1.0;
+    mode = modeVal<0.28?'pluck':modeVal<0.52?'slap':modeVal<0.76?'sustain':'growl';
+  } else {
+    mode = _bassKit.mode;
+  }
 
   const _styleLen=styleP().noteLenMult;
+  // CLEAN bass path: the wobble-free option. Pure pulse through a gentle
+  // lowpass, no ring mod, no filter LFO, no detune wobble. Returns early so
+  // none of the subtractive modulation below fires.
+  if(mode === 'clean'){
+    const dur = 0.32 * _styleLen / warp;
+    const osc = ctx.createOscillator(); osc.type = 'square';
+    osc.frequency.value = freq;
+    osc.detune.value = (pcMod*4-2);
+    const lpf = ctx.createBiquadFilter(); lpf.type='lowpass';
+    lpf.frequency.value = Math.max(180, (650 + inputChar*500 + pcMod*200)*warp);
+    lpf.Q.value = 0.8;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.55 + windBoost*0.10, t + 0.006);
+    g.gain.linearRampToValueAtTime(0.40 + windBoost*0.05, t + dur*0.7);
+    g.gain.linearRampToValueAtTime(0.0001, t + dur);
+    osc.connect(lpf); lpf.connect(g); g.connect(dest);
+    osc.start(t); osc.stop(t + dur + 0.03);
+    autoClean(osc, lpf, g);
+    return;
+  }
   // Envelope tween: scale decay by the slow-moving envelope target for bass.
   // Tight (low env) = shorter/punchier. Open (high env) = longer, breathier.
   const _bassEnv = motionTween.envFor('bass');
@@ -6445,12 +6529,20 @@ function App(){
           Object.keys(brain.q).forEach(k=>{ if(k.indexOf(prefix)===0) brain.q[k]=brain.q[k]*0.25; });
         }
       }catch(_){}
-      addLog(`[RESEED] ${which.toUpperCase()} vocabulary shuffled.`);
+      // Bass gets an actual NEW SOUND on reseed -- cycle the synthesis mode
+      // through auto / clean / pluck / slap / sustain / growl so the voice
+      // genuinely changes character, not just its phrase memory.
+      if(which==='bass' && typeof reseedBassKit === 'function'){
+        reseedBassKit();
+        addLog(`[RESEED] BASS mode -> ${_bassKit.mode}`);
+      } else {
+        addLog(`[RESEED] ${which.toUpperCase()} vocabulary shuffled.`);
+      }
     } else if(which==='all'){
       reseedDrum('kick'); reseedDrum('snare'); reseedDrum('hat');
       reseedDrumPattern('all');
       ['bass','mid','lead'].forEach(r=>reseedInstrument(r));
-      addLog('[RESEED] Full band reshuffled.');
+      addLog(`[RESEED] Full band reshuffled. Kick=${_drumRecipes.kick} Snare=${_drumRecipes.snare} Hat=${_drumRecipes.hat} Bass=${_bassKit.mode}`);
     }
     hap.tap();
   };
@@ -8109,6 +8201,21 @@ function App(){
           // Open-hat only on designated steps, and only when that step actually plays
           dp.hOpen[st] = isDesignatedOpen0 && dp.h[st] > 0 && (Math.random() < 0.55 + chaos*0.2);
         }
+
+        // SNARE REST: every 4th bar (when AI leads), drop the backbeat snare
+        // entirely and replace with kicks on 2 & 4 (or cowbell if style wants
+        // it). Gives the groove room to breathe and makes the snare-bar feel
+        // like an arrival when it comes back on the next bar.
+        if(!userIsDrummer && ((ar.measureCount||0) % 4) === 3){
+          // Find existing snare positions (2 & 4 in a 16-step grid = steps 4 & 12)
+          for(let st=0;st<16;st++){
+            if(dp.s[st] > 0){
+              // Replace with a kick if kick isn't already there
+              if(dp.k[st] === 0) dp.k[st] = Math.max(0.55, dp.s[st] * 0.9);
+              dp.s[st] = 0;
+            }
+          }
+        }
         // ---- 16-BAR PHRASE VARIATION -------------------------------------
         // Real drummers play over a 16-bar structure: bar 1 states, bars
         // 2-3 vary subtly, bar 4 turns around; bars 5-8 answer with more
@@ -8279,7 +8386,11 @@ function App(){
         window._isDrumHittingTimer=setTimeout(()=>{ window._isDrumHitting=false; },55);
       }
       if(playS){
-        const sT = time;
+        // Deterministic snare micro-timing: real drummers sit a few ms
+        // behind the click on the backbeat. Uses a sine of the measureCount
+        // so consecutive bars lag slightly differently, never random.
+        const snarePocket = 0.003 + 0.0018 * Math.sin((ar.measureCount||0) * 0.37);
+        const sT = time + snarePocket;
         const snVel = Math.max(0.35, Math.min(1, sVel*0.7 + 0.15));
         synthSnare(ctx,sT,chaos,warpMultiplier,bus.getInput('snare'),snVel);
         voices.drum.play();
@@ -8295,10 +8406,13 @@ function App(){
         // Velocity = template velocity (accent/ghost) with a small humanization.
         // Velocity straight from the template, no random humanization.
         const hatVel = Math.max(0.18, Math.min(1.0, hVel*0.85));
-        // Tweened swing only. No per-hit random jitter on drums.
+        // Tweened swing + deterministic human micro-timing: off-beat hats
+        // push back a couple ms, on-beat hats sit flat. Pattern comes from
+        // the step index so it repeats predictably -- grooves, doesn't roll.
         const grooveOff = (styleP().hatGrooveOffset||0);
         const drumSwingPush = (motionTween.swingFor('drum') - 0.18) * 0.020;
-        const hatT = time + grooveOff + drumSwingPush;
+        const hatHuman = (b16%2 === 1) ? 0.0035 : -0.0008;  // off-beats drag, downbeats push
+        const hatT = time + grooveOff + drumSwingPush + hatHuman;
         synthHat(ctx,hatT,dp.hOpen[b16],chaos,warpMultiplier,bus.getInput('drum'),ie,hatVel);
         rhythmMemory.mark(beat,stepsPerMeasure,{h:true});
       }
