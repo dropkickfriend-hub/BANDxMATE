@@ -223,13 +223,86 @@ def _save_file(payload, path=OUTPUT_PATH):
         print(f'[bandx-worker] could not write {path}: {exc}')
 
 
-# ── HTTP handler: CORS + /progressions.json ────────────────────────────────
+# ── Billboard: cross-user Top-10-per-genre store ──────────────────────────
+# Metadata-only. Audio is never uploaded here -- only titles, socials URLs,
+# per-voice ratings, and computed scores. Entries expire after 60 days so
+# the chart is always fresh. Weekly champions are snapshotted separately.
+BILLBOARD_PATH   = Path(os.environ.get('BANDX_BILLBOARD', '/tmp/bandx-billboard.json'))
+BB_MAX_ENTRIES   = 2000           # hard cap so one bad actor can't bomb the db
+BB_EXPIRE_SEC    = 60 * 24 * 3600 # entries older than this drop off the chart
+BB_LOCK = threading.Lock()
+_BB_STATE = {'entries': {}, 'champs': {}}  # id -> entry; genre -> snapshot
+
+
+def _bb_load():
+    if BILLBOARD_PATH.exists():
+        try:
+            data = json.loads(BILLBOARD_PATH.read_text())
+            _BB_STATE['entries'] = data.get('entries', {}) or {}
+            _BB_STATE['champs']  = data.get('champs', {})  or {}
+        except (OSError, ValueError) as exc:
+            print(f'[bandx-billboard] could not read {BILLBOARD_PATH}: {exc}')
+
+
+def _bb_save():
+    try:
+        tmp = BILLBOARD_PATH.with_suffix('.tmp')
+        tmp.write_text(json.dumps(_BB_STATE, indent=2))
+        tmp.replace(BILLBOARD_PATH)
+    except OSError as exc:
+        print(f'[bandx-billboard] could not write {BILLBOARD_PATH}: {exc}')
+
+
+def _bb_expire():
+    now = time.time()
+    with BB_LOCK:
+        dead = [k for k, e in _BB_STATE['entries'].items()
+                if now - (e.get('ts', 0) / 1000) > BB_EXPIRE_SEC]
+        for k in dead:
+            del _BB_STATE['entries'][k]
+
+
+def _bb_score(e):
+    """Deep-learned rank: avg rating * log(count+1) * recency decay."""
+    age_hrs = max(0.0, (time.time() - e.get('ts', 0) / 1000) / 3600)
+    recency = 2.71828 ** (-age_hrs / (24 * 7))
+    r  = float(e.get('totalRating', 0.0))
+    n  = int(e.get('ratingCount', 0))
+    import math
+    return r * math.log2(n + 2) * (0.6 + 0.4 * recency)
+
+
+def _bb_top(genre, n=10):
+    _bb_expire()
+    with BB_LOCK:
+        pool = [e for e in _BB_STATE['entries'].values()
+                if not genre or e.get('genre') == genre]
+    pool.sort(key=_bb_score, reverse=True)
+    return pool[:n]
+
+
+def _bb_update_champs():
+    """Snapshot #1 per genre; called once per request naturally (cheap)."""
+    GENRES = ['jazz','pop','edm','hiphop','westcoast','eastcoast','african','indian']
+    for g in GENRES:
+        top = _bb_top(g, 1)
+        if top:
+            _BB_STATE['champs'][g] = {
+                'entryId': top[0].get('id'),
+                'title':   top[0].get('title'),
+                'socials': top[0].get('socials', ''),
+                'score':   _bb_score(top[0]),
+                'snapshotTs': int(time.time() * 1000),
+            }
+
+
+# ── HTTP handler: CORS + /progressions.json + /billboard/* ────────────────
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, code, body=b'', content_type='application/json'):
         self.send_response(code)
         self.send_header('Content-Type', content_type)
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', '*')
         self.send_header('Cache-Control', 'no-store')
         self.send_header('Content-Length', str(len(body)))
@@ -237,16 +310,101 @@ class _Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
+    def _read_body(self):
+        try:
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            raw = self.rfile.read(n) if n > 0 else b''
+            return json.loads(raw.decode('utf-8')) if raw else {}
+        except (ValueError, OSError):
+            return None
+
     def do_OPTIONS(self):  # CORS preflight
         self._send(204)
 
     def do_GET(self):
         path = self.path.split('?', 1)[0].rstrip('/')
+        qs = {}
+        if '?' in self.path:
+            for kv in self.path.split('?', 1)[1].split('&'):
+                if '=' in kv:
+                    k, v = kv.split('=', 1)
+                    qs[k] = v
+
         if path in ('', '/progressions.json'):
             body = json.dumps(_get_payload()).encode('utf-8')
             self._send(200, body)
         elif path == '/health':
             self._send(200, b'{"ok":true}')
+        elif path == '/billboard/top':
+            genre = qs.get('genre')
+            try:
+                n = max(1, min(50, int(qs.get('n', '10'))))
+            except ValueError:
+                n = 10
+            _bb_update_champs()
+            body = json.dumps({
+                'entries': _bb_top(genre, n),
+                'champs':  _BB_STATE['champs'],
+            }).encode('utf-8')
+            self._send(200, body)
+        else:
+            self._send(404, b'{"error":"not found"}')
+
+    def do_POST(self):
+        path = self.path.split('?', 1)[0].rstrip('/')
+        if path == '/billboard/upload':
+            data = self._read_body()
+            if not data or not isinstance(data, dict):
+                self._send(400, b'{"error":"invalid json"}'); return
+            eid = str(data.get('id') or f'bb-{int(time.time()*1000)}-{random.randint(1000,9999)}')
+            with BB_LOCK:
+                # Never store raw audio -- just metadata
+                _BB_STATE['entries'][eid] = {
+                    'id':         eid,
+                    'title':      str(data.get('title', 'Untitled'))[:140],
+                    'socials':    str(data.get('socials', ''))[:240],
+                    'genre':      str(data.get('genre', 'pop'))[:24],
+                    'ts':         int(data.get('ts') or time.time() * 1000),
+                    'weekId':     str(data.get('weekId', ''))[:16],
+                    'ratings':    data.get('ratings', {'drum':0,'bass':0,'mid':0,'lead':0}),
+                    'ratingCounts': data.get('ratingCounts', {'drum':0,'bass':0,'mid':0,'lead':0}),
+                    'totalRating':float(data.get('totalRating', 0) or 0),
+                    'ratingCount':int(data.get('ratingCount', 0) or 0),
+                }
+                # Enforce cap -- drop lowest-scoring on overflow
+                if len(_BB_STATE['entries']) > BB_MAX_ENTRIES:
+                    sorted_ids = sorted(_BB_STATE['entries'].values(), key=_bb_score)
+                    for e in sorted_ids[:len(sorted_ids) - BB_MAX_ENTRIES]:
+                        _BB_STATE['entries'].pop(e['id'], None)
+            _bb_save()
+            self._send(200, json.dumps({'ok': True, 'id': eid}).encode('utf-8'))
+        elif path == '/billboard/rate':
+            data = self._read_body()
+            if not data:
+                self._send(400, b'{"error":"invalid json"}'); return
+            eid = str(data.get('id', ''))
+            voice = str(data.get('voice', ''))
+            stars = float(data.get('stars', 0) or 0)
+            if voice not in ('drum','bass','mid','lead') or not (1 <= stars <= 5):
+                self._send(400, b'{"error":"bad voice or stars"}'); return
+            with BB_LOCK:
+                e = _BB_STATE['entries'].get(eid)
+                if not e:
+                    self._send(404, b'{"error":"no such entry"}'); return
+                n = int(e['ratingCounts'].get(voice, 0) or 0)
+                prev = float(e['ratings'].get(voice, 0) or 0)
+                e['ratings'][voice] = (prev * n + stars) / (n + 1)
+                e['ratingCounts'][voice] = n + 1
+                tot, cnt = 0.0, 0
+                for k in ('drum','bass','mid','lead'):
+                    c = int(e['ratingCounts'].get(k, 0) or 0)
+                    if c:
+                        tot += float(e['ratings'][k]) * c
+                        cnt += c
+                e['totalRating'] = tot / cnt if cnt else 0.0
+                e['ratingCount'] = cnt
+            _bb_save()
+            self._send(200, json.dumps({'ok': True}).encode('utf-8'))
         else:
             self._send(404, b'{"error":"not found"}')
 
@@ -281,6 +439,8 @@ def main():
         except (OSError, ValueError) as exc:
             print(f'[bandx-worker] could not read existing {OUTPUT_PATH}: {exc}')
 
+    _bb_load()
+    print(f'[bandx-billboard] loaded {len(_BB_STATE["entries"])} entries')
     _publish(library)
     _start_server(PORT)
     print(f'[bandx-worker] evolver starting. pop={POPULATION} libcap={LIBRARY_SIZE}')

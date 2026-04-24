@@ -2280,6 +2280,78 @@ const billboard = {
     return false;
   },
 
+  // -- Cloud sync (metadata-only). Opt-in via localStorage.'bandx.cloudUrl'.
+  // The cloud worker's /billboard/upload and /billboard/top endpoints handle
+  // cross-user Top-10 aggregation. Audio stays local; only titles, socials,
+  // and per-voice ratings are shared.
+  async cloudUpload(entry){
+    try{
+      const base = (typeof localStorage!=='undefined') ? localStorage.getItem('bandx.cloudUrl') : null;
+      if(!base) return false;
+      const url = base.replace(/\/$/,'') + '/billboard/upload';
+      const res = await fetch(url, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          id: entry.id, title: entry.title, socials: entry.socials,
+          genre: entry.genre, ts: entry.ts, weekId: entry.weekId,
+          ratings: entry.ratings, ratingCounts: entry.ratingCounts,
+          totalRating: entry.totalRating, ratingCount: entry.ratingCount,
+        }),
+      });
+      return res.ok;
+    }catch(_){ return false; }
+  },
+  async cloudRate(entryId, voice, stars){
+    try{
+      const base = (typeof localStorage!=='undefined') ? localStorage.getItem('bandx.cloudUrl') : null;
+      if(!base) return false;
+      const url = base.replace(/\/$/,'') + '/billboard/rate';
+      const res = await fetch(url, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({id: entryId, voice, stars}),
+      });
+      return res.ok;
+    }catch(_){ return false; }
+  },
+  async cloudFetchTop(genre, n=10){
+    try{
+      const base = (typeof localStorage!=='undefined') ? localStorage.getItem('bandx.cloudUrl') : null;
+      if(!base) return null;
+      const url = base.replace(/\/$/,'') + `/billboard/top?genre=${encodeURIComponent(genre||'')}&n=${n}`;
+      const res = await fetch(url, {cache:'no-store'});
+      if(!res.ok) return null;
+      const data = await res.json();
+      // Merge cloud-only entries into local list as shadow entries (no blobs).
+      if(Array.isArray(data.entries)){
+        for(const e of data.entries){
+          if(!e || !e.id) continue;
+          const existing = this.entries.find(x => x.id === e.id);
+          if(existing){
+            // Prefer the fresher rating aggregate from the cloud
+            existing.ratings = e.ratings || existing.ratings;
+            existing.ratingCounts = e.ratingCounts || existing.ratingCounts;
+            existing.totalRating = e.totalRating ?? existing.totalRating;
+            existing.ratingCount = e.ratingCount ?? existing.ratingCount;
+          } else {
+            this.entries.push({
+              id:e.id, title:e.title||'Untitled', socials:e.socials||'',
+              genre:e.genre||'pop', ts:e.ts||Date.now(),
+              weekId:e.weekId||this._weekId(e.ts||Date.now()),
+              master:null, stems:{},
+              ratings: e.ratings||{drum:0,bass:0,mid:0,lead:0},
+              ratingCounts: e.ratingCounts||{drum:0,bass:0,mid:0,lead:0},
+              totalRating: e.totalRating||0,
+              ratingCount: e.ratingCount||0,
+              _cloudOnly: true,
+            });
+          }
+        }
+      }
+      return data;
+    }catch(_){ return null; }
+  },
+
   serialize(){
     // Strip raw audio buffers to keep the brain payload small. Stem blobs are
     // persisted separately in IndexedDB under `billboard-<id>-<voice>`.
@@ -6323,18 +6395,31 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
   // Envelope tween for lead: longer, more-open envelope when motionTween
   // targets higher values. At low env = punchy/tight, at high env = sustained.
   const _leadEnv = motionTween.envFor('lead');
-  const durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult*(0.65 + _leadEnv*0.75)/warp;
+  let durT=(0.22+s.tone*0.50+windBoost*0.18+chaos*0.25)*_lStyle.noteLenMult*(0.65 + _leadEnv*0.75)/warp;
   const atk = _lStyle.attackMult * 0.006 * (0.75 + _leadEnv*0.5);
   const vol = 0.09+windBoost*0.04+s.punch*0.03;
+
+  // deepDesign staccato: shorten the note length BEFORE any branch runs.
+  if(_ddL && _ddL.move==='staccato' && deepDesign.active){
+    durT = durT * expressionFX.staccatoFactor();
+  }
 
   // Hard ceiling: 10kHz lowpass on ALL lead modes -- prevents deafening highs
   // Gentle slope (Q=0.5) so it doesn't ring, just rolls off
   const ceiling=ctx.createBiquadFilter(); ceiling.type='lowpass';
   ceiling.frequency.value=10000; ceiling.Q.value=0.5;
-  ceiling.connect(dest);
-  // All lead modes output to `ceiling` instead of `dest` directly
-  const leadDest=ceiling;
-  autoClean(ceiling);
+  // Insert a post-branch gain node for tremolo (deepDesign.move=='tremolo').
+  // All branches write into `leadDest` which is this gain; the gain then
+  // feeds the ceiling filter and out to the real dest. Makes tremolo
+  // possible without touching each branch's internal envelope.
+  const postG = ctx.createGain(); postG.gain.value = 1.0;
+  postG.connect(ceiling); ceiling.connect(dest);
+  const leadDest=postG;
+  if(_ddL && _ddL.move==='tremolo' && deepDesign.active){
+    const [lfo,tg] = expressionFX.tremolo(ctx, postG.gain, 1.0, 5.8, 0.35, t, durT+0.2);
+    autoClean(lfo, tg);
+  }
+  autoClean(ceiling, postG);
 
   if(mode==='saw'){
     // Classic detuned poly-saw -- 2-4 osc, portamento, lowpass filter sweep
@@ -6989,6 +7074,16 @@ function App(){
     setBbEntries(billboard.entries.slice());
   });},[]);
 
+  // Refresh the cross-user Top-10 from the cloud worker when the user opens
+  // the Billboard tab or changes the viewed genre. Fails silently if no
+  // cloud URL is configured.
+  useEffect(()=>{
+    if(activeTab!=='billboard') return;
+    billboard.cloudFetchTop(bbViewGenre, 10).then(data=>{
+      if(data) setBbEntries(billboard.entries.slice());
+    });
+  },[activeTab, bbViewGenre]);
+
   // -- SYNC LEARNING MODE to engine objects --------------------------------
   useEffect(()=>{
     chaosRewardEngine.active    = learningMode==='chaos';
@@ -7460,6 +7555,11 @@ function App(){
           setBbEntries(billboard.entries.slice());
           setBbRec({on:false, remaining:0});
           collectiveBrainSave();
+          // Opt-in cloud sync: if bandx.cloudUrl is set, upload metadata to
+          // the worker so this entry counts toward the global Top-10.
+          billboard.cloudUpload(entry).then(ok=>{
+            if(ok) addLog('[BILLBOARD] Synced to cloud.');
+          });
           addLog('[BILLBOARD] Track saved: '+entry.title+' ('+entry.genre+')');
         }catch(e){
           console.warn('[billboard] finish failed', e);
@@ -7473,6 +7573,7 @@ function App(){
     billboard.rate(entryId, voice, stars);
     setBbEntries(billboard.entries.slice());
     collectiveBrainSave();
+    billboard.cloudRate(entryId, voice, stars);
   };
 
   const deleteBillboardEntry = (entryId) => {
@@ -9245,14 +9346,30 @@ function App(){
           const lowArcs = ['ballad','to_to_pause_from','from_from_from','shock_settle'];
           let feel = userFeel;
           if(feel === 'auto'){
-            // Low tempo + low arc + user not drumming = delta sparse
+            // Tempo-first rules so slow jams always get space. The drummer
+            // is NOT supposed to be on crack when the tempo asks for chill.
             const onsetR = ar._onsetRate||0;
             const lowArc = lowArcs.includes(curArcName);
-            if(bpmNow < 72 && lowArc && onsetR < 1.0 && Math.random()<0.55) feel='delta_sparse';
-            else if(bpmNow < 80 && Math.random()<0.25)                      feel='halftime';
-            else if(bpmNow > 150 && Math.random()<0.15)                     feel='doubletime';
-            else if(lowArc && Math.random()<0.35)                           feel='ballad';
-            else                                                             feel='normal';
+            if(bpmNow < 68){
+              // Really slow -- mostly empty bars with occasional kick on 1.
+              feel = Math.random()<0.55 ? 'delta_sparse' : 'ballad';
+            } else if(bpmNow < 78){
+              // Slow -- halftime + delta_sparse with the user not pushing.
+              if(onsetR < 1.2 && Math.random()<0.50)          feel='delta_sparse';
+              else if(lowArc && Math.random()<0.55)           feel='halftime';
+              else if(Math.random()<0.35)                     feel='ballad';
+              else                                             feel='normal';
+            } else if(bpmNow < 92){
+              // Mid -- halftime on pause arcs only.
+              if(lowArc && onsetR < 0.8 && Math.random()<0.40) feel='halftime';
+              else if(lowArc && Math.random()<0.25)            feel='ballad';
+              else                                              feel='normal';
+            } else if(bpmNow > 155){
+              // Fast -- doubletime bias; tight hats, packed.
+              feel = Math.random()<0.30 ? 'doubletime' : 'normal';
+            } else {
+              feel = 'normal';
+            }
           }
           ar._drumFeelActive = feel;
           if(feel === 'normal') return;
