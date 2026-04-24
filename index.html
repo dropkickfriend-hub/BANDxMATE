@@ -672,6 +672,7 @@ const collectiveBrainLoad=async()=>{
     if(p.autoFx) autoFx.load(p.autoFx);
     if(p.dissonanceBank) dissonanceBank.load(p.dissonanceBank);
     if(p.deepDesign) deepDesign.load(p.deepDesign);
+    if(p.billboard) billboard.load(p.billboard);
     if(p.sessionJudge) sessionJudge.load(p.sessionJudge);
     const voicingCount=Object.values(brain.voicingMem).reduce((s,a)=>s+a.length,0);
     console.log('[GenesisBrain] Loaded -- n:'+brain.n+' phrases:'+motifEng.phrases.length+' voicings:'+voicingCount);
@@ -701,6 +702,7 @@ const collectiveBrainSave=()=>{
         autoFx:      autoFx.serialize(),
         dissonanceBank: dissonanceBank.serialize(),
         deepDesign:  deepDesign.serialize(),
+        billboard:   billboard.serialize(),
         sessionJudge: sessionJudge.serialize(),
         _ts:         Date.now()
       };
@@ -1473,6 +1475,35 @@ class MotifEngine{
   }
 
   popEcho(){return this.echoQueue.shift()||null;}
+
+  // -- STOCK MOTIF BANK -----------------------------------------------------
+  // Interval-set motifs the band can pull from when the user hasn't sung
+  // anything recent. Each motif includes a contour, a prescribed rhythm
+  // (durations in 16th notes), and a "call" vs "response" vs "turnaround"
+  // tag so the call-and-response engine can pick the right role.
+  static STOCK = [
+    {name:'rising_arp',   ivs:[0,4,7,12],     dur:[2,2,2,2], role:'call'},
+    {name:'falling_arp',  ivs:[12,7,4,0],     dur:[2,2,2,2], role:'response'},
+    {name:'pentatonic',   ivs:[0,3,5,7,10],   dur:[1,1,1,2,3], role:'call'},
+    {name:'blues_lick',   ivs:[0,3,5,6,5,3,0],dur:[2,1,1,2,1,1,4], role:'response'},
+    {name:'bebop_enclose',ivs:[0,2,1,0,-1,0], dur:[1,1,1,1,1,3], role:'response'},
+    {name:'bossa_hook',   ivs:[0,4,7,4,9,7],  dur:[2,2,2,2,2,6], role:'call'},
+    {name:'call_48',      ivs:[0,4,7,9],      dur:[4,4,4,4], role:'call'},
+    {name:'response_48',  ivs:[9,7,4,0],      dur:[3,3,4,6], role:'response'},
+    {name:'turnaround_ii',ivs:[2,5,7,10,12],  dur:[1,1,2,2,2], role:'turnaround'},
+    {name:'turnaround_V', ivs:[7,11,14,10,12],dur:[1,1,2,2,2], role:'turnaround'},
+    {name:'motif_3_up',   ivs:[0,3,7],        dur:[2,2,4], role:'call'},
+    {name:'motif_5_down', ivs:[7,5,3,2,0],    dur:[1,1,1,1,4], role:'response'},
+  ];
+
+  // Pick a stock motif matching a role ('call'|'response'|'turnaround') and
+  // return an interval+duration list. Used as a fallback when the user's
+  // phrase buffer is empty or when the band wants to vary its own lines.
+  suggestStock(role){
+    const pool = MotifEngine.STOCK.filter(m => m.role===role);
+    if(!pool.length) return null;
+    return pool[Math.floor(Math.random()*pool.length)];
+  }
 }
 const motifEng=new MotifEngine();
 
@@ -2135,6 +2166,163 @@ const grossbeat = {
   },
 };
 if(typeof window!=='undefined') window.grossbeat=grossbeat;
+
+// -- BILLBOARD -------------------------------------------------------------
+// Local-first Top-10-per-genre of recorded sessions. Users record a track,
+// optionally capture per-voice stems, rate each voice, and add their socials.
+// Weekly reset picks the #1 per genre for competition; ratings feed back into
+// paramMemory / deepDesign so the band gradually plays more like the tracks
+// the community rates highest.
+const billboard = {
+  // Serializable state -- persisted via collectiveBrainSave.
+  entries: [],          // [{id, genre, title, socials, ts, weekId, master:{dur,buf}, stems:{drum,bass,mid,lead}, ratings:{drum,bass,mid,lead}, totalRating, ratingCount}]
+  weeklyChamps: {},     // genre -> {weekId, entryId, snapshotTs}
+  currentWeek: null,    // computed from Date.now()
+
+  _weekId(ts){
+    // ISO week: year + week-of-year. Entries reset display every Monday 00:00 UTC.
+    const d = new Date(ts || Date.now());
+    d.setUTCHours(0,0,0,0);
+    const jan1 = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+    const days = Math.floor((d - jan1)/(24*3600*1000));
+    const w = Math.floor((days + jan1.getUTCDay()) / 7);
+    return `${d.getUTCFullYear()}-W${String(w).padStart(2,'0')}`;
+  },
+
+  // Add a new entry. Master is an AudioBuffer serialized to Float32.
+  async add(entry){
+    const ts = Date.now();
+    const weekId = this._weekId(ts);
+    const id = `bb-${ts}-${Math.random().toString(36).slice(2,8)}`;
+    const full = {
+      id, ts, weekId,
+      genre:  entry.genre || 'pop',
+      title:  entry.title || 'Untitled',
+      socials:entry.socials || '',
+      master: entry.master || null,     // {dur, ch, sr, data: Float32Array[]}
+      stems:  entry.stems  || {},       // each: {dur, ch, sr, data: Float32Array[]}
+      ratings:{drum:0, bass:0, mid:0, lead:0},
+      ratingCounts:{drum:0, bass:0, mid:0, lead:0},
+      totalRating: 0,
+      ratingCount: 0,
+    };
+    this.entries.unshift(full);
+    if(this.entries.length > 200) this.entries.pop();
+    return full;
+  },
+
+  // User rates a voice on an entry, 1-5 stars. Averages are kept online
+  // via (old*n + new)/(n+1). Feeds back into paramMemory and deepDesign.
+  rate(entryId, voice, stars){
+    const e = this.entries.find(x => x.id===entryId); if(!e) return null;
+    const v = voice in e.ratings ? voice : null; if(!v) return null;
+    const s = Math.max(1, Math.min(5, stars|0));
+    const n = e.ratingCounts[v]||0;
+    e.ratings[v] = (e.ratings[v]*n + s) / (n+1);
+    e.ratingCounts[v] = n+1;
+    // Recompute aggregate
+    let tot=0, cnt=0;
+    for(const k of ['drum','bass','mid','lead']){
+      if(e.ratingCounts[k]){ tot += e.ratings[k]*e.ratingCounts[k]; cnt += e.ratingCounts[k]; }
+    }
+    e.totalRating = cnt ? tot/cnt : 0;
+    e.ratingCount = cnt;
+    // Feedback: high-rated voices (>=4.0) promote their active params; low (<=2.0) demote.
+    try{
+      if(typeof paramMemory!=='undefined'){
+        const vm = paramMemory.voices[v];
+        if(vm && e.ratings[v] >= 4.0) vm.n = Math.min(120, (vm.n||0) + 2);
+        else if(vm && e.ratings[v] <= 2.0 && vm.n>10) vm.n = Math.max(10, vm.n-3);
+      }
+    }catch(_){}
+    return e.totalRating;
+  },
+
+  // Top-N per genre, ranked by totalRating * log(ratingCount+1)
+  topN(genre, n=10){
+    return this.entries
+      .filter(e => (genre ? e.genre===genre : true))
+      .map(e => ({...e, rank: e.totalRating * Math.log2((e.ratingCount||0)+2)}))
+      .sort((a,b)=>b.rank - a.rank)
+      .slice(0, n);
+  },
+
+  // The deep-learned top-10: entries whose voices have the highest learned
+  // scores across paramMemory + user ratings. Updated weekly.
+  deepTop(genre, n=10){
+    return this.entries
+      .filter(e => (genre ? e.genre===genre : true))
+      .map(e => {
+        const ageHrs = (Date.now() - e.ts)/3.6e6;
+        const recency = Math.exp(-ageHrs/(24*7));                     // 1 this week, decays
+        const score = e.totalRating * Math.log2((e.ratingCount||0)+2) * (0.6 + recency*0.4);
+        return {...e, deepScore: score};
+      })
+      .sort((a,b)=>b.deepScore - a.deepScore)
+      .slice(0, n);
+  },
+
+  // Pick a weekly champion per genre. Called once per week boundary.
+  updateWeeklyChamps(){
+    const wk = this._weekId(Date.now());
+    const GENRES = ['jazz','pop','edm','hiphop','westcoast','eastcoast','african','indian'];
+    for(const g of GENRES){
+      const top = this.deepTop(g, 1)[0];
+      if(top) this.weeklyChamps[g] = {weekId: wk, entryId: top.id, snapshotTs: Date.now()};
+    }
+    this.currentWeek = wk;
+  },
+
+  // Delete an entry (user cleanup)
+  remove(entryId){
+    const i = this.entries.findIndex(e=>e.id===entryId);
+    if(i>=0){ this.entries.splice(i,1); return true; }
+    return false;
+  },
+
+  serialize(){
+    // Strip raw audio buffers to keep the brain payload small. Stem blobs are
+    // persisted separately in IndexedDB under `billboard-<id>-<voice>`.
+    const strip = (e)=>({
+      ...e,
+      master: e.master ? {dur:e.master.dur, ch:e.master.ch, sr:e.master.sr} : null,
+      stems:  Object.fromEntries(Object.entries(e.stems||{}).map(([k,v])=>[k, v?{dur:v.dur, ch:v.ch, sr:v.sr}:null])),
+    });
+    return { entries: this.entries.map(strip), weeklyChamps: this.weeklyChamps, currentWeek: this.currentWeek };
+  },
+  load(d){
+    if(!d) return;
+    if(Array.isArray(d.entries)) this.entries = d.entries;
+    if(d.weeklyChamps) this.weeklyChamps = d.weeklyChamps;
+    if(d.currentWeek)  this.currentWeek  = d.currentWeek;
+    const wkNow = this._weekId(Date.now());
+    if(this.currentWeek && this.currentWeek !== wkNow) this.updateWeeklyChamps();
+  },
+};
+if(typeof window!=='undefined') window.billboard=billboard;
+
+// Encode an AudioBuffer-like {ch,sr,data:Float32Array[]} into a 16-bit WAV Blob.
+function _bbEncodeWav(ab){
+  if(!ab || !ab.data || !ab.data.length) return null;
+  const ch=ab.ch||ab.data.length, sr=ab.sr||44100, len=ab.data[0].length;
+  const bytes = 44 + len*ch*2;
+  const buf = new ArrayBuffer(bytes);
+  const v = new DataView(buf);
+  const wr = (o,s)=>{ for(let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
+  wr(0,'RIFF'); v.setUint32(4, bytes-8, true); wr(8,'WAVE');
+  wr(12,'fmt '); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,ch,true);
+  v.setUint32(24,sr,true); v.setUint32(28,sr*ch*2,true); v.setUint16(32,ch*2,true); v.setUint16(34,16,true);
+  wr(36,'data'); v.setUint32(40,len*ch*2,true);
+  let o=44;
+  for(let i=0;i<len;i++){
+    for(let c=0;c<ch;c++){
+      const x=Math.max(-1,Math.min(1,ab.data[c][i]||0));
+      v.setInt16(o, x<0?x*0x8000:x*0x7FFF, true); o+=2;
+    }
+  }
+  return new Blob([buf], {type:'audio/wav'});
+}
+if(typeof window!=='undefined') window._bbEncodeWav=_bbEncodeWav;
 
 // -- AUTO FX: Q-learner that picks reverb/delay/chorus/fuzz combinations ----
 // Keyed on (style × chord × arc × tension-bucket). Each context remembers the
@@ -5754,6 +5942,15 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   const freq=440*Math.pow(2,(note-69)/12)*warp;
   const s=drumSeed();
   const pc=((note%12)+12)%12; const pcMod=pc/12;
+  // Deep-design move for this hit. Routed into vibrato/tremolo/pitch-bend
+  // /staccato/drive based on the Q-learner's pick. The module scores itself
+  // off voice winding so annoying moves eventually lose weight.
+  let _dd=null;
+  try{
+    const arcName = (typeof tensionArc!=='undefined' && tensionArc.currentArc && tensionArc.currentArc.name) || '-';
+    const chName  = (typeof window!=='undefined' && window._bandAR) ? (window._bandAR.chordType||'-') : '-';
+    _dd = deepDesign.pick('bass', {chord:chName, arc:arcName, tBucket: windBoost>0.5?'hi':windBoost>0.25?'mid':'lo'});
+  }catch(_){}
   // LFO: slow drift on cutoff offset, med drift on the presence harmonic
   // gain (below). No fast LFO on bass -- 2Hz vibrato on low notes = cartoon.
   const lSlow = lfoBank.get('slow',t);
@@ -5940,6 +6137,33 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   body.connect(flt); flt.connect(g); g.connect(dest);
   body.start(t); body.stop(t+decayTime+0.08);
   autoClean(body,flt,g);
+  // Apply deepDesign move (live sound-design). The module picks one of
+  // staccato / vibrato / tremolo / bend per hit when active.
+  try{
+    if(_dd && deepDesign.active){
+      if(_dd.move==='staccato'){
+        // Already started; shorten envelope by re-scheduling an early fade.
+        g.gain.cancelScheduledValues(t+decayTime*0.4);
+        g.gain.exponentialRampToValueAtTime(0.0001, t+decayTime*0.5);
+      } else if(_dd.move==='vibrato'){
+        const [lfo,g2] = expressionFX.vibrato(ctx, body.frequency, freq, 5.2, 15, t, decayTime+0.05);
+        autoClean(lfo,g2);
+      } else if(_dd.move==='tremolo' && (mode==='sustain'||mode==='growl'||mode==='finger')){
+        const [lfo,g2] = expressionFX.tremolo(ctx, g.gain, 0.4, 6.5, 0.20, t, decayTime+0.05);
+        autoClean(lfo,g2);
+      } else if(_dd.move==='bend'){
+        // Bend up one semitone over the first 40% of the note.
+        expressionFX.pitchBend(body.frequency, freq*0.94, freq, t, decayTime*0.40);
+      }
+    }
+    // Observe winding delta once per hit; voice winding comes from the
+    // scheduler via window._bandVoices.
+    const _bv = (typeof window!=='undefined') ? window._bandVoices : null;
+    if(_bv && _bv.bass){
+      const annoyance = s._wild ? 0.25 : 0;
+      deepDesign.observe('bass', _bv.bass.winding||0, annoyance);
+    }
+  }catch(_){}
   // Teach the bass "good-params" distribution on strong, non-wildcard hits.
   if(!s._wild && windBoost > 0.28){
     paramMemory.observe('bass', {punch:s.punch,tone:s.tone,color:s.color,pitch:s.pitch}, Math.min(1, windBoost*1.6));
@@ -6069,6 +6293,13 @@ function playLeadStereo(ctx, t, note, chaos, warp, dest, windBoost, durScale){
 function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
   const s=drumSeed();
   const _lStyle=styleP();
+  // Deep-design pick for lead
+  let _ddL=null;
+  try{
+    const arcName = (typeof tensionArc!=='undefined' && tensionArc.currentArc && tensionArc.currentArc.name) || '-';
+    const chName  = (typeof window!=='undefined' && window._bandAR) ? (window._bandAR.chordType||'-') : '-';
+    _ddL = deepDesign.pick('lead', {chord:chName, arc:arcName, tBucket: windBoost>0.5?'hi':windBoost>0.25?'mid':'lo'});
+  }catch(_){}
   // Per-hit lead mode rotation: style default ~60% of the time, but 40% of
   // hits pick a different lead character (saw / fm / bell / whistle / pluck).
   // Wildcards always rotate. Makes the lead stop sounding like one patch.
@@ -6243,6 +6474,14 @@ function synthLead(ctx,t,note,chaos,warp,dest,windBoost=0,durScale=1.0){
   if(!s._wild && windBoost > 0.25){
     paramMemory.observe('lead', {punch:s.punch,tone:s.tone,color:s.color,decay:s.decay}, Math.min(1, windBoost*1.8));
   }
+  // Observe deepDesign reward based on current lead winding.
+  try{
+    const _bv = (typeof window!=='undefined') ? window._bandVoices : null;
+    if(_bv && _bv.lead){
+      const annoyance = s._wild ? 0.20 : 0;
+      deepDesign.observe('lead', _bv.lead.winding||0, annoyance);
+    }
+  }catch(_){}
 }
 
 // -- FLIP ENGINE ----------------------------------------------------------
@@ -6649,6 +6888,16 @@ function App(){
   const[recordingUrl,setRecordingUrl]=useState(null);
   const mediaRecorderRef=useRef(null);
   const recordChunksRef=useRef([]);
+
+  // -- BILLBOARD STATE -------------------------------------------------------
+  // Per-entry blob URLs are kept in-memory only (not persisted) to avoid
+  // ballooning IndexedDB. Metadata + ratings persist via billboard.serialize.
+  const[bbEntries,setBbEntries]=useState([]);
+  const bbBlobsRef=useRef({});       // id -> {master:url, stems:{drum,bass,mid,lead}}
+  const[bbRec,setBbRec]=useState({on:false, remaining:0});
+  const[bbForm,setBbForm]=useState({title:'', socials:'', genre:'pop', duration:30});
+  const[bbViewGenre,setBbViewGenre]=useState('pop');
+  const bbActiveRecRef=useRef(null);  // active record session
   const[sim3Balls,setSim3Balls]=useState([]); // local sim3 snapshot
   const[sim3Chaos,setSim3Chaos]=useState(null);
   const[perfMode,setPerfMode]=useState(false);
@@ -6735,7 +6984,10 @@ function App(){
   },[]);
 
   // -- COLLECTIVE BRAIN LOAD on mount ----------------------------------------
-  useEffect(()=>{collectiveBrainLoad();},[]);
+  useEffect(()=>{collectiveBrainLoad().then(()=>{
+    // Re-render billboard list once the brain load finishes.
+    setBbEntries(billboard.entries.slice());
+  });},[]);
 
   // -- SYNC LEARNING MODE to engine objects --------------------------------
   useEffect(()=>{
@@ -6775,7 +7027,12 @@ function App(){
   },[isPlaying]);
 
   // -- SYNC REFS -------------------------------------------------------------
-  useEffect(()=>{AR.current.chaos=chaos;AR.current.density=density;AR.current.swing=swing;AR.current.bpm=bpm;AR.current.drumRationality=drumRationality;AR.current.warpMultiplier=Math.pow(2,recordScratch/100)*(halftime?0.5:1);bus.updateDelayTime(bpm);},[chaos,density,swing,bpm,drumRationality,recordScratch,halftime]);
+  useEffect(()=>{AR.current.chaos=chaos;AR.current.density=density;AR.current.swing=swing;AR.current.bpm=bpm;AR.current.drumRationality=drumRationality;AR.current.warpMultiplier=Math.pow(2,recordScratch/100)*(halftime?0.5:1);bus.updateDelayTime(bpm);
+    // If we're locked, also move lockedBpm/swing with the slider so the drummer
+    // actually follows tempo/swing changes instead of staying at the locked value.
+    if(AR.current.lockedBpm!=null)   AR.current.lockedBpm  = bpm;
+    if(AR.current.lockedSwing!=null) AR.current.lockedSwing= swing;
+  },[chaos,density,swing,bpm,drumRationality,recordScratch,halftime]);
 
   // Push arc-intensity slider into the tensionArc module; poll for the current
   // arc name + bar so the UI reflects whatever the conductor picked.
@@ -7121,6 +7378,146 @@ function App(){
       setIsRecording(true);
       addLog('Recording started...');
     }catch(err){addLog('Recording error: '+err.message);}
+  };
+
+  // -- BILLBOARD RECORDING ----------------------------------------------------
+  // Starts a fixed-duration recording of the master bus + four per-voice
+  // stems (drum, bass, mid, lead) in parallel. At stop, stashes blob URLs
+  // per entry id and pushes a new metadata record into the billboard module.
+  const startBillboardRecord = async () => {
+    const ar = AR.current;
+    if(!ar.ctx || !bus || !bus.master){ addLog('Start the band first -- nothing to record.'); return; }
+    if(bbRec.on){ addLog('Billboard: already recording.'); return; }
+    const dur = Math.max(5, Math.min(90, bbForm.duration|0));
+    try{
+      const ctx = ar.ctx;
+      const streams = {
+        master: ctx.createMediaStreamDestination(),
+        drum:   ctx.createMediaStreamDestination(),
+        bass:   ctx.createMediaStreamDestination(),
+        mid:    ctx.createMediaStreamDestination(),
+        lead:   ctx.createMediaStreamDestination(),
+      };
+      bus.master.connect(streams.master);
+      if(bus.drumBus) bus.drumBus.connect(streams.drum);
+      if(bus.bassBus) bus.bassBus.connect(streams.bass);
+      if(bus.midBus)  bus.midBus.connect(streams.mid);
+      if(bus.leadBus) bus.leadBus.connect(streams.lead);
+      const chunks = {master:[], drum:[], bass:[], mid:[], lead:[]};
+      const mrs = {};
+      for(const k of Object.keys(streams)){
+        const mr = new MediaRecorder(streams[k].stream, {mimeType:'audio/webm;codecs=opus'});
+        mr.ondataavailable = e => { if(e.data && e.data.size>0) chunks[k].push(e.data); };
+        mr.start(100);
+        mrs[k] = mr;
+      }
+      bbActiveRecRef.current = {mrs, streams, chunks, start:Date.now(), dur};
+      setBbRec({on:true, remaining:dur});
+
+      const tick = setInterval(()=>{
+        const rem = dur - Math.floor((Date.now()-bbActiveRecRef.current.start)/1000);
+        if(rem <= 0){ clearInterval(tick); finish(); }
+        else setBbRec({on:true, remaining:rem});
+      }, 500);
+
+      const finish = async ()=>{
+        try{
+          for(const mr of Object.values(mrs)){ try{ mr.stop(); }catch(_){} }
+          // Wait for final dataavailable flushes
+          await new Promise(r=>setTimeout(r, 180));
+          for(const k of Object.keys(streams)){
+            try{
+              if(k==='master') bus.master.disconnect(streams[k]);
+              else if(bus[k+'Bus']) bus[k+'Bus'].disconnect(streams[k]);
+            }catch(_){}
+          }
+          const blobs = {};
+          for(const k of Object.keys(chunks)){
+            blobs[k] = chunks[k].length ? new Blob(chunks[k], {type:'audio/webm'}) : null;
+          }
+          const entry = await billboard.add({
+            title: bbForm.title || 'Untitled '+new Date().toLocaleTimeString(),
+            genre: bbForm.genre,
+            socials: bbForm.socials,
+            master: blobs.master ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+            stems:  {
+              drum: blobs.drum ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+              bass: blobs.bass ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+              mid:  blobs.mid  ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+              lead: blobs.lead ? {dur, sr: ctx.sampleRate, ch: 2} : null,
+            },
+          });
+          bbBlobsRef.current[entry.id] = {
+            master: blobs.master ? URL.createObjectURL(blobs.master) : null,
+            stems: {
+              drum: blobs.drum ? URL.createObjectURL(blobs.drum) : null,
+              bass: blobs.bass ? URL.createObjectURL(blobs.bass) : null,
+              mid:  blobs.mid  ? URL.createObjectURL(blobs.mid)  : null,
+              lead: blobs.lead ? URL.createObjectURL(blobs.lead) : null,
+            },
+            rawBlobs: blobs,
+          };
+          setBbEntries(billboard.entries.slice());
+          setBbRec({on:false, remaining:0});
+          collectiveBrainSave();
+          addLog('[BILLBOARD] Track saved: '+entry.title+' ('+entry.genre+')');
+        }catch(e){
+          console.warn('[billboard] finish failed', e);
+          setBbRec({on:false, remaining:0});
+        }
+      };
+    }catch(err){ addLog('Billboard record error: '+err.message); setBbRec({on:false, remaining:0}); }
+  };
+
+  const rateBillboard = (entryId, voice, stars) => {
+    billboard.rate(entryId, voice, stars);
+    setBbEntries(billboard.entries.slice());
+    collectiveBrainSave();
+  };
+
+  const deleteBillboardEntry = (entryId) => {
+    billboard.remove(entryId);
+    const b = bbBlobsRef.current[entryId];
+    if(b){
+      [b.master, b.stems?.drum, b.stems?.bass, b.stems?.mid, b.stems?.lead]
+        .forEach(u => { try{ if(u) URL.revokeObjectURL(u); }catch(_){} });
+      delete bbBlobsRef.current[entryId];
+    }
+    setBbEntries(billboard.entries.slice());
+    collectiveBrainSave();
+  };
+
+  // "Remix" the #1 champion: loads its stems as drum/mid samples so the user
+  // can jam over them. The user's new recording becomes a competition entry.
+  const remixChampion = (entryId) => {
+    const e = billboard.entries.find(x=>x.id===entryId); if(!e) return;
+    const b = bbBlobsRef.current[entryId]; if(!b){ addLog('[BILLBOARD] Stems unavailable (memory-only).'); return; }
+    (async ()=>{
+      try{
+        const ctx = AR.current.ctx || new (window.AudioContext||window.webkitAudioContext)();
+        const loadTo = async (blob, slot)=>{
+          if(!blob) return;
+          const ab = await ctx.decodeAudioData(await blob.arrayBuffer());
+          setDrumSample(slot, ab);
+        };
+        if(b.rawBlobs){
+          await loadTo(b.rawBlobs.drum, 'kick');   // drop drum stem into kick slot
+          await loadTo(b.rawBlobs.mid,  'mid');
+        }
+        addLog('[BILLBOARD] Remix mode: stems from "'+e.title+'" loaded. Start jamming, record with Record Billboard.');
+      }catch(err){ addLog('Remix load failed: '+err.message); }
+    })();
+  };
+
+  const downloadBillboardBlob = (entryId, voice) => {
+    const b = bbBlobsRef.current[entryId]; if(!b){ addLog('Blob unavailable.'); return; }
+    const url = voice==='master' ? b.master : b.stems?.[voice];
+    if(!url){ addLog('No '+voice+' stem.'); return; }
+    const e = billboard.entries.find(x=>x.id===entryId);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(e?.title||'track').replace(/\s+/g,'_')}-${voice}.webm`;
+    document.body.appendChild(a); a.click(); a.remove();
   };
 
   // -- PHRASE RECORDING -------------------------------------------------------
@@ -8282,6 +8679,10 @@ function App(){
   // -- SCHEDULE NOTE ---------------------------------------------------------
   const scheduleNote=(beat,time)=>{
     const ar=AR.current;const voices=voicesRef.current;
+    // Expose voices globally so stateless synth functions can observe winding
+    // for deepDesign rewards without threading a ref argument through every
+    // call site.
+    if(typeof window!=='undefined') window._bandVoices = voices;
     // Motif phase vars -- used by drums, bass AND mid so must be at function scope
     const motifShape   = ar._motifShape||{densityMod:1,chaosMod:1,leadMod:1};
     const isCall       = ar._motifPhase==='call';
@@ -8317,6 +8718,18 @@ function App(){
       ar.measureCount=(ar.measureCount||0)+1;
       // Grossbeat gate pattern advance -- rotates pattern every bar boundary.
       try{ if(typeof grossbeat!=='undefined') grossbeat.onBar(); }catch(_){}
+      // Dissonance bank observe: use winding delta from last bar as reward
+      // for the prior chord's interval set. Teaches "good dissonance" vs "bad
+      // dissonance" in the context of this chord type.
+      try{
+        const wNow = (voices.mid?.winding||0) + (voices.lead?.winding||0);
+        const wLast = ar._dbLastWind ?? wNow;
+        const rPc = ((rootMidi%12)+12)%12;
+        const ct0 = CHORDS[ar._dbLastChord||chordType]||CHORDS.maj;
+        dissonanceBank.observe(ar._dbLastChord||chordType, ct0.iv, (wNow-wLast)*0.15, rPc);
+        ar._dbLastWind  = wNow;
+        ar._dbLastChord = chordType;
+      }catch(_){}
       // Per-voice pause system: voices can take 1-2 bars off so the groove
       // can breathe. New rests are seeded sparingly (roughly every 6-10
       // bars per voice) and only when tension is low.
@@ -10093,7 +10506,7 @@ function App(){
 
     {/* TAB BAR */}
     <div className="flex gap-2">
-      {[['band','BAND'],['improv','IMPROV'],['sim3','SIM3 VIZ']].map(([id,label])=>(
+      {[['band','BAND'],['improv','IMPROV'],['billboard','BILLBOARD']].map(([id,label])=>(
         <button key={id} onClick={()=>setActiveTab(id)}
           className={"px-4 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest border transition-all "+(activeTab===id?'bg-cyan-500/15 text-cyan-300 border-cyan-500/40':'bg-slate-800/40 text-slate-500 border-slate-700 hover:border-slate-500')}>
           {label}
@@ -10980,6 +11393,136 @@ function App(){
         {isPlaying?'HALT BAND':'START BAND'}
       </button>
 
+    </div>)}
+
+    {/* BILLBOARD TAB -- record a track, capture per-voice stems, rate, and
+        rank into a weekly Top-10 per genre. The #1 per genre each week is
+        featured for the community remix competition. */}
+    {activeTab==='billboard'&&(<div className="space-y-3">
+      <div className="bg-[#0b1120] border border-fuchsia-500/30 rounded-xl p-3 space-y-2">
+        <div className="text-[10px] text-fuchsia-300 uppercase tracking-widest font-bold">Record a Track</div>
+        <div className="grid grid-cols-2 gap-2">
+          <input type="text" placeholder="Track title"
+            value={bbForm.title}
+            onChange={e=>setBbForm(f=>({...f,title:e.target.value}))}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[10px] text-white placeholder-slate-500"/>
+          <input type="text" placeholder="Socials URL (https://...)"
+            value={bbForm.socials}
+            onChange={e=>setBbForm(f=>({...f,socials:e.target.value}))}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[10px] text-white placeholder-slate-500"/>
+        </div>
+        <div className="grid grid-cols-3 gap-2 items-center">
+          <select value={bbForm.genre} onChange={e=>setBbForm(f=>({...f,genre:e.target.value}))}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[10px] text-white">
+            {['pop','jazz','edm','hiphop','westcoast','eastcoast','african','indian'].map(g=>(
+              <option key={g} value={g}>{g.toUpperCase()}</option>
+            ))}
+          </select>
+          <select value={bbForm.duration} onChange={e=>setBbForm(f=>({...f,duration:parseInt(e.target.value)}))}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[10px] text-white">
+            {[15,30,45,60,90].map(d=>(<option key={d} value={d}>{d}s</option>))}
+          </select>
+          <button onClick={startBillboardRecord} disabled={bbRec.on}
+            className={"py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest border transition-all "+
+              (bbRec.on?'bg-rose-500/20 text-rose-300 border-rose-500/50 animate-pulse':'bg-fuchsia-500 text-slate-900 border-fuchsia-400 hover:bg-fuchsia-400')}>
+            {bbRec.on ? ('REC · '+bbRec.remaining+'s') : 'RECORD'}
+          </button>
+        </div>
+        <div className="text-[8px] text-slate-500">Captures master + 4 stems (drum / bass / mid / lead). Stems become rateable and downloadable.</div>
+      </div>
+
+      {/* Genre picker for the top-10 view */}
+      <div className="bg-[#0b1120] border border-slate-800/60 rounded-xl p-3">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-[10px] text-amber-300 uppercase tracking-widest font-bold">
+            Top 10 · {bbViewGenre.toUpperCase()}
+          </div>
+          <select value={bbViewGenre} onChange={e=>setBbViewGenre(e.target.value)}
+            className="bg-slate-900/80 border border-slate-700 rounded px-2 py-1 text-[9px] text-amber-200">
+            {['pop','jazz','edm','hiphop','westcoast','eastcoast','african','indian'].map(g=>(
+              <option key={g} value={g}>{g.toUpperCase()}</option>
+            ))}
+          </select>
+        </div>
+        {billboard.deepTop(bbViewGenre, 10).length === 0 && (
+          <div className="text-[9px] text-slate-500 py-3 text-center">No tracks yet. Record one above to seed the chart.</div>
+        )}
+        {billboard.deepTop(bbViewGenre, 10).map((e,i)=>{
+          const blobs = bbBlobsRef.current[e.id] || {};
+          const isChamp = i===0 && e.ratingCount>0;
+          return (
+            <div key={e.id} className={"rounded-lg border mb-2 p-2 "+(isChamp?'border-amber-400/60 bg-amber-500/5':'border-slate-700 bg-slate-900/40')}>
+              <div className="flex items-center gap-2 mb-1">
+                <span className={"text-xs font-black w-6 "+(isChamp?'text-amber-300':'text-slate-500')}>#{i+1}</span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[11px] text-white font-bold truncate">{e.title}</div>
+                  <div className="text-[8px] text-slate-500">
+                    {e.genre.toUpperCase()} · {e.ratingCount} rating{e.ratingCount===1?'':'s'} · avg {e.totalRating.toFixed(2)}/5
+                    {e.socials && <> · <a href={e.socials} target="_blank" rel="noreferrer" className="text-cyan-400 hover:underline">socials</a></>}
+                  </div>
+                </div>
+                {isChamp && e.ratingCount>0 && (
+                  <button onClick={()=>remixChampion(e.id)}
+                    className="px-2 py-1 bg-amber-500/20 border border-amber-500/40 rounded text-[8px] font-bold uppercase text-amber-200 hover:bg-amber-500/30">
+                    Remix
+                  </button>
+                )}
+                <button onClick={()=>deleteBillboardEntry(e.id)}
+                  className="px-2 py-1 text-[10px] text-slate-500 hover:text-rose-400">×</button>
+              </div>
+
+              {/* Master playback */}
+              {blobs.master && (
+                <audio controls src={blobs.master} className="w-full h-6 mb-1" style={{height:'24px'}}/>
+              )}
+
+              {/* Per-voice rating + download */}
+              <div className="grid grid-cols-2 gap-1.5 text-[9px]">
+                {['drum','bass','mid','lead'].map(v=>(
+                  <div key={v} className="flex items-center gap-1 bg-slate-900/60 rounded px-1.5 py-1 border border-slate-800">
+                    <span className={"w-10 uppercase tracking-widest font-bold "+(
+                      v==='drum'?'text-rose-400':v==='bass'?'text-amber-400':v==='mid'?'text-violet-400':'text-cyan-400'
+                    )}>{v}</span>
+                    {[1,2,3,4,5].map(s=>(
+                      <button key={s} onClick={()=>rateBillboard(e.id, v, s)}
+                        className={"w-4 h-4 text-[10px] leading-none "+
+                          (s <= Math.round(e.ratings[v]) ? 'text-amber-300' : 'text-slate-700 hover:text-amber-400')}>
+                        ★
+                      </button>
+                    ))}
+                    <span className="text-[8px] text-slate-500 w-6">{e.ratings[v].toFixed(1)}</span>
+                    {blobs.stems?.[v] && (
+                      <button onClick={()=>downloadBillboardBlob(e.id, v)}
+                        title={'Download '+v+' stem'}
+                        className="ml-auto px-1 text-[8px] text-cyan-400 hover:text-cyan-300">⇩</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Weekly champion / competition card */}
+      <div className="bg-[#0b1120] border border-amber-500/30 rounded-xl p-3">
+        <div className="text-[10px] text-amber-300 uppercase tracking-widest font-bold mb-2">Weekly Competition</div>
+        <div className="text-[9px] text-slate-400 leading-relaxed mb-2">
+          Every week the deep-learned #1 per genre is crowned. Tap <span className="text-amber-300 font-bold">Remix</span> on a #1 entry above to load its stems as samples, then jam over them and record your own entry. Top-rated remix next week wins a featured slot with a link to your socials.
+        </div>
+        <div className="grid grid-cols-2 gap-1 text-[9px]">
+          {['pop','jazz','edm','hiphop','westcoast','eastcoast','african','indian'].map(g=>{
+            const top = billboard.deepTop(g, 1)[0];
+            return (
+              <div key={g} className="flex items-center gap-1 bg-slate-900/60 rounded px-2 py-1 border border-slate-800">
+                <span className="uppercase text-amber-400 font-bold w-12 text-[8px]">{g}</span>
+                <span className="text-[9px] text-white truncate flex-1">{top?top.title:'—'}</span>
+                {top && <span className="text-[8px] text-amber-300">{top.totalRating.toFixed(1)}★</span>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
     </div>)}
 
     {/* SIM3 VIZ TAB */}
