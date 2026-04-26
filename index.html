@@ -1085,6 +1085,10 @@ class AudioBus{
     this.grossbeatGain.connect(this.limiter);
     if(typeof grossbeat !== 'undefined') grossbeat.node = this.grossbeatGain;
     this.limiter.connect(ctx.destination);
+    // Tap the master output so the band can hear itself (centroid, lowRatio,
+    // roughness, etc). Connecting to an AnalyserNode does not affect the audio
+    // path; it just snoops samples for the FFT.
+    if(typeof bandEars!=='undefined') bandEars.attach(ctx, this.limiter);
 
     // -- MASTER BUS COMPRESSOR: glue everything together ------------------
     // Gentle 2:1, slow attack so transients punch through
@@ -1456,6 +1460,116 @@ class AudioBus{
   }
 }
 const bus=new AudioBus();
+
+// -- BAND EARS: spectral self-listening ---------------------------------------
+// Taps the master output, runs an FFT each animation frame, and exposes a
+// smoothed feature vector the rest of the band reads to make taste decisions:
+//   centroid  : 0..1 brightness (spectral centroid normalized to ~4 kHz)
+//   lowRatio  : energy below 200 Hz / total
+//   highRatio : energy above 4 kHz / total
+//   flatness  : 0 tonal .. 1 noise
+//   roughness : Plomp-Levelt sensory dissonance over the top spectral peaks
+//   energy    : overall loudness 0..1
+// brain.choose() and voice rotation read these to fill spectral gaps and back
+// off when things get muddy or harsh.
+const INTERVAL_CONSONANCE_PC={0:1.0,7:0.95,5:0.85,4:0.78,9:0.7,3:0.65,2:0.55,8:0.55,10:0.5,11:0.32,1:0.30,6:0.22};
+const bandEars={
+  ctx:null, analyser:null, buf:null, _rafId:null,
+  enabled:true, debug:false,
+  features:{centroid:0.5,lowRatio:0.3,highRatio:0.2,flatness:0.5,roughness:0,energy:0},
+  emaAlpha:0.18,
+  attach(ctx, sourceNode){
+    if(this.analyser||!ctx||!sourceNode) return;
+    this.ctx=ctx;
+    this.analyser=ctx.createAnalyser();
+    this.analyser.fftSize=1024;
+    this.analyser.smoothingTimeConstant=0.6;
+    this.buf=new Uint8Array(this.analyser.frequencyBinCount);
+    try{ sourceNode.connect(this.analyser); }catch(e){ this.analyser=null; return; }
+    this._tick();
+  },
+  _tick(){
+    if(!this.analyser) return;
+    this._rafId=(typeof requestAnimationFrame!=='undefined')
+      ? requestAnimationFrame(()=>this._tick())
+      : setTimeout(()=>this._tick(),33);
+    if(!this.enabled) return;
+    const buf=this.buf, N=buf.length, sr=this.ctx.sampleRate, binHz=sr/2/N;
+    this.analyser.getByteFrequencyData(buf);
+    let sum=0, weighted=0, lowSum=0, highSum=0, geoLog=0, geoCount=0;
+    for(let i=1;i<N;i++){
+      const v=buf[i]/255, f=i*binHz;
+      sum+=v; weighted+=v*f;
+      if(f<200) lowSum+=v;
+      else if(f>4000) highSum+=v;
+      if(v>0.001){ geoLog+=Math.log(v); geoCount++; }
+    }
+    if(sum<1e-4){ this._ema('energy',0); return; }
+    const centroidHz=weighted/sum;
+    const arith=sum/(N-1);
+    const geo=geoCount>0?Math.exp(geoLog/geoCount):0;
+    // Top peaks for roughness
+    const peaks=[];
+    for(let i=2;i<N-2;i++){
+      const v=buf[i];
+      if(v>buf[i-1]&&v>=buf[i+1]&&v>30) peaks.push({f:i*binHz,v:v/255});
+    }
+    peaks.sort((a,b)=>b.v-a.v);
+    const top=peaks.slice(0,6);
+    let rough=0;
+    for(let a=0;a<top.length;a++){
+      for(let b=a+1;b<top.length;b++){
+        const f1=top[a].f, f2=top[b].f;
+        if(f1<50||f2<50) continue;
+        const cbw=1.72*Math.pow(Math.min(f1,f2),0.65);
+        const x=Math.abs(f2-f1)/cbw;
+        const r=Math.exp(-3.5*x)-Math.exp(-5.75*x);
+        if(r>0) rough+=r*top[a].v*top[b].v;
+      }
+    }
+    this._ema('centroid', Math.min(1, centroidHz/4000));
+    this._ema('lowRatio', lowSum/sum);
+    this._ema('highRatio', highSum/sum);
+    this._ema('flatness', Math.min(1, geo/Math.max(1e-3,arith)));
+    this._ema('roughness', Math.min(1, rough*4));
+    this._ema('energy', Math.min(1, arith));
+    if(this.debug && Math.random()<0.03){
+      const f=this.features;
+      console.log('[bandEars]',
+        'cen='+f.centroid.toFixed(2),
+        'lo='+f.lowRatio.toFixed(2),
+        'hi='+f.highRatio.toFixed(2),
+        'flat='+f.flatness.toFixed(2),
+        'rough='+f.roughness.toFixed(2),
+        'e='+f.energy.toFixed(2));
+    }
+  },
+  _ema(k,v){ const a=this.emaAlpha; this.features[k]=this.features[k]*(1-a)+v*a; },
+  // Spectral bias for brain.choose. Returns an additive term ([-0.5, +0.5] range).
+  // Positive = encourage this interval given current mix state.
+  bias(role, iv){
+    if(!this.enabled||!this.analyser) return 0;
+    const f=this.features;
+    let bias=0;
+    // High roughness -> push toward consonant pitch classes (avoid piling on dissonance)
+    if(f.roughness>0.45){
+      const pc=((iv%12)+12)%12;
+      const cons=INTERVAL_CONSONANCE_PC[pc] ?? 0.5;
+      bias += (cons-0.5)*0.6*Math.min(1,(f.roughness-0.45)*4);
+    }
+    // Mix is bass-heavy and bass voice is choosing -> prefer non-root, higher intervals
+    if(role==='bass' && f.lowRatio>0.55){
+      bias += (iv>=5?0.12:-0.08)*Math.min(1,(f.lowRatio-0.55)*5);
+    }
+    // Mix is harsh on top -> lead avoids stinging m2/M7
+    if(role==='lead' && f.highRatio>0.30){
+      const pc=((iv%12)+12)%12;
+      if(pc===1||pc===11) bias -= 0.25*Math.min(1,(f.highRatio-0.30)*5);
+    }
+    return bias;
+  }
+};
+if(typeof window!=='undefined') window._bandEars=bandEars;
 
 // -- MOTIF ENGINE (robust: handles jazz, polyrhythm, Indian tala) --------------
 class MotifEngine{
@@ -1867,6 +1981,9 @@ class Brain{
       ? tensionArc.currentFor(role).h : 0;
     if(Math.random()>this.eps){
       let b=opts[0],bw=-Infinity;
+      // Spectral bias is muted while the arc is actively asking for tension —
+      // the band gets to commit to dissonance on purpose, not have ears fight it.
+      const earsWeight = (1 - th) * 0.9;
       for(const v of opts){
         const ctxVal =(this.q[this._k(role,v,ctx)]??0.5);
         const globVal=(this.q[this._k(role,v,'global')]??0.5);
@@ -1875,7 +1992,8 @@ class Brain{
         // invert and REWARD the low-consonance intervals. The 1.6 multiplier
         // at th=1 means a tritone can beat a P5 when the arc is at its peak.
         const consWeight = cons*(1-th) + (1-cons)*th*1.6;
-        const w=(ctxVal*0.7+globVal*0.3)*(1+consWeight*(1-chaos*.6));
+        const earsBias = (typeof bandEars!=='undefined') ? bandEars.bias(role,v)*earsWeight : 0;
+        const w=(ctxVal*0.7+globVal*0.3)*(1+consWeight*(1-chaos*.6)) + earsBias;
         if(w>bw){bw=w;b=v;}
       }
       return b;
@@ -7944,6 +8062,22 @@ function App(){
   useEffect(()=>{window._sim3ChaosLatest=sim3Chaos;},[sim3Chaos]);
   useEffect(()=>{window._isPlayingLatest=isPlaying;},[isPlaying]);
 
+  // -- SHARED ROOT: every voice tunes to one root MIDI -----------------------
+  // trackConfig.key is the user-facing source of truth for the band's key.
+  // Without this sync, voices fall back to AR.current.rootMidi=60 (C) on init
+  // even when the user picked a different key — which is why the band could
+  // sound like it started in a different key than the displayed key. Mirror
+  // every change into AR.current.rootMidi and prevRootRef so the scheduler
+  // (line ~9671) and key-change detector (line ~11168) see the same value.
+  useEffect(()=>{
+    const KEY_TO_PC={C:0,'C#':1,Db:1,D:2,'D#':3,Eb:3,E:4,F:5,'F#':6,Gb:6,G:7,'G#':8,Ab:8,A:9,'A#':10,Bb:10,B:11};
+    const pc=KEY_TO_PC[trackConfig.key];
+    if(pc==null) return;
+    const newRoot=60+pc;
+    AR.current.rootMidi=newRoot;
+    prevRootRef.current=newRoot;
+  },[trackConfig.key]);
+
   // -- AUTO CHAOS + DISPLAY --------------------------------------------------
   useEffect(()=>{
     if(!isPlaying)return;
@@ -9601,6 +9735,13 @@ function App(){
     if(!AR.current.ctx)AR.current.ctx=(()=>{const SR=DeviceComp.score<0.45?22050:44100;try{return new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR,latencyHint:'playback'});}catch(e){return new(window.AudioContext||window.webkitAudioContext)();}})();
     if(AR.current.ctx.state==='suspended')await AR.current.ctx.resume();
     bus.init(AR.current.ctx);
+    // Belt-and-suspenders: re-sync the band's root from trackConfig.key so the
+    // first scheduled note can't slip into MIDI 60 if the useEffect hasn't run.
+    {
+      const KEY_TO_PC={C:0,'C#':1,Db:1,D:2,'D#':3,Eb:3,E:4,F:5,'F#':6,Gb:6,G:7,'G#':8,Ab:8,A:9,'A#':10,Bb:10,B:11};
+      const pc=KEY_TO_PC[trackConfig.key];
+      if(pc!=null){ AR.current.rootMidi=60+pc; prevRootRef.current=60+pc; }
+    }
     ghostBand.stop(); // real band takes over
     setIsPlaying(true);isPlayRef.current=true;
     // Set up high-priority MessageChannel scheduler (not throttled on mobile)
