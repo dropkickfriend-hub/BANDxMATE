@@ -379,11 +379,35 @@ const structureEngine = {
     };
     let options = (VOCAB[current] || VOCAB.maj).slice();
 
+    // Sticky mode lock from the improv tab. When MAJOR, we boost dom7 / maj /
+    // maj7 / dom9 / lydian and suppress the minor cluster. When MINOR, we
+    // boost maj7 / min / min7 / min11 / dim and suppress the bright cluster.
+    // The user's pick stays the centre of gravity instead of drifting away
+    // every 4 bars.
+    // globalThis (not window) -- a `const window` is shadowed below in this
+    // scope and a window-named TDZ would throw ReferenceError on first call.
+    const _gt = (typeof globalThis!=='undefined') ? globalThis
+              : (typeof self!=='undefined') ? self : {};
+    const _modeAR = _gt._bandAR || null;
+    const _bandMode = _modeAR && _modeAR.bandMode;
+    if(_bandMode==='major'){
+      const major = new Set(['maj','maj7','dom7','dom9','lydian','quar','aug']);
+      const minor = new Set(['min','min7','min11','dim']);
+      options = options.map(o=>({c:o.c, w:o.w * (major.has(o.c)?1.6 : minor.has(o.c)?0.25 : 0.8), tag:o.tag}));
+      options.push({c:'dom7', w:1.4, tag:'V (locked-major)'});
+    } else if(_bandMode==='minor'){
+      const major = new Set(['maj','dom7','dom9','lydian']);
+      const minor = new Set(['min','min7','min11','dim','maj7']);
+      options = options.map(o=>({c:o.c, w:o.w * (minor.has(o.c)?1.6 : major.has(o.c)?0.30 : 0.8), tag:o.tag}));
+      options.push({c:'maj7', w:1.4, tag:'bIII (locked-minor)'});
+    }
+
     // 1) Cloud-discovered progressions: if progressionMemory has a high-
     //    score suggestion that follows the recent window, prefer it 60%.
     //    The cloud worker writes its discoveries into this library.
+    //    Suppressed when the user has locked a mode -- the lock wins.
     const brainSugg = progressionMemory.suggest(current);
-    if(brainSugg && CHORDS[brainSugg] && Math.random()<0.6){
+    if(!_bandMode && brainSugg && CHORDS[brainSugg] && Math.random()<0.6){
       return brainSugg;
     }
 
@@ -7873,6 +7897,16 @@ function App(){
   },[]);
   const[chaos,setChaos]=useState(0.32);
   const[density,setDensity]=useState(0.55);
+  // Mood (darkness, 0=bright/major-leaning, 1=dark/minor-leaning) and Intensity
+  // (overall energy: scales velocity + drives drum + lead probability) live on
+  // the main page so the user can shape vibe + energy without diving into
+  // setup. Pushed into bandTaste/AR via a useEffect below.
+  const[mood,setMood]=useState(0.4);
+  const[intensity,setIntensity]=useState(0.55);
+  // Sticky harmonic mode for the improv tab. 'major' = bright tonic + dom7
+  // ("just 7"), 'minor' = dark tonic + maj7 lean. Persists across the
+  // autonomous progression so the user's pick doesn't reset every 4 bars.
+  const[bandMode,setBandMode]=useState('major');
   const[swing,setSwing]=useState(20);
   const[bpm,setBpm]=useState(110);
   const[drumRationality,setDrumRationality]=useState(0.75); // 0=chaos, 1=strict archetype
@@ -8112,6 +8146,15 @@ function App(){
     if(AR.current.lockedBpm!=null)   AR.current.lockedBpm  = bpm;
     if(AR.current.lockedSwing!=null) AR.current.lockedSwing= swing;
   },[chaos,density,swing,bpm,drumRationality,recordScratch,halftime]);
+
+  // Push Mood -> bandTaste.darkness (drives chord-pick dark/bright bias in
+  // structureEngine.nextChord) and Intensity -> AR.current.intensity (velocity
+  // + per-voice probability multiplier read by scheduleNote).
+  useEffect(()=>{
+    bandTaste.darkness = mood;
+    AR.current.intensity = intensity;
+    AR.current.bandMode  = bandMode;
+  },[mood,intensity,bandMode]);
 
   // Push arc-intensity slider into the tensionArc module; poll for the current
   // arc name + bar so the UI reflects whatever the conductor picked.
@@ -9499,6 +9542,10 @@ function App(){
     AR.current.lockedRoot = rootNote;
     setBpm(bpm);
     setKickStyleState(kickStyle);
+    // Hand the popup's mood/intensity to the live-page sliders so the band
+    // continues with the same vibe the user just rendered.
+    if(typeof cfg.intensity==='number') setIntensity(cfg.intensity);
+    if(typeof cfg.darkness==='number')  setMood(cfg.darkness);
     collectiveBrainSave();  // persist including song history
 
     setRenderProgress(100); setRenderStage('Done!');
@@ -10851,7 +10898,13 @@ function App(){
       const _gfMid = (typeof grooveField !== 'undefined')
         ? (grooveField.matchWeight('mid', beat%16) + grooveField.echoInvite('mid'))
         : 1;
-      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost*_gfMid;
+      // Density + Intensity (from main-page sliders) shape the off-downbeat
+      // probability so low density actually leaves space and high density
+      // pushes more chord activity. Downbeat hit stays untouched so the
+      // chord change is always heard.
+      const _densMid = 0.35 + density*1.05;          // ~0.35..1.40
+      const _intMid  = 0.55 + (AR.current.intensity||0.55)*0.90; // ~0.55..1.45
+      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*_densMid*_intMid*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost*_gfMid;
       // Guaranteed downbeat hit on bar 0: makes the rotating synth bank
       // audible every 4 measures even at low density/chaos. Skips only if
       // the user is actively playing (so we leave them space).
@@ -10939,7 +10992,11 @@ function App(){
       const _gfLead = (typeof grooveField !== 'undefined')
         ? (grooveField.matchWeight('lead', beat%16) + grooveField.echoInvite('lead'))
         : 1;
-      const prob=density*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck*_gfLead;
+      // Intensity multiplier from the main-page slider: at 0 the lead all but
+      // disappears, at 1 it gets a 1.45× boost. Keeps a 0.35 floor so the lead
+      // never fully dies even if intensity is yanked to zero mid-song.
+      const _intLead = 0.35 + (AR.current.intensity||0.55)*1.10;
+      const prob=density*_intLead*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck*_gfLead;
       if(!ar._quietBar && Math.random()<prob){
         // Expanded note pool: chord tones (3× weighted) + full diatonic
         // scale + flat-3/5/7 blues + optional octave jump for drama. Stops
@@ -11788,7 +11845,13 @@ function App(){
           </div>
         )}
 
-        <button onClick={()=>setShowConfig(false)}
+        <button onClick={()=>{
+          // Carry the popup's mood/intensity choices into the live band so the
+          // main-page sliders start where the user set them in setup.
+          if(typeof trackConfig.intensity==='number') setIntensity(trackConfig.intensity);
+          if(typeof trackConfig.darkness==='number') setMood(trackConfig.darkness);
+          setShowConfig(false);
+        }}
           className="w-full py-2 text-[9px] text-slate-600 hover:text-slate-400 uppercase tracking-widest transition-all">
           Skip → Go to live controls
         </button>
@@ -12096,6 +12159,8 @@ function App(){
           {[
             {l:'Chaos',c:'text-cyan-400',v:Math.round(chaos*100)+'%',min:0,max:1,step:.01,val:chaos,set:setChaos,f:true},
             {l:'Density',c:'text-purple-400',v:Math.round(density*100)+'%',min:0,max:1,step:.01,val:density,set:setDensity,f:true},
+            {l:'Mood',c:'text-pink-400',v:mood<0.35?'Bright':mood<0.65?'Neutral':'Dark',min:0,max:1,step:.01,val:mood,set:setMood,f:true},
+            {l:'Intensity',c:'text-orange-400',v:intensity<0.35?'Chill':intensity<0.65?'Moderate':'Intense',min:0,max:1,step:.01,val:intensity,set:setIntensity,f:true},
             {l:'Tempo',c:'text-slate-400',v:bpm+' BPM (max '+DeviceComp.maxBpm+')',min:40,max:DeviceComp.maxBpm,step:1,val:Math.min(bpm,DeviceComp.maxBpm),set:setBpm,f:false},
             {l:'Swing',c:'text-amber-400',v:swing+'%',min:0,max:100,step:1,val:swing,set:setSwing,f:false},
             {l:'Arc',c:'text-emerald-400',v:arcName+(arcName!=='—'?' '+(arcBar+1)+'/8':'')+' · '+arcIntensity+'%',min:0,max:100,step:1,val:arcIntensity,set:setArcIntensity,f:false},
@@ -12577,6 +12642,37 @@ function App(){
       {/* MIDI SOUND CREATOR */}
       <div className="bg-[#0b1120] border border-cyan-500/20 rounded-xl p-4">
         <div className="text-[9px] text-cyan-400 uppercase tracking-widest font-bold mb-3">MIDI Sound Creator -- Chord Inversions</div>
+        {/* Sticky mode lock: MAJOR -> tonic dom7 ("just 7"), MINOR -> tonic
+            maj7. Clears the autonomous progression so the choice survives
+            past the next bar boundary instead of cycling away. */}
+        <div className="mb-3">
+          <div className="text-[8px] text-slate-500 uppercase tracking-widest mb-1.5">Mode</div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {[
+              ['major','Major','dom7','bg-amber-500/20 text-amber-200 border-amber-500/50',0.25],
+              ['minor','Minor','maj7','bg-indigo-500/20 text-indigo-200 border-indigo-500/50',0.7],
+            ].map(([id,label,defaultChord,activeCls,darkness])=>(
+              <button key={id} onClick={()=>{
+                setBandMode(id);
+                AR.current.bandMode=id;
+                bandTaste.darkness=darkness; setMood(darkness);
+                AR.current.chordType=defaultChord;
+                setImprovChord(defaultChord);
+                setCChord(defaultChord);
+                AR.current.targetChordSeq=null;
+                AR.current.phrasePosition=0;
+                AR.current.measuresThisChord=0;
+                AR.current.measuresPerChord=Math.max(4, AR.current.measuresPerChord||4);
+                addLog('Mode -> '+label+' (tonic '+(CHORDS[defaultChord]?.label||defaultChord)+')');
+                if(!isPlayRef.current)startBand();
+              }}
+                className={"py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest border transition-all "+(bandMode===id?activeCls:'bg-slate-800/50 text-slate-500 border-slate-700 hover:border-slate-500')}>
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="text-[7px] text-slate-600 mt-1">Major locks the tonic to dom 7 ("just 7"). Minor locks to maj 7. Stays put across bars.</div>
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="space-y-2">
             <div className="text-[8px] text-slate-500 uppercase tracking-widest">Root Note</div>
@@ -12593,7 +12689,20 @@ function App(){
             <div className="text-[8px] text-slate-500 uppercase tracking-widest">Chord Quality + Inversion</div>
             <div className="grid grid-cols-2 gap-1.5">
               {Object.entries(CHORDS).slice(0,8).map(([type,def])=>(
-                <button key={type} onClick={()=>{setImprovChord(type);AR.current.chordType=type;setCChord(type);if(!isPlayRef.current)startBand();}}
+                <button key={type} onClick={()=>{
+                  setImprovChord(type);
+                  AR.current.chordType=type;
+                  setCChord(type);
+                  // Clear the autonomous progression so the band rebuilds the
+                  // phrase from the user's pick instead of marching through
+                  // the old targetChordSeq and overwriting them at the next
+                  // bar boundary.
+                  AR.current.targetChordSeq=null;
+                  AR.current.phrasePosition=0;
+                  AR.current.measuresThisChord=0;
+                  AR.current.measuresPerChord=Math.max(4, AR.current.measuresPerChord||4);
+                  if(!isPlayRef.current)startBand();
+                }}
                   className={"py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all "+(improvChord===type?'bg-purple-500/20 text-purple-200 border-purple-500/50':'bg-slate-800/50 text-slate-500 border-slate-700 hover:border-purple-500/30')}>
                   {def.label}
                 </button>
