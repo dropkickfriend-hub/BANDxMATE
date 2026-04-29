@@ -12406,7 +12406,14 @@ function App(){
         {keyChangeFlag&&<span className="text-[8px] bg-amber-400/15 text-amber-300 border border-amber-400/35 px-2 py-0.5 rounded-full animate-pulse">Key Change!</span>}
         {phraseRecording&&<span className="text-[8px] bg-rose-500/20 text-rose-300 border border-rose-500/40 px-2 py-0.5 rounded-full animate-pulse">REC Phrase...</span>}
         <span className="text-[8px] bg-slate-800 text-slate-400 border border-slate-700 px-2 py-0.5 rounded-full">{meterLabel} . {subLabel[subdivisions]||subdivisions+'div'}</span>
-        <span className="text-[8px] bg-slate-800 text-slate-400 border border-slate-700 px-2 py-0.5 rounded-full">{scaleMode}</span>
+        <span className="text-[8px] bg-slate-800 text-slate-400 border border-slate-700 px-2 py-0.5 rounded-full" title={AR.current._userScaleLock?'Mode locked from improv tab. Click a genre to release.':'Mode auto-picked from genre.'}>{scaleMode}{AR.current._userScaleLock?' [lock]':''}</span>
+        {/* Live spotlight badge: shows which voice the autonomous spotlight
+            scheduler currently has elected. Rotates every 4 bars. Hidden when
+            no spotlight is set (e.g. before the first bar). */}
+        {AR.current._spotlight && <span
+          className="text-[8px] bg-pink-500/10 text-pink-300 border border-pink-500/30 px-2 py-0.5 rounded-full"
+          title="Spotlight rotates every 4 bars. The featured voice plays denser; the others pull back ~15%."
+        >Spot {AR.current._spotlight}</span>}
         <span className="text-[8px] bg-slate-800 text-cyan-400 border border-cyan-900 px-2 py-0.5 rounded-full" title={"Ghost: "+ghostBand.measure+" measures | Groove: "+(AR.current._groove||"?")+" | Dark: "+Math.round(bandTaste.darkness*100)+"%"}>Brain {Math.round(brainQ*100)}% {!isPlaying&&ghostBand.running?"[g]":""}</span>
         <span className="text-[8px] bg-slate-800 text-slate-500 border border-slate-700 px-2 py-0.5 rounded-full" title={`Device score: ${DeviceComp.score.toFixed(2)} | Lookahead: ${DeviceComp.lookahead.toFixed(2)}s | Max BPM: ${DeviceComp.maxBpm}`}>[cfg] {DeviceComp.label}</span>
         {learningMode!=='none'&&<span className={"text-[8px] px-2 py-0.5 rounded-full border "+(learningMode==='chaos'?'bg-cyan-500/10 text-cyan-300 border-cyan-800':learningMode==='progression'?'bg-purple-500/10 text-purple-300 border-purple-800':'bg-amber-500/10 text-amber-300 border-amber-800')}>{learningMode==='chaos'?'!! Cross-Sense':learningMode==='progression'?'[*] Prog Mem':'~ Converge'}{learningMode==='convergence'?' '+convergenceScore+'%':''}</span>}
