@@ -8223,7 +8223,12 @@ function App(){
   const[improvChord,setImprovChord]=useState('maj');
   const[improvRoot,setImprovRoot]=useState(60);
   const fileInputRef=useRef(null);
-  const[billboard,setBillboard]=useState([]); // top 10 user inputs
+  // Personal billboard list -- short on-screen feed of the user's recorded
+  // phrases. Renamed from `billboard` because the module-level `billboard`
+  // (ratings + cloud sync + stems) was being shadowed by this React state
+  // inside the App component, which is why none of billboard.cloudFetchTop /
+  // billboard.add / billboard.entries was firing.
+  const[personalBillboard,setPersonalBillboard]=useState([]);
   const[isRecording,setIsRecording]=useState(false);
   const[recordingUrl,setRecordingUrl]=useState(null);
   const mediaRecorderRef=useRef(null);
@@ -8994,7 +8999,7 @@ function App(){
       setCChord(result.reharmonSuggestion);
     }
     // Billboard entry
-    setBillboard(prev=>{
+    setPersonalBillboard(prev=>{
       const entry={
         rank:prev.length+1,
         key:NOTE_NAMES[result.root],
@@ -10149,6 +10154,26 @@ function App(){
     const _octShift = ar._octShift || 0;
     const rootMidi=(ar.lockedRoot??ar.rootMidi) + _octShift;
     const mutes=mutesRef.current;
+    // Mute-fill compensation: when sections are muted, the surviving voices
+    // fill in. Counts melodic+rhythm sections (drum/bass/mid/lead -- 4 total)
+    // and applies a multiplicative boost so a solo voice plays ~2x denser
+    // than a full quartet would, with ornament probability scaled the same
+    // way. Each muted role also "elects" a leader: the highest-priority
+    // surviving voice (lead > mid > bass > drum) becomes the focal point and
+    // gets an extra solo boost while the others sit slightly more sparse.
+    const _muteCount = (mutes.drum?1:0)+(mutes.bass?1:0)+(mutes.mid?1:0)+(mutes.lead?1:0);
+    const _muteFill  = 1 + _muteCount * 0.30;          // 1.0..2.2
+    const _muteOrn   = 1 + _muteCount * 0.45;          // ornament/fill density
+    let _leadVoice = null;
+    if(_muteCount > 0){
+      if(!mutes.lead)      _leadVoice = 'lead';
+      else if(!mutes.mid)  _leadVoice = 'mid';
+      else if(!mutes.bass) _leadVoice = 'bass';
+      else if(!mutes.drum) _leadVoice = 'drum';
+    }
+    ar._muteFill   = _muteFill;
+    ar._muteOrn    = _muteOrn;
+    ar._leadVoice  = _leadVoice;
     const ie=ar.inputEnergy||0.5;
     const tick=ar.tick++;
     // Follow-vs-lead signal visible to every drum sub-block in this scheduleNote.
@@ -10976,17 +11001,20 @@ function App(){
       }
 
       // Micro-subdivision: style-driven ghost 32nd-note hat.
-      // Only fire when the user IS drumming (so the AI fills in between
-      // your hits). When AI leads, these extras overload the groove.
+      // Fires for the user-is-drumming case OR when drums are the elected
+      // leader (mute-fill). Lead-drum mode also raises the per-step
+      // probability via _muteOrn so a solo drummer plays the busiest fills
+      // they have without the rest of the band crowding them out.
       const stepSec=60/(((ar.lockedBpm||ar.bpm)||110)*tempoWarp)*0.25;
-      if(userIsDrummer && Math.random()<styleP().microSubdiv && !sup.drum){
+      const _drumLeader = (ar._leadVoice === 'drum');
+      const _ghostP = styleP().microSubdiv * (_drumLeader ? (ar._muteOrn||1)*1.4 : 1.0);
+      if((userIsDrummer || _drumLeader) && Math.random()<_ghostP && !sup.drum){
         const ghostT=time+stepSec*0.5*(0.8+Math.random()*0.4);
         synthHat(ctx,ghostT,false,chaos*0.6,warpMultiplier,bus.getInput('drum'),0.25,0.25);
       }
 
-      // Ghost snare: same rule -- only when user is drumming, so they're
-      // fills between your hits, not clutter on top of an AI-led groove.
-      if(userIsDrummer && playGhostSnare && !sup.drum){
+      // Ghost snare: now also fires when drums are the elected leader.
+      if((userIsDrummer || _drumLeader) && playGhostSnare && !sup.drum){
         synthSnare(ctx,time+(60/(((ar.lockedBpm||ar.bpm)||110)*tempoWarp)*0.25*0.5),chaos,warpMultiplier,bus.getInput('snare'),0.18);
         voices.drum.play();
       }
@@ -11126,7 +11154,11 @@ function App(){
       // Bass: motif-shaped -- call=driving, response=sparse, turnaround=anticipate.
       // Per-bar call/response: call/turnaround bars play denser, response bars
       // play sparser so consecutive bars actually answer each other.
-      const bassDensityMod = isCall?1.4 : isResponse?0.40 : isTurnaround?1.6 : 1.0;
+      // Mute compensation gets folded in here so a solo bass plays denser
+      // ghost notes; the elected-leader boost makes a bass-only mix walk
+      // more melodically.
+      const _bassMuteFill = (ar._muteFill||1) * (ar._leadVoice==='bass' ? 1.55 : 1.0);
+      const bassDensityMod = (isCall?1.4 : isResponse?0.40 : isTurnaround?1.6 : 1.0) * _bassMuteFill;
       // PAUSES: if bass is on a rest turn, skip the whole bar's non-downbeat
       // hits. Lets the groove breathe and catch up.
       const bassIsResting = (ar._restBars?.bass || 0) > 0;
@@ -11216,7 +11248,10 @@ function App(){
       // chord change is always heard.
       const _densMid = 0.35 + density*1.05;          // ~0.35..1.40
       const _intMid  = 0.55 + (AR.current.intensity||0.55)*0.90; // ~0.55..1.45
-      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*_densMid*_intMid*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost*_gfMid;
+      // Mute fill: when other voices are muted, the mid takes more real
+      // estate. Extra boost when mid is the elected lead voice.
+      const _midMuteFill = (ar._muteFill||1) * (ar._leadVoice==='mid' ? 1.45 : 1.0);
+      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*_densMid*_intMid*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost*_gfMid*_midMuteFill;
       // Guaranteed downbeat hit on bar 0: makes the rotating synth bank
       // audible every 4 measures even at low density/chaos. Skips only if
       // the user is actively playing (so we leave them space).
@@ -11308,7 +11343,11 @@ function App(){
       // disappears, at 1 it gets a 1.45× boost. Keeps a 0.35 floor so the lead
       // never fully dies even if intensity is yanked to zero mid-song.
       const _intLead = 0.35 + (AR.current.intensity||0.55)*1.10;
-      const prob=density*_intLead*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck*_gfLead;
+      // Mute fill + leader election: when other roles are muted, the lead
+      // gets denser. When the lead is the elected leader (mid/bass/drum
+      // muted), it gets a further 1.6× to carry the song.
+      const _leadMuteFill = (ar._muteFill||1) * (ar._leadVoice==='lead' ? 1.60 : 1.0);
+      const prob=density*_intLead*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck*_gfLead*_leadMuteFill;
       if(!ar._quietBar && Math.random()<prob){
         // Expanded note pool: chord tones (3× weighted) + full diatonic
         // scale + flat-3/5/7 blues + optional octave jump for drama. Stops
@@ -12136,11 +12175,19 @@ function App(){
           </div>
         </div>
 
-        {/* Generate / progress */}
+        {/* Primary action -- go straight to the live band. The full-song
+            offline render takes minutes and isn't what most users want on
+            first launch; it's now demoted to a secondary text link below.
+            Live mode lazily creates voices the first time each fires, so
+            this path skips all the offline rendering work. */}
         {renderProgress===0?(
-          <button onClick={()=>renderFullTrack(trackConfig)}
-            className="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm uppercase tracking-wider transition-all">
-            Generate Song →
+          <button onClick={()=>{
+            if(typeof trackConfig.intensity==='number') setIntensity(trackConfig.intensity);
+            if(typeof trackConfig.darkness==='number') setMood(trackConfig.darkness);
+            setShowConfig(false);
+          }}
+            className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm uppercase tracking-wider transition-all">
+            Start Live Band →
           </button>
         ):(
           <div className="space-y-2">
@@ -12157,15 +12204,10 @@ function App(){
           </div>
         )}
 
-        <button onClick={()=>{
-          // Carry the popup's mood/intensity choices into the live band so the
-          // main-page sliders start where the user set them in setup.
-          if(typeof trackConfig.intensity==='number') setIntensity(trackConfig.intensity);
-          if(typeof trackConfig.darkness==='number') setMood(trackConfig.darkness);
-          setShowConfig(false);
-        }}
-          className="w-full py-2 text-[9px] text-slate-600 hover:text-slate-400 uppercase tracking-widest transition-all">
-          Skip → Go to live controls
+        <button onClick={()=>renderFullTrack(trackConfig)}
+          disabled={renderProgress>0}
+          className="w-full py-2 text-[9px] text-indigo-400 hover:text-indigo-300 uppercase tracking-widest transition-all disabled:opacity-40">
+          Or pre-render a full track (slow)
         </button>
 
       </div>
@@ -12450,10 +12492,52 @@ function App(){
               </div>
             ))}
           </div>}
-          <button onClick={restartBand} disabled={!isPlaying}
-            className="w-full py-1.5 rounded-lg text-[9px] font-bold uppercase border border-slate-700 text-slate-400 hover:border-cyan-500/40 hover:text-cyan-400 transition-all disabled:opacity-30">
-            Restart Band
-          </button>
+          <div className="grid grid-cols-2 gap-1.5">
+            <button onClick={restartBand} disabled={!isPlaying}
+              className="py-1.5 rounded-lg text-[9px] font-bold uppercase border border-slate-700 text-slate-400 hover:border-cyan-500/40 hover:text-cyan-400 transition-all disabled:opacity-30">
+              Restart
+            </button>
+            {/* Like: calibrates the band toward whatever's playing right now.
+                Pushes sessionJudge.score, rewards current Q picks via
+                sessionJudge.feedback, reinforces the current groove
+                archetype, and nudges bandTaste so future sessions lean this
+                direction. The button flashes briefly so the user knows it
+                registered. */}
+            <button onClick={()=>{
+              try{
+                if(typeof sessionJudge!=='undefined'){
+                  sessionJudge.evaluate({voiceWinding:1, arcAlignment:1, userAlignment:1});
+                  sessionJudge.feedback(AR.current._recentPicks||[], AR.current._groove);
+                }
+                if(typeof bandTaste!=='undefined'){
+                  if(AR.current._groove) bandTaste.reinforceArchetype(AR.current._groove, 0.85);
+                  bandTaste.density = bandTaste.density*0.85 + (density||0.55)*0.15;
+                  bandTaste.darkness = bandTaste.darkness*0.85 + (mood||0.4)*0.15;
+                }
+                // Also bump the brain priors for the chord type we're
+                // currently playing so the picker reaches for it again.
+                if(typeof brain!=='undefined' && AR.current.chordType){
+                  const ct = CHORDS[AR.current.chordType] || CHORDS.maj;
+                  brain.auto('lead', ct.iv, chaos, AR.current.chordType);
+                  brain.auto('mid',  ct.iv, chaos, AR.current.chordType);
+                }
+                // Sound-pair likes: lock in the current mid<->lead pairing.
+                if(typeof soundCompat!=='undefined' && typeof pickMidSynthName==='function' && typeof pickLeadMode==='function'){
+                  try{
+                    const m = pickMidSynthName(AR.current, true);
+                    const l = pickLeadMode(AR.current, true);
+                    if(soundCompat.reward) soundCompat.reward(m, l, 0.85);
+                  }catch(_){}
+                }
+                if(typeof collectiveBrainSave==='function') collectiveBrainSave();
+                addLog('[LIKE] Calibrated band toward current sound.');
+                hap.lockIn();
+              }catch(e){ addLog('[LIKE] '+(e.message||'error')); }
+            }}
+              className="py-1.5 rounded-lg text-[9px] font-bold uppercase border border-pink-500/30 text-pink-400 bg-pink-500/5 hover:bg-pink-500/15 transition-all">
+              ♥ Like
+            </button>
+          </div>
           <div className="text-[9px] text-purple-400 uppercase tracking-widest font-bold">Reharm</div>
           <div className="grid grid-cols-4 gap-1.5">
             {[['maj','Major'],['min','Minor'],['quar','4ths'],['dom7','Dom 7'],['min7','Min 7'],['maj7','Maj 7'],['dom9','Dom 9'],['dim','Dim'],['aug','Aug']].map(([type,label])=>(
@@ -13146,11 +13230,11 @@ function App(){
       {/* BILLBOARD TOP 10 */}
       <div className="bg-[#0b1120] border border-amber-500/20 rounded-xl p-3">
         <div className="text-[9px] text-amber-400 uppercase tracking-widest font-bold mb-2">Billboard Top 10 -- Your Inputs</div>
-        {billboard.length===0?(
+        {personalBillboard.length===0?(
           <p className="text-[9px] text-slate-600">No entries yet. Record phrases to populate.</p>
         ):(
           <div className="space-y-1">
-            {billboard.map(function(entry,idx){return(
+            {personalBillboard.map(function(entry,idx){return(
               <div key={idx} className="flex items-center gap-2 bg-slate-900/60 rounded px-2 py-1.5">
                 <span className="text-[8px] font-black w-4" style={{color:idx===0?'#f59e0b':idx<3?'#94a3b8':'#475569'}}>#{idx+1}</span>
                 <span className="text-[8px] text-white font-mono">{entry.key}</span>
