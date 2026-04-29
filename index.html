@@ -3709,6 +3709,41 @@ const MID_CHARACTERS = {
     chorus:{ delayMs:[10, 16], lfoHz:[0.50, 0.90], mix:0.22 },
     voices:1, detuneCents:[-5, +5],
   },
+  // Analog-laplace -- s-domain (Laplace) wavetable. PeriodicWave built from
+  // the magnitude/phase response of two cascaded resonator pole pairs at
+  // harmonics 1 and 4. Gives a warm, formant-shaped harmonic envelope that
+  // doesn't alias and reads as "analog" instead of the sometimes-goofy
+  // crossfade-of-three-OscillatorNode wavetable.
+  'analog-laplace': {
+    body: { type:'laplace-wavetable',
+            poles:[[0.45, 1.0], [0.30, 4.0]],   // body resonator + 4th-partial formant
+            partials:48 },
+    air: { burst:true, bpCenter:[1100, 1700], bpQ:0.9, gain:0.05, durMs:8 },
+    sub: { enabled:true, keyFade:{ top:62, slope:0.04 } },
+    tail: { durMs:[260, 600] },
+    filter:{ type:'lowpass', cutoff:[1800, 3200], Q:[0.5, 0.9] },
+    attack:{ type:'medium', peakMs:35, curve:0.55 },
+    satAmount:1.3,
+    trem:{ rateHz:[3.0, 4.5], depth:0.05 },
+    chorus:{ delayMs:[12, 18], lfoHz:[0.35, 0.70], mix:0.30 },
+    voices:1, detuneCents:[-5, +5],
+  },
+  // Analog-laplace bell -- two pole pairs at 1 and 7 with low damping creates
+  // a clear bell-like spectrum without inharmonic ugliness.
+  'analog-laplace-bell': {
+    body: { type:'laplace-wavetable',
+            poles:[[0.20, 1.0], [0.18, 7.0]],
+            partials:64 },
+    air: { burst:true, bpCenter:[1600, 2400], bpQ:1.2, gain:0.06, durMs:6 },
+    sub: { enabled:false },
+    tail: { durMs:[400, 1100] },
+    filter:{ type:'lowpass', cutoff:[2400, 3800], Q:[0.5, 1.0] },
+    attack:{ type:'hammer', peakMs:5, curve:0.85 },
+    satAmount:1.1,
+    trem:null,
+    chorus:{ delayMs:[10, 16], lfoHz:[0.45, 0.85], mix:0.25 },
+    voices:1, detuneCents:[-3, +3],
+  },
   // DILLA dust-pad -- ported from DILLAxRADIO `dust_pad` (sawtooth, slow env
   // attack:0.4, decay:0.6, sustain:0.7, release:2). Lo-fi sustained pad with
   // tape character; sits behind the rhodes for fatter chord voicings.
@@ -3919,7 +3954,7 @@ const STYLE_PROFILES = {
     leadMode:'saw',      // classic poly-saw lead
     hatMode:'metallic',  // standard physical cymbal model -- clean, bright
     hatGrooveOffset:0,   // on the grid
-    midBank:['grand-piano','rhodes-mk2','string-ensemble','nylon-guitar','funky-rhodes','violin'],
+    midBank:['grand-piano','analog-laplace','rhodes-mk2','string-ensemble','analog-laplace-bell','nylon-guitar','funky-rhodes'],
     leadBank:['bell','pluck','moog','sax'],
     label:'Pop',
   },
@@ -3935,7 +3970,7 @@ const STYLE_PROFILES = {
     arpBias:0.75,           // 75% chance extra-instrument auto-picks arp
     arpContinuous:true,     // arp loops a scale pattern across bars
     doubleTimeBias:0.5,     // 50% chance a fresh session locks to double-time grid
-    midBank:['rhodes-mk2','string-ensemble','grand-piano','vibraphone'],
+    midBank:['rhodes-mk2','analog-laplace','analog-laplace-bell','string-ensemble','grand-piano','vibraphone'],
     leadBank:['bell','pluck','moog'],
     label:'Hip-Hop/EDM',
   },
@@ -6729,6 +6764,57 @@ function synthMidVoice(ctx, t, notes, chordType, chaos, warp, dest, windBoost=0,
   });
 }
 
+// ── Laplace-domain wavetable cache --------------------------------------
+// Generates a PeriodicWave whose Fourier coefficients come from the magnitude
+// and phase response of an s-domain (Laplace) transfer function evaluated at
+// integer harmonics. Each pole pair = [zeta, omega0Norm], representing a
+// complex conjugate pair s = -zeta*omega0 +/- j*omega0*sqrt(1-zeta^2). The
+// resulting harmonic envelope is what an analog resonator passing a sawtooth
+// would produce: smooth roll-off + formant peaks at the resonator
+// frequencies, no aliasing artifacts (Web Audio band-limits PeriodicWave to
+// Nyquist automatically).
+// Cached per (pole-set signature, partials) so we don't rebuild per-hit.
+const _laplaceWaveCache = new Map();
+function getCachedLaplaceWave(ctx, poles, partials){
+  const sig = ctx.sampleRate + '|' + partials + '|' +
+    poles.map(p=>p[0].toFixed(3)+','+p[1].toFixed(3)).join(';');
+  const cached = _laplaceWaveCache.get(sig);
+  if(cached) return cached;
+  const N = Math.max(8, Math.min(256, partials|0));
+  const real = new Float32Array(N+1);
+  const imag = new Float32Array(N+1);
+  // Sawtooth baseline (1/n) so we start with audible harmonic content; the
+  // pole product then shapes the envelope on top of it.
+  for(let n=1;n<=N;n++){
+    let mag = 1, phase = 0;
+    for(let p=0;p<poles.length;p++){
+      const zeta = poles[p][0], w0 = poles[p][1];
+      const w = n;                  // harmonic index = relative omega
+      const re = w0*w0 - w*w;
+      const im = 2*zeta*w0*w;
+      const denomMag = Math.sqrt(re*re + im*im) || 1e-9;
+      mag /= denomMag;
+      phase -= Math.atan2(im, re);
+    }
+    const baseEnv = 1/n;
+    const finalMag = baseEnv * mag;
+    real[n] = finalMag * Math.cos(phase);
+    imag[n] = finalMag * Math.sin(phase);
+  }
+  // Peak-normalize so loudness is consistent across pole choices.
+  let peak = 0;
+  for(let n=1;n<=N;n++){
+    const m = Math.hypot(real[n], imag[n]);
+    if(m>peak) peak=m;
+  }
+  if(peak>0){
+    for(let n=0;n<=N;n++){ real[n]/=peak; imag[n]/=peak; }
+  }
+  const wave = ctx.createPeriodicWave(real, imag, {disableNormalization:true});
+  _laplaceWaveCache.set(sig, wave);
+  return wave;
+}
+
 // ── Body layer dispatch by profile.body.type
 function _playMidBody(ctx, t, freq, note, idx, prof, J, sustain, chaos, windBoost, dest){
   const atk = Math.max(0.002, (prof.attack.peakMs * 0.001) * J.attackMul);
@@ -6860,6 +6946,23 @@ function _playMidBody(ctx, t, freq, note, idx, prof, J, sustain, chaos, windBoos
       sq.stop(t + sustain + 0.05); pwmLfo.stop(t + sustain + 0.05);
       autoClean(sq, pwmLfo, pG, sqG);
     }
+  } else if(body.type === 'laplace-wavetable'){
+    // Laplace-domain wavetable: build a PeriodicWave whose harmonic envelope
+    // is the magnitude/phase response of an s-domain (Laplace) transfer
+    // function evaluated at each integer harmonic. Each `pole` entry is
+    // [zeta, omega0Norm] -> a complex conjugate pole pair at
+    //   s = -zeta*omega0 +/- j*omega0*sqrt(1-zeta^2)
+    // omega0Norm is in units of the fundamental (1 = f0, 3 = 3rd harmonic).
+    // Stacking pole pairs gives multi-formant analog character without
+    // needing time-domain modeling. Result is cached per (pole-set, partials).
+    const wave = getCachedLaplaceWave(ctx, body.poles || [[0.4,1.0]], body.partials || 48);
+    const o = ctx.createOscillator();
+    o.setPeriodicWave(wave);
+    o.frequency.value = freq;
+    o.detune.value = (idx - 1) * 4 * J.detuneMul;
+    o.connect(g);
+    o.start(t); o.stop(t + sustain + 0.05);
+    autoClean(o);
   } else if(body.type === 'wavetable'){
     // Approximate wavetable morph via two oscillators crossfading over time
     const o1 = ctx.createOscillator(); o1.type='sawtooth'; o1.frequency.value = freq;
