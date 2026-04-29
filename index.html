@@ -3342,7 +3342,7 @@ if(typeof window!=='undefined'){window._drumKit=_drumKit;window.reseedDrum=resee
 // bass feel independent of style; 'finger' and 'pick' are softer/brighter
 // variants of the electric bass.
 const _bassKit = {mode:'auto'};
-const BASS_MODE_CYCLE = ['auto','finger','pick','clean','pluck','slap','sustain','growl','upright','acoustic'];
+const BASS_MODE_CYCLE = ['auto','laplace','finger','pick','clean','pluck','slap','sustain','growl','upright','acoustic'];
 let reseedBassKit = function(){
   const i = BASS_MODE_CYCLE.indexOf(_bassKit.mode);
   _bassKit.mode = BASS_MODE_CYCLE[(i+1) % BASS_MODE_CYCLE.length];
@@ -7265,12 +7265,17 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
     // Tilt auto selection toward the gentler modes; growl only at high chaos.
     // Growl is the source of the resonant "cat meowing" tone the user heard
     // in pop -- gate it behind chaos>=0.55 so it stays a high-energy color.
+    // Laplace = warm s-domain wavetable bass, the new default for low-chaos
+    // / low-wind passages. PeriodicWave is band-limited so it can't alias
+    // and the two-formant pole set gives a real "electric body" tone.
     const modeVal=(nn.harmonicMix + chaos*0.3 + windBoost*0.2 + pcMod*0.15) % 1.0;
-    if(chaos < 0.25 && windBoost < 0.35) mode = 'finger';
-    else if(modeVal<0.30)               mode = 'pluck';
-    else if(modeVal<0.55)               mode = 'finger';
-    else if(modeVal<0.78)               mode = 'pick';
-    else if(modeVal<0.92)               mode = (chaos>=0.55 ? 'sustain' : 'finger');
+    if(chaos < 0.22)                    mode = 'laplace';
+    else if(chaos < 0.30 && windBoost < 0.35) mode = 'finger';
+    else if(modeVal<0.25)               mode = 'laplace';
+    else if(modeVal<0.45)               mode = 'pluck';
+    else if(modeVal<0.65)               mode = 'finger';
+    else if(modeVal<0.82)               mode = 'pick';
+    else if(modeVal<0.92)               mode = (chaos>=0.55 ? 'sustain' : 'laplace');
     else                                mode = (chaos>=0.55 ? 'growl' : 'pluck');
   } else {
     mode = _bassKit.mode;
@@ -7306,13 +7311,26 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   // Envelope tween: scale decay by the slow-moving envelope target for bass.
   // Tight (low env) = shorter/punchier. Open (high env) = longer, breathier.
   const _bassEnv = motionTween.envFor('bass');
-  const _DT = {pluck:0.22,slap:0.18,sustain:0.55,growl:0.40,finger:0.28,pick:0.20};
-  const _BT = {pluck:'triangle',slap:'square',sustain:'sawtooth',growl:'sawtooth',finger:'triangle',pick:'sawtooth'};
+  const _DT = {pluck:0.22,slap:0.18,sustain:0.55,growl:0.40,finger:0.28,pick:0.20,laplace:0.34};
+  const _BT = {pluck:'triangle',slap:'square',sustain:'sawtooth',growl:'sawtooth',finger:'triangle',pick:'sawtooth',laplace:null};
+  // Pole pairs for laplace mode -- two complex conjugate pairs in the s-plane:
+  // a body resonator at the fundamental + a low-formant peak around the
+  // 2.5th harmonic. Damping ~0.4 keeps the formants smooth (no resonant
+  // ringing). Result: warm two-formant electric-bass spectrum with proper
+  // analog harmonic roll-off, band-limited automatically by Web Audio's
+  // PeriodicWave so it can't alias even at the lowest E1.
+  const _BASS_LAPLACE_POLES = [[0.45, 1.0], [0.40, 2.5]];
   const decayTime=(_DT[mode] ?? 0.28)*_styleLen/warp * (0.6 + _bassEnv*0.8);
   const bodyType=_BT[mode] || 'triangle';
 
   // -- BODY OSCILLATOR ---------------------------------------------------
-  const body=ctx.createOscillator(); body.type=bodyType;
+  const body=ctx.createOscillator();
+  if(mode==='laplace' && typeof getCachedLaplaceWave==='function'){
+    try{ body.setPeriodicWave(getCachedLaplaceWave(ctx, _BASS_LAPLACE_POLES, 48)); }
+    catch(_){ body.type = 'triangle'; }
+  } else {
+    body.type = bodyType;
+  }
   // IMPROV ORNAMENTS: slides, bends, grace notes per hit so bass doesn't
   // sound like it's holding one note. Picked stochastically; a grace note
   // schedules an extra short osc, slide/bend just shape body.frequency.
@@ -7348,7 +7366,13 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
     body.frequency.value = freq*(1+s.color*0.004);
     // Extra short grace-note osc a whole-step below, tucked 60 ms before the hit.
     const gT = Math.max(0, t - 0.055);
-    const graceOsc = ctx.createOscillator(); graceOsc.type = bodyType;
+    const graceOsc = ctx.createOscillator();
+    if(mode==='laplace' && typeof getCachedLaplaceWave==='function'){
+      try{ graceOsc.setPeriodicWave(getCachedLaplaceWave(ctx, _BASS_LAPLACE_POLES, 48)); }
+      catch(_){ graceOsc.type = 'triangle'; }
+    } else {
+      graceOsc.type = bodyType || 'triangle';
+    }
     graceOsc.frequency.value = _freqAt(-2);
     const gg = ctx.createGain();
     gg.gain.setValueAtTime(0, gT);
