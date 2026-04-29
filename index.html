@@ -10326,6 +10326,24 @@ function App(){
 
     if(beat===0){
       ar.measureCount=(ar.measureCount||0)+1;
+      // -- AUTONOMOUS SPOTLIGHT --------------------------------------------
+      // Rotate which voice is in the spotlight every 4 bars so the band
+      // doesn't let the lead carry the whole song. Each section phase has a
+      // primary voice; within the section we cycle through a short list so
+      // the spotlight feels musical instead of mechanical. The spotlight
+      // voice gets a probability boost in its scheduler block; the others
+      // pull back ~15% so the spotlight cuts through.
+      const _spotCycle = {
+        intro:     ['mid','drum','bass'],
+        verse:     ['lead','mid','bass'],
+        chorus:    ['lead','mid','drum'],
+        bridge:    ['bass','mid','lead'],
+        turnaround:['drum','bass','lead'],
+        outro:     ['mid','bass','lead'],
+      };
+      const _spotPhase = _spotCycle[ar.structurePhase] || _spotCycle.verse;
+      const _spotIdx   = (Math.floor((ar.measureCount||0)/4)) % _spotPhase.length;
+      ar._spotlight    = _spotPhase[_spotIdx];
       // Grossbeat gate pattern advance -- rotates pattern every bar boundary.
       try{ if(typeof grossbeat!=='undefined') grossbeat.onBar(); }catch(_){}
       // Groove field: tick the bar, evaluate anomalies per role. Voices
@@ -11080,6 +11098,23 @@ function App(){
           bus.subBus.gain.linearRampToValueAtTime(duck, kT+0.006);
           bus.subBus.gain.exponentialRampToValueAtTime(1.0, kT+recover);
         }
+        // DILLA / HIP-HOP MID DUCK: ported from DILLAxRADIO's chord block
+        // (chords.volume.rampTo(-35, 0.05, kT) -> rampTo(-16, 0.4, kT+0.1)).
+        // Yanks the mid+lead send down to ~0.18 right when kick fires, then
+        // breathes back up over ~280 ms. Gives east coast / hip-hop / west
+        // coast that classic boom-bap chord pump where the Rhodes ducks
+        // under every kick. Send is already where mid+lead route, so it
+        // affects both without touching bass.
+        if((kickStyle==='eastcoast' || kickStyle==='hiphop' || kickStyle==='westcoast' || kickStyle==='phonk') && bus.send){
+          const duck = (kickStyle==='eastcoast') ? 0.18 : 0.28;
+          const recover = 0.280;
+          try{
+            bus.send.gain.cancelScheduledValues(kT);
+            bus.send.gain.setValueAtTime(1.0, kT);
+            bus.send.gain.linearRampToValueAtTime(duck, kT+0.012);
+            bus.send.gain.exponentialRampToValueAtTime(1.0, kT+recover);
+          }catch(_){}
+        }
         // Band-onset log so mic analysis can reject speaker-bleed from
         // being counted as user input.
         if(!ar._bandOnsets) ar._bandOnsets=[];
@@ -11133,15 +11168,19 @@ function App(){
       // probability via _muteOrn so a solo drummer plays the busiest fills
       // they have without the rest of the band crowding them out.
       const stepSec=60/(((ar.lockedBpm||ar.bpm)||110)*tempoWarp)*0.25;
-      const _drumLeader = (ar._leadVoice === 'drum');
-      const _ghostP = styleP().microSubdiv * (_drumLeader ? (ar._muteOrn||1)*1.4 : 1.0);
-      if((userIsDrummer || _drumLeader) && Math.random()<_ghostP && !sup.drum){
+      const _drumLeader   = (ar._leadVoice === 'drum');
+      const _drumSpot     = (ar._spotlight === 'drum');
+      const _ghostP = styleP().microSubdiv
+        * (_drumLeader ? (ar._muteOrn||1)*1.4 : 1.0)
+        * (_drumSpot ? 1.5 : 1.0);
+      if((userIsDrummer || _drumLeader || _drumSpot) && Math.random()<_ghostP && !sup.drum){
         const ghostT=time+stepSec*0.5*(0.8+Math.random()*0.4);
         synthHat(ctx,ghostT,false,chaos*0.6,warpMultiplier,bus.getInput('drum'),0.25,0.25);
       }
 
-      // Ghost snare: now also fires when drums are the elected leader.
-      if((userIsDrummer || _drumLeader) && playGhostSnare && !sup.drum){
+      // Ghost snare: now also fires when drums are the elected leader OR
+      // the spotlight is on drums (autonomous 4-bar rotation).
+      if((userIsDrummer || _drumLeader || _drumSpot) && playGhostSnare && !sup.drum){
         synthSnare(ctx,time+(60/(((ar.lockedBpm||ar.bpm)||110)*tempoWarp)*0.25*0.5),chaos,warpMultiplier,bus.getInput('snare'),0.18);
         voices.drum.play();
       }
@@ -11283,9 +11322,11 @@ function App(){
       // play sparser so consecutive bars actually answer each other.
       // Mute compensation gets folded in here so a solo bass plays denser
       // ghost notes; the elected-leader boost makes a bass-only mix walk
-      // more melodically.
+      // more melodically. Spotlight rotation gives the bass a 4-bar
+      // featured slot when ar._spotlight==='bass'.
       const _bassMuteFill = (ar._muteFill||1) * (ar._leadVoice==='bass' ? 1.55 : 1.0);
-      const bassDensityMod = (isCall?1.4 : isResponse?0.40 : isTurnaround?1.6 : 1.0) * _bassMuteFill;
+      const _bassSpot = (ar._spotlight==='bass') ? 1.45 : (ar._spotlight && ar._spotlight!=='bass' ? 0.90 : 1.0);
+      const bassDensityMod = (isCall?1.4 : isResponse?0.40 : isTurnaround?1.6 : 1.0) * _bassMuteFill * _bassSpot;
       // PAUSES: if bass is on a rest turn, skip the whole bar's non-downbeat
       // hits. Lets the groove breathe and catch up.
       const bassIsResting = (ar._restBars?.bass || 0) > 0;
@@ -11378,7 +11419,12 @@ function App(){
       // Mute fill: when other voices are muted, the mid takes more real
       // estate. Extra boost when mid is the elected lead voice.
       const _midMuteFill = (ar._muteFill||1) * (ar._leadVoice==='mid' ? 1.45 : 1.0);
-      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*_densMid*_intMid*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost*_gfMid*_midMuteFill;
+      // Autonomous spotlight: the bar's elected spotlight voice gets a
+      // probability boost; the others pull back. Mute-fill leader still wins
+      // when it's set, but in a normal mix the spotlight rotates every 4
+      // bars so the lead doesn't carry the whole song.
+      const _midSpot = (ar._spotlight==='mid') ? 1.45 : (ar._spotlight && ar._spotlight!=='mid' ? 0.85 : 1.0);
+      const prob=(beat===0?(DeviceComp.score<0.35?0.6:1)*midMotifMod:chaos*0.55*midMotifMod*_densMid*_intMid*(hist.m?0.08:1.9)*(DeviceComp.score<0.4?0.6:1.0))*midExclusion*_userDuck*_respBoost*_vampBoost*_gfMid*_midMuteFill*_midSpot;
       // Guaranteed downbeat hit on bar 0: makes the rotating synth bank
       // audible every 4 measures even at low density/chaos. Skips only if
       // the user is actively playing (so we leave them space).
@@ -11474,7 +11520,8 @@ function App(){
       // gets denser. When the lead is the elected leader (mid/bass/drum
       // muted), it gets a further 1.6× to carry the song.
       const _leadMuteFill = (ar._muteFill||1) * (ar._leadVoice==='lead' ? 1.60 : 1.0);
-      const prob=density*_intLead*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck*_gfLead*_leadMuteFill;
+      const _leadSpot = (ar._spotlight==='lead') ? 1.50 : (ar._spotlight && ar._spotlight!=='lead' ? 0.85 : 1.0);
+      const prob=density*_intLead*motifShape.leadMod*(hist.l?0.14:1.6)*0.65*(DeviceComp.score<0.4?0.5:1.0)*leadExclusion*_leadDuck*_leadResp*_leadMidDuck*_gfLead*_leadMuteFill*_leadSpot;
       if(!ar._quietBar && Math.random()<prob){
         // Expanded note pool: chord tones (3× weighted) + full diatonic
         // scale + flat-3/5/7 blues + optional octave jump for drama. Stops
