@@ -389,16 +389,50 @@ const structureEngine = {
     const _gt = (typeof globalThis!=='undefined') ? globalThis
               : (typeof self!=='undefined') ? self : {};
     const _modeAR = _gt._bandAR || null;
-    const _bandMode = _modeAR && _modeAR.bandMode;
-    if(_bandMode==='major'){
+    const _bandMode  = _modeAR && _modeAR.bandMode;
+    const _bandScale = _modeAR && _modeAR.bandScale;
+
+    // Mode-specific diatonic palette: when the user (or the genre setter) has
+    // pinned a scale, score chord types higher when they appear in that
+    // scale's diatonic chord set. This is the "modulate chords within the
+    // major/minor context" the user asked for -- the band literally consults
+    // the diatonic table per scale degree before reaching for chromatic moves.
+    let diaSet = null;
+    if(_bandScale && typeof MODE_SPEC !== 'undefined' && MODE_SPEC[_bandScale]){
+      const dia = MODE_SPEC[_bandScale].diatonic || [];
+      diaSet = new Set(dia);
+      // Stuff the missing diatonic flavours into the option pool so they're
+      // reachable even when the per-current vocab table didn't list them.
+      dia.forEach(function(t){
+        if(t && CHORDS[t] && !options.find(function(o){return o.c===t;})){
+          options.push({c:t, w:0.7, tag:'diatonic('+_bandScale+')'});
+        }
+      });
+    }
+
+    if(_bandMode==='major' || (_bandScale && MODE_SPEC[_bandScale] && MODE_SPEC[_bandScale].major)){
       const major = new Set(['maj','maj7','dom7','dom9','lydian','quar','aug']);
       const minor = new Set(['min','min7','min11','dim']);
-      options = options.map(o=>({c:o.c, w:o.w * (major.has(o.c)?1.6 : minor.has(o.c)?0.25 : 0.8), tag:o.tag}));
+      options = options.map(function(o){
+        const inDia = diaSet && diaSet.has(o.c);
+        const mul = inDia ? 1.9
+                  : major.has(o.c) ? 1.6
+                  : minor.has(o.c) ? 0.25
+                  : 0.8;
+        return {c:o.c, w:o.w * mul, tag:o.tag};
+      });
       options.push({c:'dom7', w:1.4, tag:'V (locked-major)'});
-    } else if(_bandMode==='minor'){
+    } else if(_bandMode==='minor' || (_bandScale && MODE_SPEC[_bandScale] && !MODE_SPEC[_bandScale].major)){
       const major = new Set(['maj','dom7','dom9','lydian']);
       const minor = new Set(['min','min7','min11','dim','maj7']);
-      options = options.map(o=>({c:o.c, w:o.w * (minor.has(o.c)?1.6 : major.has(o.c)?0.30 : 0.8), tag:o.tag}));
+      options = options.map(function(o){
+        const inDia = diaSet && diaSet.has(o.c);
+        const mul = inDia ? 1.9
+                  : minor.has(o.c) ? 1.6
+                  : major.has(o.c) ? 0.30
+                  : 0.8;
+        return {c:o.c, w:o.w * mul, tag:o.tag};
+      });
       options.push({c:'maj7', w:1.4, tag:'bIII (locked-minor)'});
     }
 
@@ -887,7 +921,112 @@ const NOTE_NAMES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 const midiToNote=m=>`${NOTE_NAMES[((m%12)+12)%12]}${Math.floor(m/12)-1}`;
 const PC=[[239,68,68],[249,115,22],[245,158,11],[252,211,77],[132,204,22],[34,197,94],[20,184,166],[6,182,212],[59,130,246],[99,102,241],[168,85,247],[236,72,153]];
 
-const SCALES={major:[0,2,4,5,7,9,11],minor:[0,2,3,5,7,8,10],dorian:[0,2,3,5,7,9,10],mixo:[0,2,4,5,7,9,10],whole:[0,2,4,6,8,10],phrygian:[0,1,3,5,7,8,10]};
+// Scale interval sets (semitones from root). Modes-of-major are grouped first
+// (Ionian -> Locrian); jazz/blues sets follow; gypsy/world scales last. The
+// "major/minor" classification of a mode is decided ONLY by the interval to
+// the 3rd: 4 semis = major-feel, 3 semis = minor-feel. That's why Aeolian
+// (the 6th mode of the major scale -- the "2nd last" mode) IS the natural
+// minor: its 3rd is +3. Same logic flags Lydian/Mixolydian as major-feel and
+// Dorian/Phrygian/Locrian as minor-feel even though they're all rotations of
+// the same parent scale.
+const SCALES = {
+  // Modes of the major (parent) scale
+  ionian:           [0,2,4,5,7,9,11],   // I (major)
+  dorian:           [0,2,3,5,7,9,10],   // ii (minor, natural 6)
+  phrygian:         [0,1,3,5,7,8,10],   // iii (minor, b2)
+  lydian:           [0,2,4,6,7,9,11],   // IV (major, #4)
+  mixolydian:       [0,2,4,5,7,9,10],   // V (major, b7 -- dominant)
+  aeolian:          [0,2,3,5,7,8,10],   // vi (natural minor)
+  locrian:          [0,1,3,5,6,8,10],   // vii (half-diminished)
+  // Jazz / blues
+  bebop_major:      [0,2,4,5,7,8,9,11], // major + b6 passing tone
+  bebop_dom:        [0,2,4,5,7,9,10,11],// mixo + maj7 passing tone
+  melodic_minor:    [0,2,3,5,7,9,11],   // jazz minor (M6 + M7)
+  harmonic_minor:   [0,2,3,5,7,8,11],   // minor with M7 leading tone
+  blues_hex:        [0,3,5,6,7,10],     // 6-note blues with b5
+  pent_minor:       [0,3,5,7,10],       // minor pentatonic
+  pent_major:       [0,2,4,7,9],        // major pentatonic
+  // Gypsy / klezmer / world
+  hungarian_minor:  [0,2,3,6,7,8,11],   // gypsy minor (#4 + M7)
+  phrygian_dom:     [0,1,4,5,7,8,10],   // Phrygian dominant (Spanish/klezmer)
+  double_harmonic:  [0,1,4,5,7,8,11],   // Byzantine / Arabic
+  whole:            [0,2,4,6,8,10],     // whole-tone
+  // Backwards-compat aliases used elsewhere in the file.
+  major: [0,2,4,5,7,9,11],
+  minor: [0,2,3,5,7,8,10],
+  mixo:  [0,2,4,5,7,9,10],
+};
+
+// Mode metadata: classify each scale as major-feel or minor-feel based on the
+// interval to the 3rd, and list the diatonic chord type per scale degree.
+// Diatonic types are drawn from CHORDS keys; nextChord uses these as the
+// "in-key" palette so the band actually stays in the chosen mode/key.
+const MODE_SPEC = {
+  // -- Modes of major --
+  ionian:         { major:true,  diatonic:['maj','min','min','maj','dom7','min','dim'] },
+  dorian:         { major:false, diatonic:['min7','min','maj','dom7','min','dim','maj'] },
+  phrygian:       { major:false, diatonic:['min','maj','dom7','min','dim','maj','min'] },
+  lydian:         { major:true,  diatonic:['maj7','dom7','min','dim','maj','min','min'] },
+  mixolydian:     { major:true,  diatonic:['dom7','min','dim','maj','min','min','maj'] },
+  aeolian:        { major:false, diatonic:['min','dim','maj','min','min','maj','maj'] },
+  locrian:        { major:false, diatonic:['dim','maj','min','min','maj','maj','min'] },
+  // -- Jazz / blues --
+  bebop_major:    { major:true,  diatonic:['maj7','min7','min7','maj7','dom7','min7','dim'] },
+  bebop_dom:      { major:true,  diatonic:['dom7','min7','dim','maj7','min7','min7','maj7'] },
+  melodic_minor:  { major:false, diatonic:['min','min','aug','dom7','dom7','dim','dim'] },
+  harmonic_minor: { major:false, diatonic:['min','dim','aug','min','dom7','maj','dim'] },
+  blues_hex:      { major:false, diatonic:['dom7','min7','dom7','dim','dom7','min7'] },
+  pent_minor:     { major:false, diatonic:['min','dom7','min','dom7','min'] },
+  pent_major:     { major:true,  diatonic:['maj','min','maj','dom7','min'] },
+  // -- Gypsy / world --
+  hungarian_minor:{ major:false, diatonic:['min','dim','aug','dim','dom7','maj','dim'] },
+  phrygian_dom:   { major:false, diatonic:['dom7','maj','dim','min','dim','aug','min'] },
+  double_harmonic:{ major:true,  diatonic:['maj','maj','min','min','dim','aug','dim'] },
+};
+
+// Genre -> typical scale palette. First entry is the default; subsequent
+// entries get rotated through when the band reseeds. structureEngine.nextChord
+// reads AR.current.bandScale to constrain its picks; on genre change we set
+// bandScale to GENRE_SCALES[genre][0] unless the user explicitly locked it
+// from the improv-tab Major/Minor toggle.
+const GENRE_SCALES = {
+  pop:        ['ionian','mixolydian','aeolian','dorian'],
+  jazz:       ['bebop_dom','bebop_major','melodic_minor','dorian','mixolydian','harmonic_minor'],
+  edm:        ['aeolian','phrygian','dorian','phrygian_dom'],
+  hiphop:     ['aeolian','dorian','pent_minor','phrygian','blues_hex'],
+  westcoast:  ['dorian','aeolian','mixolydian','pent_minor'],
+  eastcoast:  ['aeolian','dorian','phrygian','pent_minor'],
+  african:    ['pent_minor','dorian','aeolian','mixolydian'],
+  indian:     ['phrygian_dom','double_harmonic','harmonic_minor','phrygian'],
+  rock:       ['mixolydian','aeolian','dorian','blues_hex','pent_minor'],
+  phonk:      ['phrygian','aeolian','phrygian_dom','hungarian_minor'],
+  hardstyle:  ['phrygian','aeolian','harmonic_minor'],
+  dubstep:    ['aeolian','phrygian','phrygian_dom'],
+};
+
+// Helper: classify any scale name as major-feel or minor-feel based on the
+// 3rd interval. Falls back to MODE_SPEC.major if listed there. Used by the
+// improv-tab Major/Minor toggle so picking "Minor" puts you in aeolian (the
+// natural minor / 6th mode of the parent major scale) instead of guessing.
+function scaleIsMajor(name){
+  const spec = MODE_SPEC[name];
+  if(spec) return !!spec.major;
+  const sc = SCALES[name];
+  if(!sc) return true;
+  // 3rd is the second scale step (index 2 in chromatic terms): look for 4
+  // semis = M3, 3 semis = m3 in the interval set.
+  return sc.includes(4) && !sc.includes(3);
+}
+
+// Helper: pick the diatonic chord type for a scale degree (0..6) of a mode.
+// Returns null when the mode doesn't define a chord at that degree (e.g.
+// pentatonic only has 5 degrees). Used in nextChord to bias toward in-key
+// progressions.
+function diatonicChordAt(mode, degree){
+  const spec = MODE_SPEC[mode];
+  if(!spec || !spec.diatonic) return null;
+  return spec.diatonic[((degree % spec.diatonic.length) + spec.diatonic.length) % spec.diatonic.length] || null;
+}
 
 // FM ratios encode chord quality mathematically
 const CHORDS={
@@ -7021,14 +7160,15 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   let mode;
   if(_bassKit.mode === 'auto'){
     // Tilt auto selection toward the gentler modes; growl only at high chaos.
+    // Growl is the source of the resonant "cat meowing" tone the user heard
+    // in pop -- gate it behind chaos>=0.55 so it stays a high-energy color.
     const modeVal=(nn.harmonicMix + chaos*0.3 + windBoost*0.2 + pcMod*0.15) % 1.0;
     if(chaos < 0.25 && windBoost < 0.35) mode = 'finger';
-    else if(modeVal<0.22)               mode = 'pluck';
-    else if(modeVal<0.42)               mode = 'finger';
-    else if(modeVal<0.60)               mode = 'pick';
-    else if(modeVal<0.78)               mode = 'sustain';
-    else if(modeVal<0.90)               mode = 'slap';
-    else                                mode = 'growl';
+    else if(modeVal<0.30)               mode = 'pluck';
+    else if(modeVal<0.55)               mode = 'finger';
+    else if(modeVal<0.78)               mode = 'pick';
+    else if(modeVal<0.92)               mode = (chaos>=0.55 ? 'sustain' : 'finger');
+    else                                mode = (chaos>=0.55 ? 'growl' : 'pluck');
   } else {
     mode = _bassKit.mode;
   }
@@ -7121,21 +7261,29 @@ function synthBass(ctx, t, note, chaos, warp, windBoost=0, inputChar=0.5, beat=0
   body.detune.value=(pcMod*8-4)+(s.color*5-2.5);
 
   // -- RESONANT FILTER: neural cutoff + mode-specific envelope ----------
+  // Q values were tuned down (was pluck:4.5/slap:6/growl:8) -- those produced
+  // a vocal "wah/meow" peak when the filter envelope swept through the body
+  // fundamental at higher pitches. Tighter Q + smaller sweep range keeps the
+  // bass round instead of resonant.
   const flt=ctx.createBiquadFilter(); flt.type='lowpass';
-  const _BQ={pluck:4.5,slap:6.0,sustain:2.5,growl:8.0,finger:1.8,pick:3.2};
-  const baseQ=_BQ[mode] ?? 2.5;
-  flt.Q.value=baseQ+chaos*(mode==='finger'?2:8)+nn.filterCutoff*5+s.punch*3;
+  const _BQ={pluck:2.4,slap:3.6,sustain:1.8,growl:4.5,finger:1.4,pick:2.2};
+  const baseQ=_BQ[mode] ?? 1.8;
+  // Cap the Q ceiling so neural overshoot can't push past 5; previously this
+  // could climb past 12 which is where the meow lived.
+  const rawQ = baseQ + chaos*(mode==='finger'?1.0:2.5) + nn.filterCutoff*1.5 + s.punch*1.0;
+  flt.Q.value = Math.min(5, rawQ);
 
   // Filter envelope: each mode has distinct shape. Keep LFO contribution
   // tiny and SLOW only -- enough to make consecutive hits differ, not enough
-  // to modulate the cutoff audibly within a note.
-  const _FO={pluck:800,slap:2200,sustain:600,growl:1400,finger:900,pick:1800};
-  const _FC={pluck:80,slap:120,sustain:180,growl:60,finger:220,pick:260};
-  const fOpen=_FO[mode] ?? 800;
-  const fClose=_FC[mode] ?? 150;
-  const lfoCutoff = lSlow*45;
-  flt.frequency.setValueAtTime(Math.max(80,(fOpen+windBoost*400+inputChar*600+chaos*1200+pcMod*300+lfoCutoff)*warp), t);
-  flt.frequency.exponentialRampToValueAtTime(Math.max(40,(fClose+pcMod*30)*warp), t+decayTime);
+  // to modulate the cutoff audibly within a note. fClose floors raised so the
+  // sweep doesn't slam shut on the body fundamental.
+  const _FO={pluck:1200,slap:2400,sustain:900,growl:1500,finger:1200,pick:2000};
+  const _FC={pluck:260,slap:300,sustain:340,growl:200,finger:380,pick:420};
+  const fOpen=_FO[mode] ?? 1100;
+  const fClose=_FC[mode] ?? 300;
+  const lfoCutoff = lSlow*30;
+  flt.frequency.setValueAtTime(Math.max(220,(fOpen+windBoost*300+inputChar*450+chaos*900+pcMod*240+lfoCutoff)*warp), t);
+  flt.frequency.exponentialRampToValueAtTime(Math.max(180,(fClose+pcMod*30)*warp), t+decayTime);
 
   // -- GAIN ENVELOPE -----------------------------------------------------
   const _atk=styleP().attackMult;
@@ -8156,7 +8304,7 @@ function App(){
     lastOnset:0,previousEnergy:0,
     tempoHistory:[],onsetTimes:[],
     rhythmHistory:{},
-    userRole:'unknown',scale:SCALES.major,chordType:'maj',
+    userRole:'unknown',scale:SCALES.major,bandScale:'ionian',bandMode:'major',chordType:'maj',
     lockedBpm:null,lockedSwing:null,lockedRoot:null,
     tick:0,inputEnergy:0.5,
     // Autonomous structure
@@ -8334,6 +8482,22 @@ function App(){
                   : (kickStyle==='jazz') ? 0.18
                   : 0.10;
         bus.setVinylCrackleLevel(lvl);
+      }
+      // Genre -> typical scale palette. We pick the first entry from
+      // GENRE_SCALES[kickStyle] unless the user has explicitly locked a mode
+      // via the improv-tab toggle (AR.current._userScaleLock). Picking the
+      // right parent scale gives jazz its bebop chords, indian its phrygian-
+      // dominant flavour, hiphop its dorian/aeolian palette, etc.
+      if(typeof GENRE_SCALES !== 'undefined' && !AR.current._userScaleLock){
+        const palette = GENRE_SCALES[kickStyle] || GENRE_SCALES.pop;
+        const pick = palette[0];
+        if(pick && SCALES[pick]){
+          AR.current.bandScale = pick;
+          AR.current.scale     = SCALES[pick];
+          AR.current.bandMode  = (typeof scaleIsMajor==='function' && scaleIsMajor(pick)) ? 'major' : 'minor';
+          setScaleMode(pick);
+          if(typeof setBandMode==='function'){ /* sync UI toggle if available */ }
+        }
       }
     }catch(_){}
     const sp = STYLE_PROFILES[kickStyle]||STYLE_PROFILES.pop;
@@ -10910,12 +11074,19 @@ function App(){
     if(!sup.bass&&!mutes.bass&&!ar._introActive&&bassOpts.length){
       const iv=brain.choose(userRole,bassOpts,chaos,effectiveChord);
       (ar._recentPicks ||= []).push({role:'bass', iv, chord:effectiveChord});
-      // Force bass into bass register: E2-E4 (40-64), raised an octave from
-      // the old E1-E3 range per user request ("raise sub and bass one octave").
+      // Bass register clamp -- mode-aware. Electric/finger/pluck/etc. sit in
+      // E1..E3 (28..52) like a real 4-string. 808/hiphop/afrosub stay deeper
+      // (C1..Bb2). Previously everything was clamped E2..E4 which was an
+      // octave too high for pop -- the body osc was running at 200-300 Hz
+      // through a high-Q resonant filter, which is exactly the "cat meowing
+      // tuned down" zone. Lower notes let the filter env breathe.
+      const _bmReg = (styleP().bassMode || 'electric');
+      const _bassLo = (_bmReg==='808'||_bmReg==='hiphop'||_bmReg==='afrosub'||_bmReg==='tanpura'||_bmReg==='dubwobble') ? 24 : 28;
+      const _bassHi = (_bmReg==='808'||_bmReg==='hiphop'||_bmReg==='afrosub'||_bmReg==='tanpura'||_bmReg==='dubwobble') ? 46 : 52;
       const bassPC=((rootMidi+iv)%12+12)%12;
-      let baseNote=36+bassPC;                // start at C2 + pitch class
-      while(baseNote<40)baseNote+=12;
-      while(baseNote>64)baseNote-=12;
+      let baseNote=_bassLo+bassPC;            // start near the bottom of the register
+      while(baseNote<_bassLo)baseNote+=12;
+      while(baseNote>_bassHi)baseNote-=12;
 
       // Sub bass: plays on beat 0 and beat bb (half note positions).
       // On DROP bar: force sub+bass to ALL fire at beat 0 with the kick so
@@ -10968,9 +11139,11 @@ function App(){
         const pickupT = time + stepSec0*0.75;   // 3/4 of a step in = lands just before beat 0
         const pickupIv = brain.choose(userRole, bassOpts, chaos, effectiveChord);
         const pickupPC = ((rootMidi+pickupIv)%12+12)%12;
-        let pn = 36+pickupPC; while(pn<40)pn+=12; while(pn>64)pn-=12;
-        const _bDest = bus.getInput('bass');
         const _bm = styleP().bassMode || 'electric';
+        const _puLo = (_bm==='808'||_bm==='hiphop'||_bm==='afrosub'||_bm==='tanpura'||_bm==='dubwobble') ? 24 : 28;
+        const _puHi = (_bm==='808'||_bm==='hiphop'||_bm==='afrosub'||_bm==='tanpura'||_bm==='dubwobble') ? 46 : 52;
+        let pn = _puLo+pickupPC; while(pn<_puLo)pn+=12; while(pn>_puHi)pn-=12;
+        const _bDest = bus.getInput('bass');
         const w = voices.bass.winding*0.08;
         if(_bm==='808'||_bm==='hiphop')   synth808(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
         else if(_bm==='dubwobble')         synthDubstepWobble(ctx,pickupT,pn,chaos,warpMultiplier,w,_bDest);
@@ -12440,7 +12613,14 @@ function App(){
                   ['dubstep','Dub','text-teal-300 bg-teal-500/15 border-teal-500/40'],
                   ['phonk','Phonk','text-fuchsia-300 bg-fuchsia-500/15 border-fuchsia-500/40'],
                 ].map(([k,lbl,activeClass])=>(
-                  <button key={k} onClick={()=>setKickStyleState(k)}
+                  <button key={k} onClick={()=>{
+                    // User explicitly chose a genre -- release any improv-tab
+                    // scale lock so the new genre's typical scale palette
+                    // (jazz -> bebop_dom, indian -> phrygian_dom, etc.) gets
+                    // applied by the kickStyle effect.
+                    AR.current._userScaleLock = false;
+                    setKickStyleState(k);
+                  }}
                     className={"py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all "+(kickStyleState===k?activeClass:'bg-slate-800/60 text-slate-500 border-slate-700 hover:border-slate-500')}>
                     {lbl}
                   </button>
@@ -12788,12 +12968,22 @@ function App(){
           <div className="text-[8px] text-slate-500 uppercase tracking-widest mb-1.5">Mode</div>
           <div className="grid grid-cols-2 gap-1.5">
             {[
-              ['major','Major','dom7','bg-amber-500/20 text-amber-200 border-amber-500/50',0.25],
-              ['minor','Minor','maj7','bg-indigo-500/20 text-indigo-200 border-indigo-500/50',0.7],
-            ].map(([id,label,defaultChord,activeCls,darkness])=>(
+              // [id, label, defaultChord, activeCss, darknessTarget, parentScale]
+              // Major -> Ionian (the obvious major mode). Minor -> Aeolian
+              // (natural minor = the 6th mode of the major scale, the "2nd
+              // last" mode the user referenced). Setting bandScale here
+              // engages the diatonic chord picker in structureEngine so the
+              // band actually stays in key.
+              ['major','Major','dom7','bg-amber-500/20 text-amber-200 border-amber-500/50',0.25,'ionian'],
+              ['minor','Minor','maj7','bg-indigo-500/20 text-indigo-200 border-indigo-500/50',0.7, 'aeolian'],
+            ].map(([id,label,defaultChord,activeCls,darkness,parentScale])=>(
               <button key={id} onClick={()=>{
                 setBandMode(id);
                 AR.current.bandMode=id;
+                AR.current.bandScale=parentScale;
+                if(SCALES[parentScale]) AR.current.scale=SCALES[parentScale];
+                AR.current._userScaleLock=true;        // pin so genre changes don't override
+                if(typeof setScaleMode==='function') setScaleMode(parentScale);
                 bandTaste.darkness=darkness; setMood(darkness);
                 AR.current.chordType=defaultChord;
                 setImprovChord(defaultChord);
@@ -12802,7 +12992,7 @@ function App(){
                 AR.current.phrasePosition=0;
                 AR.current.measuresThisChord=0;
                 AR.current.measuresPerChord=Math.max(4, AR.current.measuresPerChord||4);
-                addLog('Mode -> '+label+' (tonic '+(CHORDS[defaultChord]?.label||defaultChord)+')');
+                addLog('Mode -> '+label+' / '+parentScale+' (tonic '+(CHORDS[defaultChord]?.label||defaultChord)+')');
                 if(!isPlayRef.current)startBand();
               }}
                 className={"py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest border transition-all "+(bandMode===id?activeCls:'bg-slate-800/50 text-slate-500 border-slate-700 hover:border-slate-500')}>
